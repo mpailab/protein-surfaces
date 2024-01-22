@@ -25,7 +25,7 @@ def local_points(atom, R, neighbours, rs):
     # M = weighted_neighbours.sum(0) / sum_rs
     # is_null = all([x == 0 for x in M])
     res = []
-    for i in range(R * dimension):
+    for i in range(2 * dimension):
         A_eq = A_external_cub[i:i+1, :]
         b_eq = np.array([R])
         A_ub = np.concatenate((A_external_cub[:i, :], A_external_cub[i+1:, :], A_main))
@@ -40,26 +40,29 @@ def local_points(atom, R, neighbours, rs):
             res.append(x + atom)
     return res
 
-def neighbours_with_rs(atom_id, coords, rs):
-    ns = []
-    ns_rs = []
+def neighbours_mask(atom_id, coords, rs):
     atom = coords[atom_id]
     R = rs[atom_id]
-    coords = np.delete(coords, atom_id, 0)
-    rs = np.delete(rs, atom_id)
-    for xyz, r in zip(coords, rs):
+    mask = np.zeros(coords.shape[0], dtype=bool)
+    #coords = np.delete(coords, atom_id, 0)
+    #rs = np.delete(rs, atom_id)
+    for index, (xyz, r) in enumerate(zip(coords, rs)):
+        if index == atom_id:
+            continue
         v = xyz - atom
         if np.dot(v, v) < r + R:
-            ns.append(xyz)
-            ns_rs.append(r)
-    return np.array(ns), np.array(ns_rs)
+            mask[index] = True
+    return mask
 
 def points_with_atomsid(coords, rs, additional_rad):
     surface_points = []
     atoms_ids = []
+    rs = rs + additional_rad
     for atom_id, atom in enumerate(coords):
-        ns, ns_rs = neighbours_with_rs(atom_id, coords, rs)
-        lps = local_points(atom, rs[atom_id], ns, ns_rs)
+        mask = neighbours_mask(atom_id, coords, rs)
+        neighbours = coords[mask]
+        neighbours_rs = rs[mask]
+        lps = local_points(atom, rs[atom_id], neighbours, neighbours_rs)
         surface_points += lps
         atoms_ids += [atom_id] * len(lps)
     return np.array(surface_points), np.array(atoms_ids)
