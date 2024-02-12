@@ -1,5 +1,7 @@
 import numpy as np
 from scipy.optimize import linprog
+import timeit
+import faiss
 
 def local_points(atom, R, neighbours, rs):
     """
@@ -40,6 +42,7 @@ def local_points(atom, R, neighbours, rs):
             res.append(x + atom)
     return res
 
+# Медленно: к удалению
 def neighbours_mask(atom_id, coords, rs):
     atom = coords[atom_id]
     R = rs[atom_id]
@@ -58,11 +61,35 @@ def points_with_atomsid(coords, rs, additional_rad):
     surface_points = []
     atoms_ids = []
     rs = rs + additional_rad
-    for atom_id, atom in enumerate(coords):
-        mask = neighbours_mask(atom_id, coords, rs)
+
+    start_time = timeit.default_timer()
+    R = 2 * max(rs)
+    d = coords.shape[1]
+    index = faiss.IndexFlatL2(d)
+    index.add(coords)
+    lims, D, I = index.range_search(coords, R)
+
+    search_neighbours_time = timeit.default_timer() - start_time
+    search_points_time = 0
+    for atom_id, atom in enumerate(coords[:3]):
+        start_time = timeit.default_timer()
+
+        mask = I[lims[atom_id]:lims[atom_id+1]]
         neighbours = coords[mask]
         neighbours_rs = rs[mask]
+
+        #Удаление atom в neighbours
+        mask = (neighbours != atom).all(axis = 1)
+        neighbours = neighbours[mask]
+        neighbours_rs = neighbours_rs[mask]
+
+        mez_time = timeit.default_timer()
+        search_neighbours_time += mez_time - start_time
         lps = local_points(atom, rs[atom_id], neighbours, neighbours_rs)
+        search_points_time += timeit.default_timer() - mez_time
         surface_points += lps
         atoms_ids += [atom_id] * len(lps)
+    summ = search_neighbours_time + search_points_time
+    print("search_neighbours_time: ", search_neighbours_time, search_neighbours_time / summ * 100, "%")
+    print("search_points_time: ", search_points_time, search_points_time / summ * 100, "%")
     return np.array(surface_points), np.array(atoms_ids)
