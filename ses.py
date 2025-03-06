@@ -163,7 +163,7 @@ def find_toroidal_fragments(
             with [probe_radius, b.radius] / (probe_radius + b.radius) as b_point:
                 down_bias = np.multi_dot(normal, np.array([b, center]), b_point)
 
-            t = Torus(center, radius, normal)
+            t = Torus(center, normal, radius, probe_radius)
 
             with Bound(normal, up_bias) as bound:
                 t.add_bound(bound)
