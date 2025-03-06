@@ -71,12 +71,12 @@ def points_with_atomsid(coords, rs, additional_rad):
 
     search_neighbours_time = timeit.default_timer() - start_time
     search_points_time = 0
-    for atom_id, atom in enumerate(coords[:3]):
+    for atom_id, atom in enumerate(coords):   #исправила coords[:3]
         start_time = timeit.default_timer()
 
         mask = I[lims[atom_id]:lims[atom_id+1]]
         neighbours = coords[mask]
-        neighbours_rs = rs[mask]
+        neighbours_rs = rs[mask] 
 
         #Удаление atom в neighbours
         mask = (neighbours != atom).all(axis = 1)
