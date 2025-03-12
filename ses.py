@@ -287,25 +287,25 @@ def generate_ses_points(coords, radii, probe_radius, point_area, jobs_num):
     generator = Generator(point_area)
     with Pool(jobs_num) as p:
         results = p.map(generator.call, fragments, chunksize=math.ceil(len(fragments)/jobs_num))
-        return np.concatenate(results)
+        return np.concatenate([x for x in results if x])
 
 
 if __name__ == '__main__':
 
-    # RADIUS = {}
-    # with open("atomtype.txt") as f:
-    #     for line in f.readlines()[1:]:
-    #         atom = line.split()[0]
-    #         RADIUS[atom] = line.split()[-2]
+    RADIUS = {}
+    with open("atomtype.txt") as f:
+        for line in f.readlines()[1:]:
+            atom = line.split()[0]
+            RADIUS[atom] = line.split()[-2]
 
-    # name_x = "1xvr_DE"
-    # molecules_npydir = "/auto/datasets/npi/raw/01-benchmark_surfaces_npy"
-    # coords = np.load(f"{molecules_npydir}/{name_x}_atomxyz.npy")
-    # types = np.load(f"{molecules_npydir}/{name_x}_atomtypes.npy")
-    # radii = np.array(list(map(lambda x: RADIUS[x], types)), dtype = float)
+    name_x = "1xvr_DE"
+    molecules_npydir = "/auto/datasets/npi/raw/01-benchmark_surfaces_npy"
+    coords = np.load(f"{molecules_npydir}/{name_x}_atomxyz.npy")
+    types = np.load(f"{molecules_npydir}/{name_x}_atomtypes.npy")
+    radii = np.array(list(map(lambda x: RADIUS[x], types)), dtype = float)
 
-    coords = [(0,0,0), (1,0,0)]
-    radii = [1, 1]
+    # coords = [(0,0,0), (1,0,0)]
+    # radii = [1, 1]
 
     probe_radius = 1.4  
     point_area = 1  
