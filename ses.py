@@ -87,6 +87,7 @@ class Torus (Surface):
         super().__init__(center, R, False)
         self.normal = normal
         self.r = r
+        self.bias = normal.dot(center)
 
         x = - self.normal[1] / np.sqrt(self.normal[0] ** 2 + self.normal[1] ** 2)
         y = self.normal[0] / np.sqrt(self.normal[0] ** 2 + self.normal[1] ** 2)
@@ -183,14 +184,14 @@ def find_toroidal_fragments(
 
 
 def add_atom_torus_bound(a : Atom, t : Torus, p : Probe):
-    with np.cross(t.normal, p.center - t.center) as normal:
-        bound = Bound(normal, normal.dot(p.center))
-        if bound.valid(a):
-            p.add_bound(bound)
-            t.add_bound(bound.neg())
-        else:
-            p.add_bound(bound.neg())
-            t.add_bound(bound)
+    normal = np.cross(t.normal, p.center - t.center)
+    bound = Bound(normal, normal.dot(p.center))
+    if bound.valid(a):
+        p.add_bound(bound)
+        t.add_bound(bound.neg())
+    else:
+        p.add_bound(bound.neg())
+        t.add_bound(bound)
 
 
 def find_probe_fragments(
@@ -212,20 +213,25 @@ def find_probe_fragments(
                 t_ac = torus_map[i][k]
                 t_bc = torus_map[j][k]
 
-                M = np.array([t_ab.normal, t_ac.normal, t_bc.normal])
-                if la.matrix_rank(M) != 3:
-                    continue
+                x = np.cross(t_ab.normal, t_ac.normal)
+                y = la.solve([t_ab.normal, t_ac.normal, x], [t_ab.bias, t_ac.bias, 0])
+                z = y - t_ab.center
+                roots = np.roots([x.dot(x), -2 * x.dot(z), z.dot(z) - t_ab.radius ** 2])
+                roots = [s for s in roots if t_bc.normal.dot(s * x + y) == t_bc.bias]
+                assert len(roots) > 0
 
-                with la.solve(M, np.array(t_ab.bias, t_ac.bias, t_bc.bias)) as x:
-                    if x in probe_map:
-                        p = probe_map[x]
+                for s in roots:
+                    v = s * x + y
+                    if v in probe_map:
+                        p = probe_map[v]
                     else:
-                        p = Probe(x)
-                        probe_map[x] = p
+                        p = Probe(v)
+                        probe_map[v] = p
 
-                add_atom_torus_bound(a, t_bc, p)
-                add_atom_torus_bound(b, t_ac, p)
-                add_atom_torus_bound(c, t_ab, p)
+                    add_atom_torus_bound(a, t_bc, p)
+                    add_atom_torus_bound(b, t_ac, p)
+                    add_atom_torus_bound(c, t_ab, p)
+                    
 
     return probe_map
 
