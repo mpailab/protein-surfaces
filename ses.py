@@ -9,7 +9,7 @@ import surface
 
 class Bound (object):
 
-    def __init__(self, normal, bias):
+    def __init__(self, normal : np.array, bias):
         self.normal = normal
         self.bias = bias
 
@@ -23,7 +23,7 @@ class Bound (object):
 class Surface (object):
 
     def __init__(self, center, radius, external):
-        self.center = center
+        self.center = np.array(center)
         self.radius = radius
         self.bounds = []
         self.feasible = True
@@ -33,10 +33,12 @@ class Surface (object):
         self.bounds.append(bound)
 
     def resolve(self):
-        self.feasible = self.feasible and self.bounds and \
-            linprog([0,0,0],
-                    A_ub=[x.normal for x in self.bounds],
-                    b_ub=[x.bias for x in self.bounds]).success
+        if not self.feasible or not self.bounds:
+            return
+        
+        self.feasible = linprog([0,0,0],
+                                A_ub=[x.normal for x in self.bounds],
+                                b_ub=[x.bias for x in self.bounds]).success
 
     def valid(self, x):
         return all (bound.valid(x) for bound in self.bounds)
@@ -55,22 +57,26 @@ class Sphere (Surface):
         v = np.linspace(0, 1, n)  
 
         u_grid, v_grid = np.meshgrid(u, v)
+        u_grid = u_grid.flatten()
+        v_grid = v_grid.flatten()
 
         u_spher = u_grid * 2 * np.pi  
         v_spher = np.arcsin(2 * v_grid - 1)
 
-        normals = np.array([np.cos(v_spher) * np.cos(u_spher),
-                            np.cos(v_spher) * np.sin(u_spher),
-                            np.sin(v_spher)])
-        points = self.center + self.radius * normals
+        normals = np.array([
+            [np.cos(x) * np.cos(y), np.sin(x) * np.cos(y), np.sin(y)] 
+            for x, y in zip(u_spher, v_spher) 
+        ])
+        points = self.radius * normals + self.center
 
         return self.filter(points, normals)
 
 
 class Atom (Sphere):
 
-    def __init__(self, center, radius):
+    def __init__(self, id, center, radius):
         super().__init__(center, radius, True)
+        self.id = id
         self.dist = la.norm(self.center) ** 2
         self.bias = self.dist - self.radius ** 2
         
@@ -109,32 +115,23 @@ class Torus (Surface):
         u = np.linspace(0, 1, n)  
         v = np.linspace(-1, 1, n)  
         u, v = np.meshgrid(u, v)
+        u = u.flatten()
+        v = v.flatten()
 
         u_spher = u * 2 * np.pi
         v_spher = np.arcsin(v - np.sign(v)) + np.pi + np.sign(v) * np.pi / 2
 
-        normals = self.rotate_matrix.dot([np.cos(v_spher) * np.cos(u_spher),
-                                          np.cos(v_spher) * np.sin(u_spher),
-                                          np.sin(v_spher)])
+        A = np.array([
+            [np.cos(x) * np.cos(y), np.sin(x) * np.cos(y), np.sin(y)] 
+            for x, y in zip(u_spher, v_spher) 
+        ])
+        B = np.array([[np.cos(x), np.sin(x), 0] for x in u_spher])
+        
+        normals = np.dot(A, self.rotate_matrix)
         points = self.center + self.r * normals + \
-            self.radius * self.rotate_matrix.dot([np.cos(u_spher), np.sin(u_spher), 0])
+            self.radius * np.dot(B, self.rotate_matrix)
 
         return self.filter(points, normals)
-
-
-def resolve(arr, surf, dead = None):
-    if dead is None:
-        for s in arr:
-            s.resolve()
-            if s.feasible:
-                np.append(surf, s)
-    else:
-        for i, s in enumerate(arr):
-            s.resolve()
-            if s.feasible:
-                np.append(surf, s)
-            else:
-                np.append(dead, i)
 
 
 def find_toroidal_fragments(
@@ -143,11 +140,11 @@ def find_toroidal_fragments(
             -> Dict[int, Dict[int, Torus]]:
     
     torus_map = {}
-    for i, a in enumerate(atoms):
-        if i not in torus_map: torus_map[i] = {}
-        torus_a = torus_map[i]
+    for a in atoms:
+        if a.id not in torus_map: torus_map[a.id] = {}
+        torus_a = torus_map[a.id]
 
-        for j, b in enumerate(atoms[i+1:]):
+        for b in atoms[a.id+1:]:
             normal = a.center - b.center
             normal_size = la.norm(normal)
             if normal_size >= a.radius + b.radius + 2 * probe_radius:
@@ -156,13 +153,13 @@ def find_toroidal_fragments(
             alpha = (1 - (a.radius - b.radius) \
                          * (a.radius + b.radius + 2 * probe_radius) \
                          / normal_size ** 2) / 2
-            center = b.center - alpha * normal
-            radius = (b.radius + probe_radius) ** 2 - (alpha * normal_size) ** 2
+            center = a.center - alpha * normal
+            radius = (a.radius + probe_radius) ** 2 - (alpha * normal_size) ** 2
 
-            a_point = [probe_radius, a.radius] / (probe_radius + a.radius)
+            a_point = np.array([probe_radius, a.radius]) / (probe_radius + a.radius)
             up_bias = la.multi_dot([a_point, [a.center, center], normal])
             
-            b_point = [probe_radius, b.radius] / (probe_radius + b.radius)
+            b_point = np.array([probe_radius, b.radius]) / (probe_radius + b.radius)
             down_bias = la.multi_dot([b_point, [b.center, center], normal])
 
             t = Torus(center, normal, radius, probe_radius)
@@ -178,7 +175,7 @@ def find_toroidal_fragments(
             if up_bias <= down_bias:
                 continue
 
-            torus_a[j + i + 1] = t
+            torus_a[b.id] = t
     
     return torus_map
 
@@ -186,7 +183,7 @@ def find_toroidal_fragments(
 def add_atom_torus_bound(a : Atom, t : Torus, p : Probe):
     normal = np.cross(t.normal, p.center - t.center)
     bound = Bound(normal, normal.dot(p.center))
-    if bound.valid(a):
+    if bound.valid(a.center):
         p.add_bound(bound)
         t.add_bound(bound.neg())
     else:
@@ -196,7 +193,8 @@ def add_atom_torus_bound(a : Atom, t : Torus, p : Probe):
 
 def find_probe_fragments(
         atoms : List[Atom], 
-        torus_map : Dict[int, Dict[int, Torus]]) \
+        torus_map : Dict[int, Dict[int, Torus]], 
+        probe_radius : float) \
             -> Dict[int, Dict[int, Torus]]:
     
     probe_map = {}
@@ -216,17 +214,18 @@ def find_probe_fragments(
                 x = np.cross(t_ab.normal, t_ac.normal)
                 y = la.solve([t_ab.normal, t_ac.normal, x], [t_ab.bias, t_ac.bias, 0])
                 z = y - t_ab.center
-                roots = np.roots([x.dot(x), -2 * x.dot(z), z.dot(z) - t_ab.radius ** 2])
-                roots = [s for s in roots if t_bc.normal.dot(s * x + y) == t_bc.bias]
-                assert len(roots) > 0
+                roots = np.roots([x.dot(x), 2 * x.dot(z), z.dot(z) - t_ab.radius ** 2])
+                froots = [s for s in roots if np.abs(t_bc.normal.dot(s * x + y) - t_bc.bias) < 0.00001]
+                assert len(froots) > 0
 
-                for s in roots:
+                for s in froots:
                     v = s * x + y
-                    if v in probe_map:
-                        p = probe_map[v]
+                    key = tuple(np.true_divide(np.fix(v * 100000), 100000))
+                    if key in probe_map:
+                        p = probe_map[key]
                     else:
-                        p = Probe(v)
-                        probe_map[v] = p
+                        p = Probe(v, probe_radius)
+                        probe_map[key] = p
 
                     add_atom_torus_bound(a, t_bc, p)
                     add_atom_torus_bound(b, t_ac, p)
@@ -236,19 +235,8 @@ def find_probe_fragments(
     return probe_map
 
 
-class Resolver:
-    def __init__(self, res, addon):
-        self.res = res
-        self.addon = addon
-
-    def resolve_task(self, args):
-        i, x = args
-        resolve(x, self.res[i], self.addon)
-
-    def resolve_task2(self, args):
-        i, x = args
-        for f in x:
-            self.res[i].extend(f.generate_points(self.addon))
+def resolve(elem):
+    elem.resolve()
 
 
 def find_ses_fragments(
@@ -256,65 +244,68 @@ def find_ses_fragments(
         probe_radius : float,
         jobs_num : int) -> List[Surface]:
     
-    res = np.array([ np.array([]) for _ in range(jobs_num) ])
+    res = [[] for _ in range(jobs_num)]
 
     torus_map = find_toroidal_fragments(atoms, probe_radius)
     
-    dead_atoms = []
-    resolver = Resolver(res, dead_atoms)
     with Pool(jobs_num) as p:
-        p.map(resolver.resolve_task,
-              enumerate(np.array_split(atoms, jobs_num)), chunksize=1)
-        
-    tori = []
-    for i in dead_atoms: del torus_map[i]
-    for i in torus_map:
-        for j in dead_atoms: torus_map[i].pop(j, None)
-        tori.extend(torus_map[i].values())
+        p.map(resolve, atoms, chunksize=math.ceil(len(atoms)/jobs_num))
 
-    probe_map = find_probe_fragments(atoms, torus_map)
-    resolver = Resolver(res, None)
-    
-    if tori:
-        with Pool(jobs_num) as p:
-            p.map(resolver.resolve_task, 
-                enumerate(np.array_split(tori, jobs_num)), chunksize=1)
-    
-    if probe_map:
-        with Pool(jobs_num) as p:
-            p.map(resolver.resolve_task, 
-                enumerate(np.array_split(probe_map.values(), jobs_num)), chunksize=1)
+    torus_map = {
+        i : { j : t for j, t in m.items() if atoms[j].feasible}
+        for i, m in torus_map.items() if atoms[i].feasible
+    }
+    probe_map = find_probe_fragments(atoms, torus_map, probe_radius)
 
-    return np.concatenate(res)
+    tori = [t for _, m in torus_map.items() for t in m.values()]
+    with Pool(jobs_num) as p:
+        p.map(resolve, tori, chunksize=math.ceil(len(tori)/jobs_num))
+
+    probes = list(probe_map.values())
+    with Pool(jobs_num) as p:
+        p.map(resolve, probes, chunksize=math.ceil(len(probes)/jobs_num))
+
+    return np.concatenate([
+        [a for a in atoms if a.feasible],
+        [t for t in tori if t.feasible],
+        [p for p in probes if p.feasible]
+    ])
+
+
+class Generator:
+    def __init__(self, point_area):
+        self.point_area = point_area
+
+    def call(self, elem):
+        return elem.generate_points(self.point_area)
 
 
 def generate_ses_points(coords, radii, probe_radius, point_area, jobs_num):
-    atoms = [ Atom(c,r) for c,r in zip(coords, radii) ]
+    atoms = [ Atom(i,c,r) for i,(c,r) in enumerate(zip(coords, radii)) ]
     fragments = find_ses_fragments(atoms, probe_radius, jobs_num)
 
-    res = np.array([ np.array([]) for _ in range(jobs_num) ])
-    resolver = Resolver(res, point_area)
+    generator = Generator(point_area)
     with Pool(jobs_num) as p:
-        p.map(resolver.resolve_task2, 
-              enumerate(np.split(fragments, jobs_num)), chunksize=1)
-        
-    return np.concatenate(res)
+        results = p.map(generator.call, fragments, chunksize=math.ceil(len(fragments)/jobs_num))
+        return np.concatenate(results)
 
 
 if __name__ == '__main__':
 
-    RADIUS = {}
-    with open("atomtype.txt") as f:
-        for line in f.readlines()[1:]:
-            atom = line.split()[0]
-            RADIUS[atom] = line.split()[-2]
+    # RADIUS = {}
+    # with open("atomtype.txt") as f:
+    #     for line in f.readlines()[1:]:
+    #         atom = line.split()[0]
+    #         RADIUS[atom] = line.split()[-2]
 
-    name_x = "1xvr_DE"
-    molecules_npydir = "/auto/datasets/npi/raw/01-benchmark_surfaces_npy"
-    coords = np.load(f"{molecules_npydir}/{name_x}_atomxyz.npy")
-    types = np.load(f"{molecules_npydir}/{name_x}_atomtypes.npy")
-    radii = np.array(list(map(lambda x: RADIUS[x], types)), dtype = float)
-    points, atoms_ids = surface.points_with_atomsid(coords, radii, additional_rad = 10)
+    # name_x = "1xvr_DE"
+    # molecules_npydir = "/auto/datasets/npi/raw/01-benchmark_surfaces_npy"
+    # coords = np.load(f"{molecules_npydir}/{name_x}_atomxyz.npy")
+    # types = np.load(f"{molecules_npydir}/{name_x}_atomtypes.npy")
+    # radii = np.array(list(map(lambda x: RADIUS[x], types)), dtype = float)
+
+    coords = [(0,0,0), (1,0,0)]
+    radii = [1, 1]
 
     probe_radius = 1.4  
     point_area = 1  
