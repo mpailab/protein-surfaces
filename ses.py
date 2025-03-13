@@ -95,8 +95,8 @@ class Torus (Surface):
         self.r = r
         self.bias = normal.dot(center)
 
-        x = - self.normal[1] / np.sqrt(self.normal[0] ** 2 + self.normal[1] ** 2)
-        y = self.normal[0] / np.sqrt(self.normal[0] ** 2 + self.normal[1] ** 2)
+        x = self.normal[1] / np.sqrt(self.normal[0] ** 2 + self.normal[1] ** 2)
+        y = - self.normal[0] / np.sqrt(self.normal[0] ** 2 + self.normal[1] ** 2)
         t = np.arccos(self.normal[2] / la.norm(self.normal))
 
         self.rotate_matrix = \
@@ -119,7 +119,7 @@ class Torus (Surface):
         v = v.flatten()
 
         u_spher = u * 2 * np.pi
-        v_spher = np.arcsin(v - np.sign(v)) + np.pi + np.sign(v) * np.pi / 2
+        v_spher = np.arcsin(v) + np.pi
 
         A = np.array([
             [np.cos(x) * np.cos(y), np.sin(x) * np.cos(y), np.sin(y)] 
@@ -215,8 +215,11 @@ def find_probe_fragments(
                 y = la.solve([t_ab.normal, t_ac.normal, x], [t_ab.bias, t_ac.bias, 0])
                 z = y - t_ab.center
                 roots = np.roots([x.dot(x), 2 * x.dot(z), z.dot(z) - t_ab.radius ** 2])
-                froots = [s for s in roots if np.abs(t_bc.normal.dot(s * x + y) - t_bc.bias) < 0.00001]
-                assert len(froots) > 0
+                rroots = roots.real[np.abs(roots.imag) < 1e-5]
+                froots = [s for s in rroots 
+                            if np.abs(t_bc.normal.dot(s * x + y) - t_bc.bias) < 0.00001]
+                if not froots:
+                    continue
 
                 for s in froots:
                     v = s * x + y
@@ -244,8 +247,6 @@ def find_ses_fragments(
         probe_radius : float,
         jobs_num : int) -> List[Surface]:
     
-    res = [[] for _ in range(jobs_num)]
-
     torus_map = find_toroidal_fragments(atoms, probe_radius)
     
     with Pool(jobs_num) as p:
@@ -265,11 +266,9 @@ def find_ses_fragments(
     with Pool(jobs_num) as p:
         p.map(resolve, probes, chunksize=math.ceil(len(probes)/jobs_num))
 
-    return np.concatenate([
-        [a for a in atoms if a.feasible],
-        [t for t in tori if t.feasible],
-        [p for p in probes if p.feasible]
-    ])
+    return ([a for a in atoms if a.feasible],
+            [t for t in tori if t.feasible],
+            [p for p in probes if p.feasible])
 
 
 class Generator:
@@ -280,14 +279,27 @@ class Generator:
         return elem.generate_points(self.point_area)
 
 
-def generate_ses_points(coords, radii, probe_radius, point_area, jobs_num):
+def generate_ses_points(coords, radii, probe_radius, point_area, jobs_num=1, split=False):
     atoms = [ Atom(i,c,r) for i,(c,r) in enumerate(zip(coords, radii)) ]
     fragments = find_ses_fragments(atoms, probe_radius, jobs_num)
-
     generator = Generator(point_area)
-    with Pool(jobs_num) as p:
-        results = p.map(generator.call, fragments, chunksize=math.ceil(len(fragments)/jobs_num))
-        return np.concatenate([x for x in results if x])
+    
+    if split:
+        res = []
+        for lf in fragments:
+            with Pool(jobs_num) as p:
+                results = p.map(generator.call, lf, chunksize=math.ceil(len(lf)/jobs_num))
+                results = [x for x in results if x]
+                res.append(np.concatenate(results) if results else results)
+        return res
+    
+    else:
+        fragments = np.concatenate(fragments)
+        with Pool(jobs_num) as p:
+            results = p.map(generator.call, fragments, 
+                            chunksize=math.ceil(len(fragments)/jobs_num))
+            results = [x for x in results if x]
+            return np.concatenate(results) if results else results
 
 
 if __name__ == '__main__':
