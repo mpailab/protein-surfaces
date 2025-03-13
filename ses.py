@@ -154,7 +154,7 @@ def find_toroidal_fragments(
                          * (a.radius + b.radius + 2 * probe_radius) \
                          / normal_size ** 2) / 2
             center = a.center - alpha * normal
-            radius = (a.radius + probe_radius) ** 2 - (alpha * normal_size) ** 2
+            radius = np.sqrt((a.radius + probe_radius) ** 2 - (alpha * normal_size) ** 2)
 
             a_point = np.array([probe_radius, a.radius]) / (probe_radius + a.radius)
             up_bias = la.multi_dot([a_point, [a.center, center], normal])
