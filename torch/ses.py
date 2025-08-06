@@ -382,7 +382,6 @@ class SES:
 
         # All combinations of pairs of atom indices
         combs = torch.combinations(torch.arange(self.atom.num))
-        m = combs.size(dim=0)
         a,b = combs.hsplit(2)
         a.squeeze_(1)
         b.squeeze_(1)
@@ -399,6 +398,7 @@ class SES:
         self.torus.normal = self.torus.normal[mask]
         normal_scale = normal_scale[mask]
         normal_size = normal_size[mask]
+        m = a.size(dim=0)
 
         # Tensors of atoms centers
         a_center = self.atom.center[a]
@@ -427,6 +427,11 @@ class SES:
             torch.stack((self.torus.r, b_radius)).div(b_ext_radius), 
             torch.stack((b_center, self.torus.center)), 
             self.torus.normal])
+        
+        feasible_tori_mask = (self.torus.up_bias - self.torus.down_bias).ge(1e-5) \
+                           * (self.torus.R - self.torus.r).ge(1e-5)
+        self.atom.apply_mask(feasible_atoms_mask)
+
         self.torus.phi = torch.tensor((0,1)).repeat(m)
         self.torus.psi = torch.stack(((down_bias - bias) / normal_size,
                                       (up_bias - bias) / normal_size), dim=1)
