@@ -6,8 +6,8 @@ import torch
 def _compute_valid_point_mask(
     points: torch.Tensor,
     coords: torch.Tensor,
-    atom_radii_sq: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    atom_radii: torch.Tensor,
+) -> torch.Tensor:
     """
     Return the boolean validity mask together with the squared point-atom
     distances used to build it.
@@ -25,9 +25,9 @@ def _compute_valid_point_mask(
     point_coord_dots = torch.einsum("mik,jk->mij", points, coords)
     point_atom_sq_dists = point_sq_norms + coord_sq_norms - 2 * point_coord_dots
     valid_point_mask = (
-        point_atom_sq_dists >= atom_radii_sq.view(1, 1, -1)
+        point_atom_sq_dists >= atom_radii.square().view(1, 1, -1)
     ).all(dim=-1)
-    return valid_point_mask, point_atom_sq_dists
+    return valid_point_mask
 
 
 def _compute_intersection_plane_points(
@@ -120,7 +120,6 @@ def project_points_to_ses(
         )
         return points, empty_mask
 
-    atom_radii_sq = atom_radii.square()
     atom_ext_radii = atom_radii + probe_radius
     atom_ext_radii_sq = atom_ext_radii.square()
 
@@ -128,7 +127,7 @@ def project_points_to_ses(
     # 1. Mark sampled points that are outside every atom sphere, then derive
     #    the per-atom mask used for the second index in pair-wise tests.
     # ------------------------------------------------------------------
-    valid_point_mask, _ = _compute_valid_point_mask(points, coords, atom_radii_sq)
+    valid_point_mask = _compute_valid_point_mask(points, coords, atom_radii)
     valid_atom_mask = valid_point_mask.any(dim=0)
     valid_atom_pair_mask = valid_atom_mask[:, None] & valid_atom_mask[None, :]
 
@@ -144,7 +143,7 @@ def project_points_to_ses(
     # masking them to one is enough to stabilize the analytic formulas below.
     safe_pair_sq_dists = pair_sq_dists.masked_fill(pair_sq_dists == 0, 1)
 
-    valid_probe_circle_mask, probe_circle_centers = \
+    valid_probe_circle_mask, probe_circle_centers = (
         _compute_intersection_plane_points(
             coords=coords,
             pair_diffs=pair_diffs,
@@ -152,14 +151,14 @@ def project_points_to_ses(
             safe_pair_sq_dists=safe_pair_sq_dists,
             sphere_radii=atom_ext_radii,
         )
-    valid_atom_circle_mask, atom_circle_centers = \
-        _compute_intersection_plane_points(
-            coords=coords,
-            pair_diffs=pair_diffs,
-            pair_sq_dists=pair_sq_dists,
-            safe_pair_sq_dists=safe_pair_sq_dists,
-            sphere_radii=atom_radii,
-        )
+    )
+    valid_atom_circle_mask, atom_circle_centers = _compute_intersection_plane_points(
+        coords=coords,
+        pair_diffs=pair_diffs,
+        pair_sq_dists=pair_sq_dists,
+        safe_pair_sq_dists=safe_pair_sq_dists,
+        sphere_radii=atom_radii,
+    )
 
     # Invalid expanded-sphere pairs should not contribute to the linear
     # projector, so we zero both the plane points and their direction vectors.
@@ -185,7 +184,7 @@ def project_points_to_ses(
         probe_radius * coords[:, None, :]
         + atom_radii[:, None, None] * probe_circle_centers
     ) / atom_ext_radii[:, None, None]
-    
+
     # The outer boundary plane comes from the ordinary atom-atom intersection
     # when it exists; otherwise we fall back to the expanded-sphere plane.
     boundary_plane_points = torch.where(
