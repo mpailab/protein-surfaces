@@ -1,5 +1,14 @@
+"""Solvent-excluded surface sampling and projection interfaces.
+
+External interfaces:
+    sample_atom_sphere_points: sample evenly distributed points on atom spheres.
+    sample_ses_points: sample atom-sphere points and project them onto SES.
+    project_points_to_ses: project sampled atom-sphere points onto SES.
+"""
+
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
 import torch
@@ -73,6 +82,100 @@ class _TangencyGeometry(NamedTuple):
     point_coord_diffs_dots: torch.Tensor
     tangency_plane_bias: torch.Tensor
     tangency_plane_mask: torch.Tensor
+
+
+def sample_atom_sphere_points(
+    atom_coords: torch.Tensor, # coordinates of atom centers, shape (n, 3)
+    atom_radii: torch.Tensor,  # radii of atoms, shape (n, 1), (n,), or n elements
+    m: int,                    # number of points sampled on each atom sphere
+) -> torch.Tensor:             # sampled points, shape (m, n, 3)
+    """
+    Sample evenly distributed points on every atom sphere using a Fibonacci lattice.
+
+    Args:
+        atom_coords: Atom center coordinates, shape (n, 3).
+        atom_radii: Atom radii, shape (n, 1), (n,), or any shape with n elements.
+        m: Number of points sampled on each atom sphere.
+
+    Returns:
+        sampled_points: Sphere-surface point coordinates, shape (m, n, 3).
+    """
+    if isinstance(m, bool) or not isinstance(m, int):
+        raise TypeError("m must be an integer")
+    if m < 0:
+        raise ValueError("m must be non-negative")
+
+    if atom_coords.ndim != 2 or atom_coords.shape[-1] != 3:
+        raise ValueError("atom_coords must have shape (n, 3)")
+
+    coord_dtype = atom_coords.dtype if atom_coords.is_floating_point() else torch.float32
+    radii_dtype = atom_radii.dtype if atom_radii.is_floating_point() else torch.float32
+    common_dtype = torch.promote_types(coord_dtype, radii_dtype)
+    common_device = atom_coords.device
+
+    atom_coords = atom_coords.to(dtype=common_dtype, device=common_device)
+    atom_radii = atom_radii.reshape(-1).to(dtype=common_dtype, device=common_device)
+    num_atoms = atom_coords.shape[0]
+
+    if atom_radii.numel() != num_atoms:
+        raise ValueError("atom_radii must contain one radius per atom")
+    if bool((atom_radii < 0).any().item()):
+        raise ValueError("atom_radii must be non-negative")
+    if m == 0 or num_atoms == 0:
+        return torch.empty((m, num_atoms, 3), dtype=common_dtype, device=common_device)
+
+    sample_indices = torch.arange(m, dtype=common_dtype, device=common_device)
+    z_coords = 1 - 2 * (sample_indices + 0.5) / m
+    radial_coords = torch.sqrt((1 - z_coords.square()).clamp_min(0))
+    golden_angle = torch.as_tensor(
+        math.pi * (3.0 - math.sqrt(5.0)),
+        dtype=common_dtype,
+        device=common_device,
+    )
+    azimuths = sample_indices * golden_angle
+    unit_directions = torch.stack(
+        (
+            torch.cos(azimuths) * radial_coords,
+            torch.sin(azimuths) * radial_coords,
+            z_coords,
+        ),
+        dim=-1,
+    )
+
+    return (
+        atom_coords.unsqueeze(0)
+        + atom_radii.view(1, num_atoms, 1) * unit_directions.view(m, 1, 3)
+    )
+
+
+def sample_ses_points(
+    atom_coords: torch.Tensor, # coordinates of atom centers, shape (n, 3)
+    atom_radii: torch.Tensor,  # radii of atoms, shape (n, 1), (n,), or n elements
+    m: int,                    # number of points sampled on each atom sphere
+    probe_radius: float,       # radius of the probe sphere
+) -> tuple[torch.Tensor,       # projected SES points, shape (m, n, 3)
+           torch.Tensor]:      # validity mask, shape (m, n)
+    """
+    Sample atom-sphere points and project them onto the solvent-excluded surface.
+
+    Args:
+        atom_coords: Atom center coordinates, shape (n, 3).
+        atom_radii: Atom radii, shape (n, 1), (n,), or any shape with n elements.
+        m: Number of points sampled on each atom sphere.
+        probe_radius: Probe sphere radius, scalar.
+
+    Returns:
+        projected_points_on_ses: Projected SES points, shape (m, n, 3).
+        valid_point_mask: Whether each sampled point is outside every atom sphere,
+            shape (m, n).
+    """
+    points = sample_atom_sphere_points(atom_coords, atom_radii, m)
+    return project_points_to_ses(
+        points=points,
+        atom_coords=atom_coords,
+        atom_radii=atom_radii,
+        probe_radius=probe_radius,
+    )
 
 
 def _select_suitable_atom_indices(
