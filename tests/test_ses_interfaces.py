@@ -17,6 +17,8 @@ from ses import (
     _compute_probe_centers,
     _compute_suitable_atom_indices,
     _compute_tangency_geometry,
+    _prefer_any_pair_only_probe_centers,
+    _prefer_pair_only_probe_centers,
     _prepare_projection_inputs,
     _recover_probe_centers,
     _select_suitable_atom_indices,
@@ -62,6 +64,32 @@ def _outward_atom_surface_points(
         keepdim=True,
     ).clamp_min(1e-12)
     return (atom_coords + atom_radii.unsqueeze(-1) * directions).unsqueeze(0)
+
+
+def _methane_atoms() -> tuple[torch.Tensor, torch.Tensor]:
+    tetrahedron = torch.tensor(
+        [
+            [1.0, 1.0, 1.0],
+            [1.0, -1.0, -1.0],
+            [-1.0, 1.0, -1.0],
+            [-1.0, -1.0, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+    tetrahedron = tetrahedron / torch.linalg.norm(
+        tetrahedron,
+        dim=-1,
+        keepdim=True,
+    )
+    atom_coords = torch.cat(
+        (
+            torch.zeros((1, 3), dtype=torch.float64),
+            1.09 * tetrahedron,
+        ),
+        dim=0,
+    )
+    atom_radii = torch.tensor([1.70, 1.20, 1.20, 1.20, 1.20], dtype=torch.float64)
+    return atom_coords, atom_radii
 
 
 def test_sample_atom_sphere_points_returns_uniform_points_on_atom_spheres() -> None:
@@ -438,6 +466,259 @@ def test_project_points_to_ses_projects_three_atom_owner_points_to_shared_probe(
     assert torch.allclose(projected_points, expected_points, atol=1e-12, rtol=0)
 
 
+def test_compute_probe_centers_keeps_water_hydrogen_pair_probe_visible() -> None:
+    coords = torch.tensor(
+        [
+            [0.0000, 0.0000, 0.0000],
+            [0.9572, 0.0000, 0.0000],
+            [-0.2390, 0.9270, 0.0000],
+        ],
+        dtype=torch.float64,
+    )
+    radii = torch.tensor([1.52, 1.20, 1.20], dtype=torch.float64)
+    points = torch.tensor(
+        [
+            [
+                [0.0, -1.52, 0.0],
+                [1.0114137140764754, 1.116675813835884, 0.436],
+                [-0.2390, 2.1270, 0.0],
+            ]
+        ],
+        dtype=torch.float64,
+    )
+
+    probe_centers, valid_point_mask = _compute_probe_centers(
+        points,
+        coords,
+        radii,
+        probe_radius=1.4,
+    )
+
+    center_atom_dists = torch.linalg.norm(probe_centers[0, 1] - coords, dim=-1)
+    assert valid_point_mask[0, 1]
+    assert center_atom_dists[0] > radii[0] + 1.4
+    assert torch.allclose(
+        center_atom_dists[1:],
+        radii[1:] + 1.4,
+        atol=1e-12,
+        rtol=0,
+    )
+
+
+def test_compute_probe_centers_allows_water_oxygen_point_to_hydrogen_pair() -> None:
+    coords = torch.tensor(
+        [
+            [0.0000, 0.0000, 0.0000],
+            [0.9572, 0.0000, 0.0000],
+            [-0.2390, 0.9270, 0.0000],
+        ],
+        dtype=torch.float64,
+    )
+    radii = torch.tensor([1.52, 1.20, 1.20], dtype=torch.float64)
+    points = torch.tensor(
+        [
+            [
+                [0.8208533023094201, 1.1618823052054148, 0.5353777777777777],
+                [2.1572, 0.0, 0.0],
+                [-0.2390, 2.1270, 0.0],
+            ]
+        ],
+        dtype=torch.float64,
+    )
+
+    probe_centers, valid_point_mask = _compute_probe_centers(
+        points,
+        coords,
+        radii,
+        probe_radius=1.4,
+    )
+
+    center_atom_dists = torch.linalg.norm(probe_centers[0, 0] - coords, dim=-1)
+    assert valid_point_mask[0, 0]
+    assert center_atom_dists[0] > radii[0] + 1.4
+    assert torch.allclose(
+        center_atom_dists[1:],
+        radii[1:] + 1.4,
+        atol=1e-12,
+        rtol=0,
+    )
+
+
+def test_compute_probe_centers_allows_ethanol_carbon_points_to_hydrogen_pairs() -> None:
+    coords = torch.tensor(
+        [
+            [0.000, 0.000, 0.000],
+            [1.520, 0.000, 0.000],
+            [2.120, 1.210, 0.000],
+            [-0.540, 0.930, 0.000],
+            [-0.540, -0.465, 0.805],
+            [-0.540, -0.465, -0.805],
+            [1.910, -0.520, 0.890],
+            [1.910, -0.520, -0.890],
+            [2.950, 1.100, 0.000],
+        ],
+        dtype=torch.float64,
+    )
+    radii = torch.tensor(
+        [1.70, 1.70, 1.52, 1.20, 1.20, 1.20, 1.20, 1.20, 1.20],
+        dtype=torch.float64,
+    )
+    probe_radius = 1.4
+    points = sample_atom_sphere_points(coords, radii, 900)[[39, 60, 67, 288]]
+
+    probe_centers, valid_point_mask = _compute_probe_centers(
+        points,
+        coords,
+        radii,
+        probe_radius=probe_radius,
+    )
+
+    expectations = (
+        (0, 0, (4, 6)),
+        (1, 0, (4, 6)),
+        (2, 1, (4, 6)),
+        (3, 1, (6, 8)),
+    )
+    expanded_radii = radii + probe_radius
+    for sample_idx, owner_idx, hydrogen_pair in expectations:
+        center_atom_dists = torch.linalg.norm(
+            probe_centers[sample_idx, owner_idx] - coords,
+            dim=-1,
+        )
+
+        assert valid_point_mask[sample_idx, owner_idx]
+        assert center_atom_dists[owner_idx] > expanded_radii[owner_idx]
+        assert torch.allclose(
+            center_atom_dists[list(hydrogen_pair)],
+            expanded_radii[list(hydrogen_pair)],
+            atol=1e-12,
+            rtol=0,
+        )
+
+
+def test_project_points_to_ses_keeps_ch4_outward_hydrogen_surface_points() -> None:
+    coords, radii = _methane_atoms()
+    points = sample_atom_sphere_points(coords, radii, 900)
+    num_samples = points.shape[0]
+
+    _, valid_point_mask = project_points_to_ses(
+        points=points,
+        atom_coords=coords,
+        atom_radii=radii,
+        probe_radius=1.4,
+    )
+
+    hydrogen_points = points[:, 1:]
+    hydrogen_coords = coords[1:]
+    hydrogen_directions = hydrogen_coords / torch.linalg.norm(
+        hydrogen_coords,
+        dim=-1,
+        keepdim=True,
+    )
+    outward_cosines = (
+        (hydrogen_points - hydrogen_coords.unsqueeze(0))
+        * hydrogen_directions.unsqueeze(0)
+    ).sum(dim=-1) / radii[1:].view(1, -1)
+
+    hydrogen_atom_dists = torch.linalg.norm(
+        hydrogen_points.unsqueeze(2) - coords.view(1, 1, -1, 3),
+        dim=-1,
+    )
+    non_owner_mask = torch.ones((4, 5), dtype=torch.bool)
+    non_owner_mask[torch.arange(4), torch.arange(1, 5)] = False
+    non_owner_radii = radii.view(1, 5).expand(4, 5)[non_owner_mask].view(1, 4, 4)
+    outside_non_owner_atoms = (
+        hydrogen_atom_dists[:, non_owner_mask].view(num_samples, 4, 4)
+        >= non_owner_radii + 1e-8
+    ).all(dim=-1)
+    outward_hydrogen_ses_mask = (outward_cosines > 0.9) & outside_non_owner_atoms
+
+    assert outward_hydrogen_ses_mask.any()
+    assert bool(valid_point_mask[:, 1:][outward_hydrogen_ses_mask].all().item())
+
+
+def test_any_pair_repair_ignores_irrelevant_ethanol_oxygen_point() -> None:
+    coords = torch.tensor(
+        [
+            [0.000, 0.000, 0.000],
+            [1.520, 0.000, 0.000],
+            [2.120, 1.210, 0.000],
+            [-0.540, 0.930, 0.000],
+            [-0.540, -0.465, 0.805],
+            [-0.540, -0.465, -0.805],
+            [1.910, -0.520, 0.890],
+            [1.910, -0.520, -0.890],
+            [2.950, 1.100, 0.000],
+        ],
+        dtype=torch.float64,
+    )
+    radii = torch.tensor(
+        [1.70, 1.70, 1.52, 1.20, 1.20, 1.20, 1.20, 1.20, 1.20],
+        dtype=torch.float64,
+    )
+    probe_radius = 1.4
+    points = sample_atom_sphere_points(coords, radii, 900)[[86]]
+    point_geometry = _compute_point_atom_geometry(points, coords, radii)
+    pair_geometry = _compute_pair_geometry(coords, radii, probe_radius)
+    tangency_geometry = _compute_tangency_geometry(
+        point_geometry,
+        pair_geometry,
+        radii,
+    )
+    geodesic_distances = _compute_geodesic_distances(
+        points,
+        coords,
+        radii,
+        pair_geometry,
+        tangency_geometry,
+    )
+    suitable_atom_indices = _compute_suitable_atom_indices(
+        point_geometry,
+        pair_geometry,
+        tangency_geometry,
+        geodesic_distances,
+    )
+    affine_projection, affine_shift = _build_affine_projector(
+        points.shape[0],
+        point_geometry,
+        pair_geometry,
+        suitable_atom_indices,
+    )
+    probe_centers = _recover_probe_centers(
+        points,
+        coords,
+        pair_geometry.atom_ext_radii_sq,
+        affine_projection,
+        affine_shift,
+    )
+    probe_centers = _prefer_pair_only_probe_centers(
+        points,
+        coords,
+        pair_geometry,
+        suitable_atom_indices,
+        probe_radius,
+        probe_centers,
+    )
+
+    repaired_probe_centers = _prefer_any_pair_only_probe_centers(
+        points,
+        coords,
+        radii,
+        pair_geometry,
+        tangency_geometry,
+        probe_radius,
+        probe_centers,
+    )
+
+    assert point_geometry.valid_point_mask[0, 2]
+    assert torch.allclose(
+        repaired_probe_centers[0, 2],
+        probe_centers[0, 2],
+        atol=1e-12,
+        rtol=0,
+    )
+
+
 def test_project_points_to_ses_promotes_integer_points_to_float() -> None:
     coords = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float64)
     radii = torch.tensor([1.0], dtype=torch.float64)
@@ -525,8 +806,14 @@ def test_project_points_to_ses_projects_fixture_npy_atom_surface_points(
     point_sq_norms = points.square().sum(dim=-1, keepdim=True)
     atom_sq_norms = atom_coords.square().sum(dim=-1).view(1, 1, -1)
     point_atom_sq_dists = point_sq_norms + atom_sq_norms - 2 * (points @ atom_coords.T)
+    atom_radii_sq = atom_radii.square().view(1, 1, -1)
+    sq_dist_tol = (
+        100
+        * torch.finfo(point_atom_sq_dists.dtype).eps
+        * torch.maximum(point_atom_sq_dists.abs(), atom_radii_sq).clamp_min(1)
+    )
     expected_valid_mask = (
-        point_atom_sq_dists >= atom_radii.square().view(1, 1, -1)
+        point_atom_sq_dists >= atom_radii_sq - sq_dist_tol
     ).all(dim=-1)
     assert torch.equal(valid_point_mask, expected_valid_mask)
 
@@ -693,19 +980,65 @@ def test_select_suitable_atom_indices_ranks_by_geodesic_distance() -> None:
             ]
         ]
     )
+    pair_normals = torch.zeros((3, 3, 3))
 
-    selected = _select_suitable_atom_indices(suitable_atom_mask, geodesic_distances)
+    selected = _select_suitable_atom_indices(
+        suitable_atom_mask,
+        geodesic_distances,
+        pair_normals,
+    )
 
     expected = torch.tensor([[[2, 1], [0, 1], [2, 2]]], dtype=torch.int)
+    assert torch.equal(selected, expected)
+
+
+def test_select_suitable_atom_indices_uses_next_unblocked_neighbor() -> None:
+    suitable_atom_mask = torch.tensor(
+        [
+            [
+                [False, True, True, True],
+                [False, False, False, False],
+                [False, False, False, False],
+                [False, False, False, False],
+            ]
+        ]
+    )
+    geodesic_distances = torch.tensor(
+        [
+            [
+                [0.0, 10.0, 9.0, 8.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ]
+        ]
+    )
+    pair_normals = torch.zeros((4, 4, 3))
+    pair_normals[0, 1] = torch.tensor([1.0, 0.0, 0.0])
+    pair_normals[0, 2] = torch.tensor([1.0, 0.0, 0.0])
+    pair_normals[0, 3] = torch.tensor([0.0, 1.0, 0.0])
+
+    selected = _select_suitable_atom_indices(
+        suitable_atom_mask,
+        geodesic_distances,
+        pair_normals,
+    )
+
+    expected = torch.tensor([[[1, 3], [1, 1], [2, 2], [3, 3]]], dtype=torch.int)
     assert torch.equal(selected, expected)
 
 
 def test_select_suitable_atom_indices_rejects_distance_shape_mismatch() -> None:
     suitable_atom_mask = torch.zeros((1, 2, 2), dtype=torch.bool)
     geodesic_distances = torch.zeros((1, 2, 3))
+    pair_normals = torch.zeros((2, 2, 3))
 
     with pytest.raises(ValueError, match="geodesic_distances"):
-        _select_suitable_atom_indices(suitable_atom_mask, geodesic_distances)
+        _select_suitable_atom_indices(
+            suitable_atom_mask,
+            geodesic_distances,
+            pair_normals,
+        )
 
 
 def test_compute_point_atom_geometry_returns_reusable_products() -> None:

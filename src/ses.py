@@ -181,6 +181,7 @@ def sample_ses_points(
 def _select_suitable_atom_indices(
     suitable_atom_mask: torch.Tensor,        # shape (m, n, n), dtype bool
     geodesic_distances: torch.Tensor,        # shape (m, n, n), dtype float
+    pair_normals: torch.Tensor,              # shape (n, n, 3), dtype float
 ) -> torch.Tensor:                           # shape (m, n, 2), dtype torch.int
     """
     For each `(sample, atom)` row in a boolean mask of shape `(m, n, n)`,
@@ -194,6 +195,7 @@ def _select_suitable_atom_indices(
     Args:
         suitable_atom_mask: Candidate neighbor mask, shape (m, n, n).
         geodesic_distances: Distances used to rank candidates, shape (m, n, n).
+        pair_normals: Unit normals of pair planes, shape (n, n, 3).
 
     Returns:
         Selected atom indices, shape (m, n, 2).
@@ -223,21 +225,73 @@ def _select_suitable_atom_indices(
         raise ValueError(
             "geodesic_distances must have the same shape as suitable_atom_mask"
         )
+    if pair_normals.shape != (num_atoms, num_atoms, 3):
+        raise ValueError("pair_normals must have shape (n, n, 3)")
 
-    # Invalid entries get -inf, so sorting by descending distance pushes them
-    # behind every valid candidate. Stable sorting preserves atom-index order for
-    # exact ties, matching the previous deterministic tie-break.
+    # Invalid entries get -inf, so max-distance selection ignores them.
+    # `argmax` preserves the lowest atom index for exact ties, matching the
+    # previous deterministic tie-break.
     distances = torch.where(
         suitable_atom_mask,
         geodesic_distances,
         torch.full((), float("-inf"), dtype=geodesic_distances.dtype, device=device),
     )
-    ordered_indices = torch.argsort(distances, dim=-1, descending=True, stable=True)
+    first_indices = distances.argmax(dim=-1)
+    first_valid = torch.gather(
+        suitable_atom_mask,
+        -1,
+        first_indices.unsqueeze(-1),
+    ).squeeze(-1)
+    owner_rows = partner_indices.to(torch.long).view(1, num_atoms).expand(
+        num_samples,
+        num_atoms,
+    )
+    candidate_indices = partner_indices.to(torch.long).view(1, 1, num_atoms).expand(
+        num_samples,
+        num_atoms,
+        num_atoms,
+    )
+    normal_cosines = (
+        pair_normals[owner_rows, first_indices].unsqueeze(-2)
+        * pair_normals[owner_rows.unsqueeze(-1), candidate_indices]
+    ).sum(dim=-1)
+    first_distances = torch.gather(
+        distances,
+        -1,
+        first_indices.unsqueeze(-1),
+    ).squeeze(-1)
+    second_blocked = (
+        first_valid.unsqueeze(-1)
+        & suitable_atom_mask
+        & (normal_cosines > 0)
+        & (distances <= first_distances.unsqueeze(-1) * normal_cosines)
+    )
+    second_blocked.scatter_(-1, first_indices.unsqueeze(-1), False)
+    second_mask = suitable_atom_mask & ~second_blocked
+    second_mask.scatter_(-1, first_indices.unsqueeze(-1), False)
+    second_distances = torch.where(
+        second_mask,
+        distances,
+        torch.full((), float("-inf"), dtype=geodesic_distances.dtype, device=device),
+    )
+    second_indices = second_distances.argmax(dim=-1)
+    second_valid = torch.gather(
+        second_mask,
+        -1,
+        second_indices.unsqueeze(-1),
+    ).squeeze(-1)
 
-    first_two_indices = ordered_indices[..., :2].to(index_dtype)
-    first_two_mask = torch.gather(suitable_atom_mask, -1, ordered_indices[..., :2])
-
-    return torch.where(first_two_mask, first_two_indices, owner_indices)
+    selected_first = torch.where(
+        first_valid,
+        first_indices.to(index_dtype),
+        owner_indices[..., 0],
+    )
+    selected_second = torch.where(
+        second_valid,
+        second_indices.to(index_dtype),
+        owner_indices[..., 1],
+    )
+    return torch.stack((selected_first, selected_second), dim=-1)
 
 
 def _prepare_projection_inputs(
@@ -311,8 +365,14 @@ def _compute_point_atom_geometry(
     point_atom_sq_dists = (
         point_sq_norms + coord_sq_norms.view(1, 1, -1) - 2 * point_coord_dots
     )
+    radii_sq = atom_radii.square().view(1, 1, -1)
+    sq_dist_tol = (
+        100
+        * torch.finfo(point_atom_sq_dists.dtype).eps
+        * torch.maximum(point_atom_sq_dists.abs(), radii_sq).clamp_min(1)
+    )
     valid_point_mask = (
-        point_atom_sq_dists >= atom_radii.square().view(1, 1, -1)
+        point_atom_sq_dists >= radii_sq - sq_dist_tol
     ).all(dim=-1) # shape (m, n)
 
     return _PointAtomGeometry(valid_point_mask, coord_sq_norms, point_coord_dots)
@@ -486,10 +546,14 @@ def _compute_suitable_atom_indices(
         & tangency_geometry.tangency_plane_mask
     ) # shape (m, n, n)
     suitable_atom_mask.diagonal(dim1=-2, dim2=-1).zero_()
+    pair_dists = torch.sqrt(pair_geometry.pair_coord_diffs_sq).clamp_min(
+        torch.finfo(pair_geometry.pair_coord_diffs.dtype).eps,
+    )
 
     return _select_suitable_atom_indices(
         suitable_atom_mask,
         geodesic_distances,
+        pair_geometry.pair_coord_diffs / pair_dists.unsqueeze(-1),
     )
 
 
@@ -589,12 +653,254 @@ def _recover_probe_centers(
     projected_atom_sq_dists = (
         projected_atoms - broadcasted_atom_coords
     ).square().sum(dim=-1)
-    probe_offset_dists = torch.sqrt(
-        atom_ext_radii_sq.unsqueeze(0) - projected_atom_sq_dists
+    probe_offset_sq = atom_ext_radii_sq.unsqueeze(0) - projected_atom_sq_dists
+    probe_offset_dists = torch.sqrt(probe_offset_sq.clamp_min(0))
+    probe_shift_denoms = projected_point_atom_dists.clamp_min(
+        torch.finfo(projected_point_atom_dists.dtype).eps,
     )
-    probe_shift_coefs = probe_offset_dists / projected_point_atom_dists
+    probe_shift_coefs = probe_offset_dists / probe_shift_denoms
 
     return projected_atoms + probe_directions * probe_shift_coefs.unsqueeze(-1)
+
+
+def _compute_pair_probe_centers(
+    points: torch.Tensor,
+    atom_coords: torch.Tensor,
+    atom_ext_radii: torch.Tensor,
+    first_indices: torch.Tensor,
+    second_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Build probe centers on expanded-sphere intersection circles for atom pairs.
+    """
+    eps = torch.finfo(points.dtype).eps
+
+    first_centers = atom_coords[first_indices]
+    second_centers = atom_coords[second_indices]
+    first_radii = atom_ext_radii[first_indices]
+    second_radii = atom_ext_radii[second_indices]
+    axes = second_centers - first_centers
+    axis_dists = torch.linalg.norm(axes, dim=-1).clamp_min(eps)
+    axis_dirs = axes / axis_dists.unsqueeze(-1)
+
+    circle_offsets = (
+        first_radii.square()
+        - second_radii.square()
+        + axis_dists.square()
+    ) / (2 * axis_dists)
+    circle_centers = first_centers + circle_offsets.unsqueeze(-1) * axis_dirs
+    circle_radii = torch.sqrt(
+        (first_radii.square() - circle_offsets.square()).clamp_min(0),
+    )
+
+    pair_points = points
+    while pair_points.ndim < circle_centers.ndim:
+        pair_points = pair_points.unsqueeze(-2)
+
+    radial_dirs = pair_points - circle_centers
+    radial_dirs = radial_dirs - (radial_dirs * axis_dirs).sum(
+        dim=-1,
+        keepdim=True,
+    ) * axis_dirs
+    radial_dir_norms = torch.linalg.norm(radial_dirs, dim=-1, keepdim=True)
+    z_ref = torch.zeros_like(axis_dirs)
+    z_ref[..., 2] = 1
+    y_ref = torch.zeros_like(axis_dirs)
+    y_ref[..., 1] = 1
+    refs = torch.where(axis_dirs[..., 2:].abs() > 0.9, y_ref, z_ref)
+    fallback_dirs = torch.cross(axis_dirs, refs, dim=-1)
+    fallback_dirs = fallback_dirs / torch.linalg.norm(
+        fallback_dirs,
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(eps)
+    radial_dirs = torch.where(
+        radial_dir_norms > eps,
+        radial_dirs / radial_dir_norms.clamp_min(eps),
+        fallback_dirs,
+    )
+    return circle_centers + circle_radii.unsqueeze(-1) * radial_dirs
+
+
+def _prefer_pair_only_probe_centers(
+    points: torch.Tensor,
+    atom_coords: torch.Tensor,
+    pair_geometry: _PairGeometry,
+    suitable_atom_indices: torch.Tensor,
+    probe_radius: float,
+    owner_probe_centers: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Prefer probe centers supported only by two selected neighbors when valid.
+    """
+    num_samples, num_atoms, _ = points.shape
+    device = points.device
+    dtype = points.dtype
+    eps = torch.finfo(dtype).eps
+
+    owner_indices = torch.arange(num_atoms, device=device, dtype=torch.long)
+    owner_indices = owner_indices.view(1, num_atoms).expand(num_samples, -1)
+    first_indices = suitable_atom_indices[..., 0].to(torch.long)
+    second_indices = suitable_atom_indices[..., 1].to(torch.long)
+    pair_only_mask = (
+        (first_indices != owner_indices)
+        & (second_indices != owner_indices)
+        & (first_indices != second_indices)
+        & pair_geometry.valid_atom_pair_mask[first_indices, second_indices]
+    )
+
+    pair_probe_centers = _compute_pair_probe_centers(
+        points,
+        atom_coords,
+        pair_geometry.atom_ext_radii,
+        first_indices,
+        second_indices,
+    )
+
+    center_atom_dists = torch.linalg.norm(
+        pair_probe_centers.unsqueeze(-2) - atom_coords,
+        dim=-1,
+    )
+    feasibility_tol = 100 * eps * pair_geometry.atom_ext_radii.max().clamp_min(1)
+    pair_feasible = (
+        center_atom_dists
+        >= pair_geometry.atom_ext_radii.view(1, 1, -1) - feasibility_tol
+    ).all(dim=-1)
+    owner_center_atom_dists = torch.linalg.norm(
+        owner_probe_centers.unsqueeze(-2) - atom_coords,
+        dim=-1,
+    )
+    owner_feasible = (
+        owner_center_atom_dists
+        >= pair_geometry.atom_ext_radii.view(1, 1, -1) - feasibility_tol
+    ).all(dim=-1)
+    owner_errors = torch.abs(
+        torch.linalg.norm(points - owner_probe_centers, dim=-1) - probe_radius,
+    )
+    pair_errors = torch.abs(
+        torch.linalg.norm(points - pair_probe_centers, dim=-1) - probe_radius,
+    )
+    use_pair = pair_only_mask & pair_feasible & (
+        ~owner_feasible | (pair_errors < owner_errors)
+    )
+    return torch.where(
+        use_pair.unsqueeze(-1),
+        pair_probe_centers,
+        owner_probe_centers,
+    )
+
+
+def _prefer_any_pair_only_probe_centers(
+    points: torch.Tensor,
+    atom_coords: torch.Tensor,
+    atom_radii: torch.Tensor,
+    pair_geometry: _PairGeometry,
+    tangency_geometry: _TangencyGeometry,
+    probe_radius: float,
+    current_probe_centers: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Repair infeasible centers by trying probe supports from any two non-owner atoms.
+    """
+    num_samples, num_atoms, _ = points.shape
+    if num_atoms < 3:
+        return current_probe_centers
+
+    device = points.device
+    dtype = points.dtype
+    eps = torch.finfo(dtype).eps
+    pair_indices = torch.combinations(
+        torch.arange(num_atoms, device=device, dtype=torch.long),
+        r=2,
+    )
+    first_indices = pair_indices[:, 0].view(1, 1, -1).expand(
+        num_samples,
+        num_atoms,
+        -1,
+    )
+    second_indices = pair_indices[:, 1].view(1, 1, -1).expand(
+        num_samples,
+        num_atoms,
+        -1,
+    )
+    owner_indices = torch.arange(num_atoms, device=device, dtype=torch.long).view(
+        1,
+        num_atoms,
+        1,
+    )
+    pair_only_mask = (
+        (first_indices != owner_indices)
+        & (second_indices != owner_indices)
+        & pair_geometry.valid_atom_pair_mask[first_indices, second_indices]
+    )
+
+    pair_probe_centers = _compute_pair_probe_centers(
+        points,
+        atom_coords,
+        pair_geometry.atom_ext_radii,
+        first_indices,
+        second_indices,
+    )
+
+    feasibility_tol = 100 * eps * pair_geometry.atom_ext_radii.max().clamp_min(1)
+    first_normals = pair_geometry.pair_coord_diffs[first_indices, second_indices]
+    second_normals = -first_normals
+    normal_dists = torch.linalg.norm(first_normals, dim=-1).clamp_min(eps)
+    owner_coords = atom_coords[owner_indices.squeeze(-1)].unsqueeze(-2)
+    owner_radii = atom_radii.view(1, num_atoms, 1).clamp_min(eps)
+    pair_points = points.unsqueeze(-2)
+    first_biases = tangency_geometry.tangency_plane_bias[
+        first_indices,
+        second_indices,
+    ]
+    second_biases = tangency_geometry.tangency_plane_bias[
+        second_indices,
+        first_indices,
+    ]
+    first_circle_cosines = (
+        first_biases - (first_normals * owner_coords).sum(dim=-1)
+    ) / (owner_radii * normal_dists)
+    second_circle_cosines = (
+        second_biases - (second_normals * owner_coords).sum(dim=-1)
+    ) / (owner_radii * normal_dists)
+    contact_plane_mask = (
+        (first_circle_cosines.abs() <= 1)
+        & (second_circle_cosines.abs() <= 1)
+        & ((pair_points * first_normals).sum(dim=-1) <= first_biases)
+        & ((pair_points * second_normals).sum(dim=-1) <= second_biases)
+    )
+    current_feasible = (
+        torch.linalg.norm(current_probe_centers.unsqueeze(-2) - atom_coords, dim=-1)
+        >= pair_geometry.atom_ext_radii.view(1, 1, -1) - feasibility_tol
+    ).all(dim=-1)
+    pair_feasible = (
+        torch.linalg.norm(pair_probe_centers.unsqueeze(-2) - atom_coords, dim=-1)
+        >= pair_geometry.atom_ext_radii.view(1, 1, 1, -1) - feasibility_tol
+    ).all(dim=-1)
+    pair_errors = torch.abs(
+        torch.linalg.norm(points.unsqueeze(-2) - pair_probe_centers, dim=-1)
+        - probe_radius,
+    )
+    pair_scores = torch.where(
+        pair_only_mask
+        & contact_plane_mask
+        & pair_feasible
+        & ~current_feasible.unsqueeze(-1),
+        pair_errors,
+        torch.full((), float("inf"), dtype=dtype, device=device),
+    )
+    best_scores, best_indices = pair_scores.min(dim=-1)
+    best_probe_centers = torch.gather(
+        pair_probe_centers,
+        2,
+        best_indices.view(num_samples, num_atoms, 1, 1).expand(-1, -1, 1, 3),
+    ).squeeze(2)
+
+    return torch.where(
+        best_scores.isfinite().unsqueeze(-1),
+        best_probe_centers,
+        current_probe_centers,
+    )
 
 
 def _compute_probe_centers(
@@ -677,6 +983,23 @@ def _compute_probe_centers(
         pair_geometry.atom_ext_radii_sq,
         affine_projection,
         affine_shift,
+    )
+    probe_centers = _prefer_pair_only_probe_centers(
+        points,
+        atom_coords,
+        pair_geometry,
+        suitable_atom_indices,
+        probe_radius,
+        probe_centers,
+    )
+    probe_centers = _prefer_any_pair_only_probe_centers(
+        points,
+        atom_coords,
+        atom_radii,
+        pair_geometry,
+        tangency_geometry,
+        probe_radius,
+        probe_centers,
     )
 
     return probe_centers, point_geometry.valid_point_mask
