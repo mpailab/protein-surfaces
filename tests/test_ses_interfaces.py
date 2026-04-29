@@ -17,6 +17,7 @@ from ses import (
     _compute_probe_centers,
     _compute_suitable_atom_indices,
     _compute_tangency_geometry,
+    _probe_centers_accessible_from_exterior,
     _prefer_any_pair_only_probe_centers,
     _prefer_pair_only_probe_centers,
     _prepare_projection_inputs,
@@ -89,6 +90,22 @@ def _methane_atoms() -> tuple[torch.Tensor, torch.Tensor]:
         dim=0,
     )
     atom_radii = torch.tensor([1.70, 1.20, 1.20, 1.20, 1.20], dtype=torch.float64)
+    return atom_coords, atom_radii
+
+
+def _octahedral_probe_cage_atoms() -> tuple[torch.Tensor, torch.Tensor]:
+    atom_coords = torch.tensor(
+        [
+            [3.0, 0.0, 0.0],
+            [-3.0, 0.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [0.0, -3.0, 0.0],
+            [0.0, 0.0, 3.0],
+            [0.0, 0.0, -3.0],
+        ],
+        dtype=torch.float64,
+    )
+    atom_radii = torch.full((6,), 1.1, dtype=torch.float64)
     return atom_coords, atom_radii
 
 
@@ -699,7 +716,54 @@ def test_project_points_to_ses_keeps_ch4_outward_hydrogen_surface_points() -> No
     assert bool(valid_point_mask[:, 1:][outward_hydrogen_ses_mask].all().item())
 
 
-def test_project_points_to_ses_avoids_glucose_chair_relaxed_patch_outlier() -> None:
+def test_probe_centers_accessible_from_exterior_rejects_enclosed_cavity() -> None:
+    coords, radii = _octahedral_probe_cage_atoms()
+    probe_centers = torch.tensor(
+        [[[0.0, 0.0, 0.0], [0.0, 0.0, 6.0]]],
+        dtype=torch.float64,
+    )
+
+    accessible_mask = _probe_centers_accessible_from_exterior(
+        probe_centers=probe_centers,
+        atom_coords=coords,
+        atom_radii=radii,
+        probe_radius=1.4,
+        grid_spacing=0.2,
+    )
+
+    assert torch.equal(accessible_mask, torch.tensor([[False, True]]))
+
+
+def test_project_points_to_ses_rejects_interior_probe_center() -> None:
+    coords, radii = _octahedral_probe_cage_atoms()
+    directions = coords / torch.linalg.norm(coords, dim=-1, keepdim=True)
+    points = coords + radii.unsqueeze(-1) * directions
+    points[0] = coords[0] - radii[0] * directions[0]
+
+    probe_centers, local_valid_mask = _compute_probe_centers(
+        points.unsqueeze(0),
+        coords,
+        radii,
+        probe_radius=1.4,
+    )
+    projected_points, valid_point_mask = project_points_to_ses(
+        points=points.unsqueeze(0),
+        atom_coords=coords,
+        atom_radii=radii,
+        probe_radius=1.4,
+    )
+
+    assert local_valid_mask[0, 0]
+    assert torch.allclose(
+        probe_centers[0, 0],
+        torch.tensor([0.5, 0.0, 0.0], dtype=torch.float64),
+    )
+    assert not valid_point_mask[0, 0]
+    assert bool(valid_point_mask[0, 1:].all().item())
+    assert torch.isfinite(projected_points).all()
+
+
+def test_project_points_to_ses_rejects_glucose_chair_infeasible_patch_outlier() -> None:
     coords, radii = _glucose_chair_atoms()
     points = sample_atom_sphere_points(coords, radii, 350)
 
@@ -711,8 +775,7 @@ def test_project_points_to_ses_avoids_glucose_chair_relaxed_patch_outlier() -> N
     )
 
     projection_distances = torch.linalg.norm(projected_points - points, dim=-1)
-    assert valid_point_mask[27, 17]
-    assert torch.allclose(projected_points[27, 17], points[27, 17])
+    assert not valid_point_mask[27, 17]
     assert projection_distances[valid_point_mask].max() < 0.7
 
 

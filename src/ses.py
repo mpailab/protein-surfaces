@@ -9,7 +9,7 @@ External interfaces:
 from __future__ import annotations
 
 import math
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -166,8 +166,8 @@ def sample_ses_points(
 
     Returns:
         projected_points_on_ses: Projected SES points, shape (m, n, 3).
-        valid_point_mask: Whether each sampled point is outside every atom sphere,
-            shape (m, n).
+        valid_point_mask: Whether each projected point has an externally
+            accessible probe center, shape (m, n).
     """
     points = sample_atom_sphere_points(atom_coords, atom_radii, m)
     return project_points_to_ses(
@@ -1539,6 +1539,274 @@ def _compute_probe_centers(
     )
 
 
+def _segment_clearance_mask(
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    atom_coords: torch.Tensor,
+    expanded_atom_radii_sq: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Check whether each segment avoids the expanded atom spheres.
+    """
+    segment_dirs = ends - starts
+    segment_lens_sq = segment_dirs.square().sum(dim=-1).clamp_min(
+        torch.finfo(starts.dtype).eps,
+    )
+    start_to_atoms = atom_coords.unsqueeze(0) - starts.unsqueeze(1)
+    nearest_params = (
+        start_to_atoms * segment_dirs.unsqueeze(1)
+    ).sum(dim=-1) / segment_lens_sq.unsqueeze(-1)
+    nearest_params = nearest_params.clamp(0, 1)
+    closest_points = starts.unsqueeze(1) + nearest_params.unsqueeze(-1) * segment_dirs.unsqueeze(1)
+    closest_dists_sq = (closest_points - atom_coords.unsqueeze(0)).square().sum(dim=-1)
+    tol = (
+        256
+        * torch.finfo(starts.dtype).eps
+        * torch.maximum(closest_dists_sq, expanded_atom_radii_sq.unsqueeze(0)).clamp_min(1)
+    )
+    return (closest_dists_sq >= expanded_atom_radii_sq.unsqueeze(0) - tol).all(dim=-1)
+
+
+def _external_reachable_grid(
+    atom_coords: torch.Tensor,
+    expanded_atom_radii: torch.Tensor,
+    query_centers: torch.Tensor,
+    grid_spacing: float,
+    max_grid_points: int,
+) -> tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]:
+    """
+    Build a flood-filled grid of center-space connected to the exterior.
+    """
+    dtype = atom_coords.dtype
+    device = atom_coords.device
+    margin = max(2.0 * grid_spacing, float(expanded_atom_radii.max().item()) + grid_spacing)
+    sphere_min = atom_coords - expanded_atom_radii.unsqueeze(-1)
+    sphere_max = atom_coords + expanded_atom_radii.unsqueeze(-1)
+    bbox_min = torch.minimum(sphere_min.min(dim=0).values, query_centers.min(dim=0).values) - margin
+    bbox_max = torch.maximum(sphere_max.max(dim=0).values, query_centers.max(dim=0).values) + margin
+
+    extents = (bbox_max - bbox_min).clamp_min(grid_spacing)
+    dims = torch.ceil(extents / grid_spacing).to(torch.long) + 1
+    grid_points = int(dims.prod().item())
+    if grid_points > max_grid_points:
+        scale = (grid_points / max_grid_points) ** (1.0 / 3.0)
+        grid_spacing *= scale
+        dims = torch.ceil(extents / grid_spacing).to(torch.long) + 1
+        grid_points = int(dims.prod().item())
+
+    nx, ny, nz = (int(dim.item()) for dim in dims)
+    flat_free = torch.empty(grid_points, dtype=torch.bool, device=device)
+    expanded_atom_radii_sq = expanded_atom_radii.square()
+    block_size = 131072
+    yz_size = ny * nz
+    for start in range(0, grid_points, block_size):
+        stop = min(start + block_size, grid_points)
+        flat_indices = torch.arange(start, stop, device=device, dtype=torch.long)
+        ix = flat_indices // yz_size
+        rem = flat_indices - ix * yz_size
+        iy = rem // nz
+        iz = rem - iy * nz
+        grid_centers = torch.stack(
+            (
+                bbox_min[0] + ix.to(dtype) * grid_spacing,
+                bbox_min[1] + iy.to(dtype) * grid_spacing,
+                bbox_min[2] + iz.to(dtype) * grid_spacing,
+            ),
+            dim=-1,
+        )
+        sq_dists = (grid_centers.unsqueeze(1) - atom_coords.unsqueeze(0)).square().sum(dim=-1)
+        flat_free[start:stop] = (sq_dists >= expanded_atom_radii_sq.unsqueeze(0)).all(dim=-1)
+
+    free_grid = flat_free.reshape(nx, ny, nz).cpu()
+    seed_grid = torch.zeros_like(free_grid)
+    seed_grid[0, :, :] = free_grid[0, :, :]
+    seed_grid[-1, :, :] = free_grid[-1, :, :]
+    seed_grid[:, 0, :] = free_grid[:, 0, :]
+    seed_grid[:, -1, :] = free_grid[:, -1, :]
+    seed_grid[:, :, 0] = free_grid[:, :, 0]
+    seed_grid[:, :, -1] = free_grid[:, :, -1]
+
+    try:
+        from scipy import ndimage
+
+        reached_grid = torch.from_numpy(
+            ndimage.binary_propagation(
+                seed_grid.numpy(),
+                mask=free_grid.numpy(),
+            )
+        )
+    except ImportError:
+        from collections import deque
+
+        reached_grid = torch.zeros_like(free_grid)
+        queue: deque[tuple[int, int, int]] = deque(
+            tuple(index.tolist()) for index in seed_grid.nonzero(as_tuple=False)
+        )
+        for index in queue:
+            reached_grid[index] = True
+        while queue:
+            i, j, k = queue.popleft()
+            for di, dj, dk in (
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ):
+                ni, nj, nk = i + di, j + dj, k + dk
+                if (
+                    0 <= ni < nx
+                    and 0 <= nj < ny
+                    and 0 <= nk < nz
+                    and bool(free_grid[ni, nj, nk].item())
+                    and not bool(reached_grid[ni, nj, nk].item())
+                ):
+                    reached_grid[ni, nj, nk] = True
+                    queue.append((ni, nj, nk))
+
+    return reached_grid.to(device=device), bbox_min, grid_spacing, dims.to(device=device)
+
+
+def _probe_centers_accessible_from_exterior(
+    probe_centers: torch.Tensor,
+    atom_coords: torch.Tensor,
+    atom_radii: torch.Tensor,
+    probe_radius: float,
+    valid_center_mask: Optional[torch.Tensor] = None,
+    grid_spacing: Optional[float] = None,
+    max_grid_points: int = 2_000_000,
+) -> torch.Tensor:
+    """
+    Return whether probe centers lie in the exterior component of center-space.
+    """
+    if valid_center_mask is None:
+        candidate_mask = torch.isfinite(probe_centers).all(dim=-1)
+    else:
+        candidate_mask = valid_center_mask & torch.isfinite(probe_centers).all(dim=-1)
+
+    accessible_mask = torch.zeros_like(candidate_mask)
+    if not bool(candidate_mask.any().item()):
+        return accessible_mask
+    if atom_coords.shape[0] < 4:
+        return candidate_mask
+
+    calc_device = atom_coords.device
+    calc_dtype = atom_coords.dtype if atom_coords.dtype in (torch.float32, torch.float64) else torch.float32
+    calc_centers = probe_centers[candidate_mask].to(device=calc_device, dtype=calc_dtype)
+    calc_atom_coords = atom_coords.to(dtype=calc_dtype)
+    calc_atom_radii = atom_radii.to(dtype=calc_dtype)
+    expanded_atom_radii = calc_atom_radii + probe_radius
+    expanded_atom_radii_sq = expanded_atom_radii.square()
+
+    center_sq_dists = (
+        calc_centers.unsqueeze(1) - calc_atom_coords.unsqueeze(0)
+    ).square().sum(dim=-1)
+    tol = (
+        256
+        * torch.finfo(calc_dtype).eps
+        * torch.maximum(center_sq_dists, expanded_atom_radii_sq.unsqueeze(0)).clamp_min(1)
+    )
+    feasible_centers = (center_sq_dists >= expanded_atom_radii_sq.unsqueeze(0) - tol).all(dim=-1)
+    if not bool(feasible_centers.any().item()):
+        return accessible_mask
+
+    effective_spacing = grid_spacing
+    if effective_spacing is None:
+        effective_spacing = min(0.25, max(0.12, float(probe_radius) / 5.0))
+    effective_spacing = float(effective_spacing)
+    if effective_spacing <= 0:
+        raise ValueError("grid_spacing must be positive")
+    if max_grid_points <= 0:
+        raise ValueError("max_grid_points must be positive")
+
+    feasible_indices = feasible_centers.nonzero(as_tuple=False).reshape(-1)
+    feasible_query_centers = calc_centers[feasible_indices]
+    molecule_center = calc_atom_coords.mean(dim=0, keepdim=True)
+    exterior_dirs = feasible_query_centers - molecule_center
+    exterior_dir_norms = torch.linalg.norm(exterior_dirs, dim=-1, keepdim=True)
+    fallback_dirs = torch.zeros_like(exterior_dirs)
+    fallback_dirs[:, 0] = 1
+    exterior_dirs = torch.where(
+        exterior_dir_norms > torch.finfo(calc_dtype).eps,
+        exterior_dirs / exterior_dir_norms.clamp_min(torch.finfo(calc_dtype).eps),
+        fallback_dirs,
+    )
+    exterior_radius = (
+        torch.linalg.norm(calc_atom_coords - molecule_center, dim=-1).max()
+        + expanded_atom_radii.max()
+        + 4.0 * effective_spacing
+    )
+    exterior_points = molecule_center + exterior_dirs * exterior_radius
+    query_accessible = _segment_clearance_mask(
+        feasible_query_centers,
+        exterior_points,
+        calc_atom_coords,
+        expanded_atom_radii_sq,
+    )
+    unresolved_query_mask = ~query_accessible
+    if bool(unresolved_query_mask.any().item()):
+        grid_query_centers = feasible_query_centers[unresolved_query_mask]
+    else:
+        flat_accessible = accessible_mask.reshape(-1)
+        flat_candidate_indices = candidate_mask.reshape(-1).nonzero(as_tuple=False).reshape(-1)
+        flat_accessible[flat_candidate_indices[feasible_indices[query_accessible]]] = True
+        return accessible_mask
+
+    reachable_grid, bbox_min, effective_spacing, dims = _external_reachable_grid(
+        calc_atom_coords,
+        expanded_atom_radii,
+        grid_query_centers,
+        effective_spacing,
+        max_grid_points,
+    )
+
+    frac_indices = (grid_query_centers - bbox_min) / effective_spacing
+    base_indices = torch.floor(frac_indices).to(torch.long)
+    dims_long = dims.to(dtype=torch.long)
+    grid_accessible = torch.zeros(
+        grid_query_centers.shape[0],
+        dtype=torch.bool,
+        device=calc_device,
+    )
+
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                offsets = torch.tensor([dx, dy, dz], dtype=torch.long, device=calc_device)
+                corner_indices = torch.minimum(
+                    torch.maximum(
+                        base_indices + offsets,
+                        torch.zeros((1, 3), dtype=torch.long, device=calc_device),
+                    ),
+                    (dims_long - 1).unsqueeze(0),
+                )
+                reached_corner_mask = reachable_grid[
+                    corner_indices[:, 0],
+                    corner_indices[:, 1],
+                    corner_indices[:, 2],
+                ]
+                unresolved = reached_corner_mask & ~grid_accessible
+                if not bool(unresolved.any().item()):
+                    continue
+                corner_points = bbox_min + corner_indices[unresolved].to(calc_dtype) * effective_spacing
+                segment_clear = _segment_clearance_mask(
+                    grid_query_centers[unresolved],
+                    corner_points,
+                    calc_atom_coords,
+                    expanded_atom_radii_sq,
+                )
+                unresolved_indices = unresolved.nonzero(as_tuple=False).reshape(-1)
+                grid_accessible[unresolved_indices[segment_clear]] = True
+
+    query_accessible[unresolved_query_mask.nonzero(as_tuple=False).reshape(-1)[grid_accessible]] = True
+
+    flat_accessible = accessible_mask.reshape(-1)
+    flat_candidate_indices = candidate_mask.reshape(-1).nonzero(as_tuple=False).reshape(-1)
+    flat_accessible[flat_candidate_indices[feasible_indices[query_accessible]]] = True
+    return accessible_mask
+
+
 def project_points_to_ses(
     points: torch.Tensor,      # coordinates of sampled points, shape (m, n, 3)
     atom_coords: torch.Tensor, # coordinates of atom centers, shape (n, 3)
@@ -1557,8 +1825,8 @@ def project_points_to_ses(
 
     Returns:
         projected_points_on_ses: Projected SES points, shape (m, n, 3).
-        valid_point_mask: Whether each sampled point is outside every atom sphere,
-            shape (m, n).
+        valid_point_mask: Whether each projected point has an externally
+            accessible probe center, shape (m, n).
     """
     prepared = _prepare_projection_inputs(
         points,
@@ -1582,6 +1850,13 @@ def project_points_to_ses(
         atom_coords,
         atom_radii,
         probe_radius,
+    )
+    valid_point_mask = valid_point_mask & _probe_centers_accessible_from_exterior(
+        probe_centers,
+        atom_coords,
+        atom_radii,
+        probe_radius,
+        valid_point_mask,
     )
 
     # Finally, project the original points onto the probe spheres.
