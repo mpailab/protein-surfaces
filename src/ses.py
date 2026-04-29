@@ -850,19 +850,21 @@ def _centers_feasible_against_local_atoms(
     """
     Vectorized local feasibility for candidate probe centers.
     """
-    while local_atom_coords.ndim < centers.ndim + 1:
-        local_atom_coords = local_atom_coords.unsqueeze(1)
-        local_atom_ext_radii = local_atom_ext_radii.unsqueeze(1)
-    center_sq_dists = (
-        centers.unsqueeze(-2) - local_atom_coords
-    ).square().sum(dim=-1)
-    ext_radii_sq = local_atom_ext_radii.square()
+    row_count = centers.shape[0]
+    candidate_shape = centers.shape[1:-1]
+    flat_centers = centers.reshape(row_count, -1, 3)
+    center_sq_norms = flat_centers.square().sum(dim=-1, keepdim=True)
+    atom_sq_norms = local_atom_coords.square().sum(dim=-1).unsqueeze(-2)
+    center_atom_dots = flat_centers @ local_atom_coords.transpose(-1, -2)
+    center_sq_dists = center_sq_norms + atom_sq_norms - 2 * center_atom_dots
+    ext_radii_sq = local_atom_ext_radii.square().unsqueeze(-2)
     sq_dist_tol = (
         100
         * torch.finfo(center_sq_dists.dtype).eps
         * torch.maximum(center_sq_dists.abs(), ext_radii_sq).clamp_min(1)
     )
-    return (center_sq_dists >= ext_radii_sq - sq_dist_tol).all(dim=-1)
+    feasible = (center_sq_dists >= ext_radii_sq - sq_dist_tol).all(dim=-1)
+    return feasible.reshape(row_count, *candidate_shape)
 
 
 def _compute_triple_probe_centers(
@@ -1002,22 +1004,25 @@ def _triple_patch_membership(
         keepdim=True,
     ).clamp_min(eps)
     target_normals = -point_dirs
-    normal_matrices = torch.stack(
-        (first_normals, second_normals, third_normals),
-        dim=-1,
-    )
-    determinants = torch.linalg.det(normal_matrices)
+    second_cross_third = torch.cross(second_normals, third_normals, dim=-1)
+    determinants = (first_normals * second_cross_third).sum(dim=-1)
     nonsingular = determinants.abs() > 1000 * eps
-    safe_matrices = torch.where(
-        nonsingular.unsqueeze(-1).unsqueeze(-1),
-        normal_matrices,
-        torch.eye(3, dtype=points.dtype, device=points.device),
+    safe_determinants = determinants.masked_fill(~nonsingular, 1)
+    first_coefs = (
+        target_normals * second_cross_third
+    ).sum(dim=-1) / safe_determinants
+    second_coefs = (
+        first_normals * torch.cross(target_normals, third_normals, dim=-1)
+    ).sum(dim=-1) / safe_determinants
+    third_coefs = (
+        first_normals * torch.cross(second_normals, target_normals, dim=-1)
+    ).sum(dim=-1) / safe_determinants
+    coefs = torch.stack((first_coefs, second_coefs, third_coefs), dim=-1)
+    reconstructed = (
+        first_coefs.unsqueeze(-1) * first_normals
+        + second_coefs.unsqueeze(-1) * second_normals
+        + third_coefs.unsqueeze(-1) * third_normals
     )
-    coefs = torch.linalg.solve(
-        safe_matrices,
-        target_normals.unsqueeze(-1),
-    ).squeeze(-1)
-    reconstructed = (normal_matrices * coefs.unsqueeze(-2)).sum(dim=-1)
     residuals = torch.linalg.norm(reconstructed - target_normals, dim=-1)
     coef_tol = 1000 * eps
     residual_tol = torch.sqrt(torch.as_tensor(eps, dtype=points.dtype, device=points.device))
@@ -1080,7 +1085,7 @@ def _compute_active_set_probe_centers(
     flat_centers = probe_centers.reshape(-1, 3)
     flat_valid_mask = valid_point_mask.reshape(-1)
     total_rows = flat_points.shape[0]
-    block_rows = 2048
+    block_rows = 8192
     atom_range = torch.arange(num_atoms, device=device, dtype=torch.long)
     pair_combinations = torch.combinations(
         torch.arange(max_active_neighbors + 1, device=device, dtype=torch.long),
