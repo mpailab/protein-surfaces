@@ -92,6 +92,68 @@ def _methane_atoms() -> tuple[torch.Tensor, torch.Tensor]:
     return atom_coords, atom_radii
 
 
+def _glucose_chair_atoms() -> tuple[torch.Tensor, torch.Tensor]:
+    atom_coords = torch.tensor(
+        [
+            [1.25, 0.0, 0.35],
+            [0.62, 1.08, -0.35],
+            [-0.62, 1.08, 0.35],
+            [-1.25, 0.0, -0.35],
+            [-0.62, -1.08, 0.35],
+            [0.62, -1.08, -0.35],
+            [1.291980477382, 2.250546638021, 0.122401107361],
+            [-1.291980477382, 2.250546638021, -0.122401107361],
+            [-2.599717449603, 0.0, 0.122401107361],
+            [-1.291980477382, -2.250546638021, -0.122401107361],
+            [1.937946559, -3.375777876967, 0.282522511546],
+            [1.368386117775, -2.383640334188, -0.575477488454],
+            [0.37730809587, 0.657246360548, 0.62492563819],
+            [-0.37730809587, 0.657246360548, -0.62492563819],
+            [-0.762537180905, 0.0, 0.62492563819],
+            [-0.37730809587, -0.657246360548, -0.62492563819],
+            [0.37730809587, -0.657246360548, -1.32492563819],
+            [2.230430874657, -1.888762788571, -0.128179990166],
+            [0.506341360892, -2.878517879806, -1.022774986742],
+            [1.743100238422, 3.036368157251, 0.4395375151],
+            [-1.743100238422, 3.036368157251, -0.4395375151],
+            [-3.505821471715, 0.0, 0.4395375151],
+            [-1.743100238422, -3.036368157251, -0.4395375151],
+            [2.320308813249, -4.041828255336, 0.858522511546],
+        ],
+        dtype=torch.float64,
+    )
+    atom_radii = torch.tensor(
+        [
+            1.52,
+            1.70,
+            1.70,
+            1.70,
+            1.70,
+            1.70,
+            1.52,
+            1.52,
+            1.52,
+            1.52,
+            1.52,
+            1.70,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+            1.20,
+        ],
+        dtype=torch.float64,
+    )
+    return atom_coords, atom_radii
+
+
 def test_sample_atom_sphere_points_returns_uniform_points_on_atom_spheres() -> None:
     atom_coords = torch.tensor(
         [[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]],
@@ -635,6 +697,23 @@ def test_project_points_to_ses_keeps_ch4_outward_hydrogen_surface_points() -> No
 
     assert outward_hydrogen_ses_mask.any()
     assert bool(valid_point_mask[:, 1:][outward_hydrogen_ses_mask].all().item())
+
+
+def test_project_points_to_ses_avoids_glucose_chair_relaxed_patch_outlier() -> None:
+    coords, radii = _glucose_chair_atoms()
+    points = sample_atom_sphere_points(coords, radii, 350)
+
+    projected_points, valid_point_mask = project_points_to_ses(
+        points=points,
+        atom_coords=coords,
+        atom_radii=radii,
+        probe_radius=1.4,
+    )
+
+    projection_distances = torch.linalg.norm(projected_points - points, dim=-1)
+    assert valid_point_mask[27, 17]
+    assert torch.allclose(projected_points[27, 17], points[27, 17])
+    assert projection_distances[valid_point_mask].max() < 0.7
 
 
 def test_any_pair_repair_ignores_irrelevant_ethanol_oxygen_point() -> None:

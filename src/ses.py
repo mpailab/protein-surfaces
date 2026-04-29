@@ -1186,8 +1186,6 @@ def _compute_active_set_probe_centers(
             )
             unresolved_best_centers = best_centers[unresolved_indices]
             unresolved_best_scores = best_scores[unresolved_indices]
-            relaxed_best_centers = unresolved_best_centers
-            relaxed_best_scores = unresolved_best_scores
 
             if pair_combinations.numel() > 0:
                 pair_slots = pair_combinations[
@@ -1231,13 +1229,6 @@ def _compute_active_set_probe_centers(
                     atom_ext_radii,
                     first_indices,
                     second_indices,
-                )
-                relaxed_best_centers, relaxed_best_scores = _replace_better_probe_centers(
-                    relaxed_best_centers,
-                    relaxed_best_scores,
-                    pair_centers,
-                    pair_scores,
-                    pair_valid & pair_feasible,
                 )
                 unresolved_best_centers, unresolved_best_scores = (
                     _replace_better_probe_centers(
@@ -1307,24 +1298,12 @@ def _compute_active_set_probe_centers(
                     triple_scores.shape[0],
                     -1,
                 )
-                flat_relaxed_mask = (
-                    distinct_triples & triple_valid & triple_feasible
-                ).reshape(triple_centers.shape[0], -1)
                 flat_strict_mask = (
                     distinct_triples
                     & triple_valid
                     & triple_feasible
                     & triple_membership
                 ).reshape(triple_centers.shape[0], -1)
-                triple_relaxed_centers, triple_relaxed_scores = (
-                    _replace_better_probe_centers(
-                        relaxed_best_centers[triple_rows],
-                        relaxed_best_scores[triple_rows],
-                        flat_triple_centers,
-                        flat_triple_scores,
-                        flat_relaxed_mask,
-                    )
-                )
                 triple_best_centers, triple_best_scores = _replace_better_probe_centers(
                     unresolved_best_centers[triple_rows],
                     unresolved_best_scores[triple_rows],
@@ -1332,22 +1311,9 @@ def _compute_active_set_probe_centers(
                     flat_triple_scores,
                     flat_strict_mask,
                 )
-                relaxed_best_centers[triple_rows] = triple_relaxed_centers
-                relaxed_best_scores[triple_rows] = triple_relaxed_scores
                 unresolved_best_centers[triple_rows] = triple_best_centers
                 unresolved_best_scores[triple_rows] = triple_best_scores
 
-            use_relaxed = ~unresolved_best_scores.isfinite() & relaxed_best_scores.isfinite()
-            unresolved_best_centers = torch.where(
-                use_relaxed.unsqueeze(-1),
-                relaxed_best_centers,
-                unresolved_best_centers,
-            )
-            unresolved_best_scores = torch.where(
-                use_relaxed,
-                relaxed_best_scores,
-                unresolved_best_scores,
-            )
             use_direct_fallback = ~unresolved_best_scores.isfinite()
             unresolved_best_centers = torch.where(
                 use_direct_fallback.unsqueeze(-1),
