@@ -276,8 +276,6 @@ def test_projection_center_selection_and_segment_helpers() -> None:
 
 
 def test_projection_grid_occupancy_and_reachability_helpers() -> None:
-    pytest.importorskip("scipy.spatial")
-
     atom_coords = torch.zeros((1, 3), dtype=torch.float64)
     expanded_radii = torch.tensor([0.75], dtype=torch.float64)
     expanded_radii_sq = expanded_radii.square()

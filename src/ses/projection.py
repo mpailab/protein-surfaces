@@ -1644,6 +1644,17 @@ def _segment_clearance_mask(
     """
     if starts.shape[0] == 0:
         return torch.empty((0,), dtype=torch.bool, device=starts.device)
+    if atom_coords.shape[0] == 0:
+        return torch.ones((starts.shape[0],), dtype=torch.bool, device=starts.device)
+
+    grid_clear = _segment_clearance_mask_with_atom_grid(
+        starts,
+        ends,
+        atom_coords,
+        expanded_atom_radii_sq,
+    )
+    if grid_clear is not None:
+        return grid_clear
 
     max_rows = _max_pairwise_rows(
         starts.shape[0],
@@ -1688,6 +1699,86 @@ def _segment_clearance_mask(
     return (closest_dists_sq >= expanded_atom_radii_sq.unsqueeze(0) - tol).all(dim=-1)
 
 
+def _segment_clearance_mask_with_atom_grid(
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    atom_coords: torch.Tensor,
+    expanded_atom_radii_sq: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    """
+    Segment/sphere clearance using a torch atom-cell broad phase.
+
+    The grid path is device-generic and helps short local segments.  Long
+    segments can touch too many cells, so callers fall back to the blocked
+    all-pairs implementation when the broad phase would be wider than useful.
+    """
+
+    if starts.shape[0] < 64 or atom_coords.shape[0] < 64:
+        return None
+
+    max_radius = torch.sqrt(expanded_atom_radii_sq.max().clamp_min(0))
+    cell_size = float(max_radius.clamp_min(torch.finfo(starts.dtype).eps).item())
+    segment_dirs = ends - starts
+    segment_lens = torch.linalg.norm(segment_dirs, dim=-1)
+    max_query_radius = float((0.5 * segment_lens.max() + max_radius).item())
+    cell_span = int(math.ceil(max_query_radius / cell_size))
+    if cell_span > 3:
+        return None
+
+    table = _build_atom_cell_table(atom_coords, cell_size)
+    if table is None:
+        return None
+
+    offsets = torch.stack(
+        torch.meshgrid(
+            torch.arange(-cell_span, cell_span + 1, device=starts.device),
+            torch.arange(-cell_span, cell_span + 1, device=starts.device),
+            torch.arange(-cell_span, cell_span + 1, device=starts.device),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).reshape(-1, 3)
+    if offsets.shape[0] * table.max_occupancy >= atom_coords.shape[0]:
+        return None
+
+    clear_mask = torch.ones(starts.shape[0], dtype=torch.bool, device=starts.device)
+    midpoints = 0.5 * (starts + ends)
+    midpoint_cells = torch.floor(midpoints / cell_size).to(torch.long)
+    segment_lens_sq = segment_dirs.square().sum(dim=-1).clamp_min(
+        torch.finfo(starts.dtype).eps,
+    )
+    for offset in offsets:
+        keys, valid_cells = _atom_cell_query_keys(
+            midpoint_cells + offset.view(1, 3),
+            table,
+        )
+        starts_in_table = torch.searchsorted(table.sorted_keys, keys, right=False)
+        stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
+        for slot in range(table.max_occupancy):
+            positions = starts_in_table + slot
+            has_atom = valid_cells & (positions < stops_in_table) & clear_mask
+            atom_indices = table.sorted_atom_indices[
+                positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
+            ]
+            candidate_coords = atom_coords[atom_indices]
+            start_to_atoms = candidate_coords - starts
+            nearest_params = (
+                start_to_atoms * segment_dirs
+            ).sum(dim=-1) / segment_lens_sq
+            nearest_params = nearest_params.clamp(0, 1)
+            closest_points = starts + nearest_params.unsqueeze(-1) * segment_dirs
+            closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
+            local_radii_sq = expanded_atom_radii_sq[atom_indices]
+            tol = (
+                256
+                * torch.finfo(starts.dtype).eps
+                * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
+            )
+            blocked = has_atom & (closest_dists_sq < local_radii_sq - tol)
+            clear_mask = clear_mask & ~blocked
+    return clear_mask
+
+
 def _max_pairwise_rows(row_count: int, column_count: int) -> int:
     """
     Bound row chunks for temporary `(rows, atoms)` distance matrices.
@@ -1708,6 +1799,20 @@ def _centers_feasible_against_all_atoms(
     """
     Check probe-center feasibility without materializing an unbounded full matrix.
     """
+    if centers.shape[0] == 0:
+        return torch.empty((0,), dtype=torch.bool, device=centers.device)
+    if atom_coords.shape[0] == 0:
+        return torch.ones((centers.shape[0],), dtype=torch.bool, device=centers.device)
+
+    grid_feasible = _centers_feasible_against_all_atoms_grid(
+        centers,
+        atom_coords,
+        expanded_atom_radii_sq,
+        tol_scale=tol_scale,
+    )
+    if grid_feasible is not None:
+        return grid_feasible
+
     feasible = torch.empty(centers.shape[0], dtype=torch.bool, device=centers.device)
     max_rows = _max_pairwise_rows(centers.shape[0], atom_coords.shape[0])
     for start in range(0, centers.shape[0], max_rows):
@@ -1729,6 +1834,157 @@ def _centers_feasible_against_all_atoms(
     return feasible
 
 
+class _AtomCellTable(NamedTuple):
+    origin: torch.Tensor
+    dims: torch.Tensor
+    cell_size: float
+    sorted_keys: torch.Tensor
+    sorted_atom_indices: torch.Tensor
+    max_occupancy: int
+
+
+def _build_atom_cell_table(
+    atom_coords: torch.Tensor,
+    cell_size: float,
+) -> Optional[_AtomCellTable]:
+    """Build a sparse atom-cell table using torch tensors on the input device."""
+
+    if atom_coords.shape[0] == 0 or cell_size <= 0:
+        return None
+
+    atom_cells = torch.floor(atom_coords / cell_size).to(torch.long)
+    origin = atom_cells.min(dim=0).values - 1
+    max_cell = atom_cells.max(dim=0).values + 1
+    dims = (max_cell - origin + 1).clamp_min(1)
+    if bool((dims <= 0).any().item()):
+        return None
+
+    shifted = atom_cells - origin.unsqueeze(0)
+    keys = _linear_cell_keys(shifted, dims)
+    order = torch.argsort(keys)
+    sorted_keys = keys[order].contiguous()
+    _, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+    max_occupancy = int(counts.max().item()) if counts.numel() > 0 else 0
+    if max_occupancy <= 0:
+        return None
+    return _AtomCellTable(
+        origin=origin,
+        dims=dims,
+        cell_size=float(cell_size),
+        sorted_keys=sorted_keys,
+        sorted_atom_indices=order.to(torch.long).contiguous(),
+        max_occupancy=max_occupancy,
+    )
+
+
+def _linear_cell_keys(shifted_cells: torch.Tensor, dims: torch.Tensor) -> torch.Tensor:
+    """Linearize already-shifted integer grid cells."""
+
+    return (shifted_cells[..., 0] * dims[1] + shifted_cells[..., 1]) * dims[2] + shifted_cells[..., 2]
+
+
+def _atom_cell_query_keys(
+    query_cells: torch.Tensor,
+    table: _AtomCellTable,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return linear query keys and whether each query cell is inside the table."""
+
+    shifted = query_cells - table.origin.view(1, 3)
+    valid = ((shifted >= 0) & (shifted < table.dims.view(1, 3))).all(dim=-1)
+    safe_shifted = torch.where(valid.unsqueeze(-1), shifted, torch.zeros_like(shifted))
+    return _linear_cell_keys(safe_shifted, table.dims), valid
+
+
+def _centers_feasible_against_all_atoms_grid(
+    centers: torch.Tensor,
+    atom_coords: torch.Tensor,
+    expanded_atom_radii_sq: torch.Tensor,
+    tol_scale: float = 256,
+) -> Optional[torch.Tensor]:
+    """
+    Device-generic point/sphere feasibility using a sparse atom-cell table.
+    """
+
+    if centers.shape[0] < 1024 or atom_coords.shape[0] < 64:
+        return None
+
+    max_radius = torch.sqrt(expanded_atom_radii_sq.max().clamp_min(0))
+    cell_size = float(max_radius.clamp_min(torch.finfo(centers.dtype).eps).item())
+    table = _build_atom_cell_table(atom_coords, cell_size)
+    if table is None or table.max_occupancy * 27 >= atom_coords.shape[0]:
+        return None
+
+    return _centers_feasible_with_atom_table(
+        centers,
+        atom_coords,
+        expanded_atom_radii_sq,
+        table,
+        tol_scale=tol_scale,
+    )
+
+
+def _centers_feasible_with_atom_table(
+    centers: torch.Tensor,
+    atom_coords: torch.Tensor,
+    expanded_atom_radii_sq: torch.Tensor,
+    table: _AtomCellTable,
+    *,
+    tol_scale: float = 256,
+) -> torch.Tensor:
+    """Point/sphere feasibility using a prebuilt sparse atom-cell table."""
+
+    offsets = torch.stack(
+        torch.meshgrid(
+            torch.arange(-1, 2, device=centers.device),
+            torch.arange(-1, 2, device=centers.device),
+            torch.arange(-1, 2, device=centers.device),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).reshape(-1, 3)
+    feasible = torch.ones(centers.shape[0], dtype=torch.bool, device=centers.device)
+    rows_per_block = max(
+        1,
+        min(centers.shape[0], _PAIRWISE_ELEMENT_BUDGET // max(1, 27 * table.max_occupancy)),
+    )
+
+    for start in range(0, centers.shape[0], rows_per_block):
+        stop = min(start + rows_per_block, centers.shape[0])
+        block_centers = centers[start:stop]
+        block_feasible = torch.ones(
+            block_centers.shape[0],
+            dtype=torch.bool,
+            device=centers.device,
+        )
+        center_cells = torch.floor(block_centers / table.cell_size).to(torch.long)
+        for offset in offsets:
+            keys, valid_cells = _atom_cell_query_keys(
+                center_cells + offset.view(1, 3),
+                table,
+            )
+            starts_in_table = torch.searchsorted(table.sorted_keys, keys, right=False)
+            stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
+            for slot in range(table.max_occupancy):
+                positions = starts_in_table + slot
+                has_atom = valid_cells & (positions < stops_in_table) & block_feasible
+                atom_indices = table.sorted_atom_indices[
+                    positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
+                ]
+                candidate_coords = atom_coords[atom_indices]
+                sq_dists = (block_centers - candidate_coords).square().sum(dim=-1)
+                local_radii_sq = expanded_atom_radii_sq[atom_indices]
+                tol = (
+                    float(tol_scale)
+                    * torch.finfo(centers.dtype).eps
+                    * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
+                )
+                blocked = has_atom & (sq_dists < local_radii_sq - tol)
+                block_feasible = block_feasible & ~blocked
+        feasible[start:stop] = block_feasible
+
+    return feasible
+
+
 def _grid_free_mask(
     atom_coords: torch.Tensor,
     expanded_atom_radii: torch.Tensor,
@@ -1741,20 +1997,6 @@ def _grid_free_mask(
     """
     Mark grid points outside all expanded atom spheres.
     """
-    if atom_coords.device.type == "cpu" and atom_coords.shape[0] >= 300:
-        try:
-            return _grid_free_mask_with_kdtree(
-                atom_coords,
-                expanded_atom_radii,
-                expanded_atom_radii_sq,
-                bbox_min,
-                grid_spacing,
-                dims,
-                grid_points,
-            )
-        except Exception:
-            pass
-
     return _grid_free_mask_with_torch(
         atom_coords,
         expanded_atom_radii_sq,
@@ -1775,58 +2017,17 @@ def _grid_free_mask_with_kdtree(
     grid_points: int,
 ) -> torch.Tensor:
     """
-    CPU occupancy check using spatial neighbor queries instead of all pairs.
+    Compatibility wrapper for the device-generic occupancy implementation.
     """
-    import numpy as np
-    from scipy.spatial import cKDTree
 
-    atom_coords_np = atom_coords.detach().cpu().numpy().astype(np.float64, copy=False)
-    radii_np = expanded_atom_radii.detach().cpu().numpy().astype(np.float64, copy=False)
-    radii_sq_np = (
-        expanded_atom_radii_sq.detach().cpu().numpy().astype(np.float64, copy=False)
+    return _grid_free_mask_with_torch(
+        atom_coords,
+        expanded_atom_radii_sq,
+        bbox_min,
+        grid_spacing,
+        dims,
+        grid_points,
     )
-    bbox_min_np = bbox_min.detach().cpu().numpy().astype(np.float64, copy=False)
-    dims_np = dims.detach().cpu().numpy().astype(np.int64, copy=False)
-
-    tree = cKDTree(atom_coords_np)
-    max_radius = float(radii_np.max())
-    free_mask_np = np.empty(grid_points, dtype=np.bool_)
-    nx, ny, nz = (int(dim) for dim in dims_np)
-    yz_size = ny * nz
-    block_size = 50_000
-
-    for start in range(0, grid_points, block_size):
-        stop = min(start + block_size, grid_points)
-        flat_indices = np.arange(start, stop, dtype=np.int64)
-        ix = flat_indices // yz_size
-        rem = flat_indices - ix * yz_size
-        iy = rem // nz
-        iz = rem - iy * nz
-        grid_centers = np.column_stack(
-            (
-                bbox_min_np[0] + ix * grid_spacing,
-                bbox_min_np[1] + iy * grid_spacing,
-                bbox_min_np[2] + iz * grid_spacing,
-            )
-        )
-        neighbor_indices = tree.query_ball_point(
-            grid_centers,
-            r=max_radius,
-            workers=-1,
-            return_sorted=False,
-        )
-        block_free = np.ones(stop - start, dtype=np.bool_)
-        for row, indices in enumerate(neighbor_indices):
-            if not indices:
-                continue
-            indices_array = np.asarray(indices, dtype=np.int64)
-            diffs = atom_coords_np[indices_array] - grid_centers[row]
-            sq_dists = np.einsum("ij,ij->i", diffs, diffs)
-            if np.any(sq_dists < radii_sq_np[indices_array]):
-                block_free[row] = False
-        free_mask_np[start:stop] = block_free
-
-    return torch.from_numpy(free_mask_np).to(device=atom_coords.device)
 
 
 def _grid_free_mask_with_torch(
@@ -1842,10 +2043,29 @@ def _grid_free_mask_with_torch(
     """
     dtype = atom_coords.dtype
     device = atom_coords.device
+    raster_free = _grid_free_mask_by_atom_raster(
+        atom_coords,
+        expanded_atom_radii_sq,
+        bbox_min,
+        grid_spacing,
+        dims,
+        grid_points,
+    )
+    if raster_free is not None:
+        return raster_free
+
     flat_free = torch.empty(grid_points, dtype=torch.bool, device=device)
     nx, ny, nz = (int(dim.item()) for dim in dims)
     yz_size = ny * nz
     block_size = _max_pairwise_rows(grid_points, atom_coords.shape[0])
+    max_radius = torch.sqrt(expanded_atom_radii_sq.max().clamp_min(0))
+    cell_size = float(max_radius.clamp_min(torch.finfo(dtype).eps).item())
+    atom_table = _build_atom_cell_table(atom_coords, cell_size)
+    if atom_table is not None and atom_table.max_occupancy * 27 < atom_coords.shape[0]:
+        block_size = max(
+            1,
+            min(grid_points, _PAIRWISE_ELEMENT_BUDGET // max(1, 27 * atom_table.max_occupancy)),
+        )
     for start in range(0, grid_points, block_size):
         stop = min(start + block_size, grid_points)
         flat_indices = torch.arange(start, stop, device=device, dtype=torch.long)
@@ -1861,13 +2081,81 @@ def _grid_free_mask_with_torch(
             ),
             dim=-1,
         )
-        sq_dists = (
-            grid_centers.unsqueeze(1) - atom_coords.unsqueeze(0)
-        ).square().sum(dim=-1)
-        flat_free[start:stop] = (
-            sq_dists >= expanded_atom_radii_sq.unsqueeze(0)
-        ).all(dim=-1)
+        if atom_table is not None and atom_table.max_occupancy * 27 < atom_coords.shape[0]:
+            flat_free[start:stop] = _centers_feasible_with_atom_table(
+                grid_centers,
+                atom_coords,
+                expanded_atom_radii_sq,
+                atom_table,
+            )
+        else:
+            sq_dists = (
+                grid_centers.unsqueeze(1) - atom_coords.unsqueeze(0)
+            ).square().sum(dim=-1)
+            flat_free[start:stop] = (
+                sq_dists >= expanded_atom_radii_sq.unsqueeze(0)
+            ).all(dim=-1)
     return flat_free
+
+
+def _grid_free_mask_by_atom_raster(
+    atom_coords: torch.Tensor,
+    expanded_atom_radii_sq: torch.Tensor,
+    bbox_min: torch.Tensor,
+    grid_spacing: float,
+    dims: torch.Tensor,
+    grid_points: int,
+) -> Optional[torch.Tensor]:
+    """Mark occupied grid cells by rasterizing each expanded atom sphere."""
+
+    if atom_coords.shape[0] == 0:
+        return torch.ones((grid_points,), dtype=torch.bool, device=atom_coords.device)
+
+    dtype = atom_coords.dtype
+    device = atom_coords.device
+    expanded_atom_radii = torch.sqrt(expanded_atom_radii_sq.clamp_min(0))
+    max_radius = float(expanded_atom_radii.max().item())
+    max_step = int(math.ceil(max_radius / float(grid_spacing)))
+    if max_step <= 0:
+        return torch.ones((grid_points,), dtype=torch.bool, device=device)
+    offset_count = (2 * max_step + 1) ** 3
+    if offset_count <= 0:
+        return None
+
+    offsets = torch.stack(
+        torch.meshgrid(
+            torch.arange(-max_step, max_step + 1, device=device),
+            torch.arange(-max_step, max_step + 1, device=device),
+            torch.arange(-max_step, max_step + 1, device=device),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).reshape(-1, 3)
+    # Keep temporary `(atoms, offsets)` tensors bounded for both CPU and GPU.
+    atom_chunk = max(1, min(atom_coords.shape[0], _PAIRWISE_ELEMENT_BUDGET // offset_count))
+    occupied = torch.zeros((grid_points,), dtype=torch.bool, device=device)
+    dims_long = dims.to(device=device, dtype=torch.long)
+    ny = int(dims_long[1].item())
+    nz = int(dims_long[2].item())
+
+    for start in range(0, atom_coords.shape[0], atom_chunk):
+        stop = min(start + atom_chunk, atom_coords.shape[0])
+        chunk_coords = atom_coords[start:stop]
+        center_cells = torch.round((chunk_coords - bbox_min.view(1, 3)) / grid_spacing).to(
+            torch.long,
+        )
+        cells = center_cells.unsqueeze(1) + offsets.view(1, -1, 3)
+        valid = ((cells >= 0) & (cells < dims_long.view(1, 1, 3))).all(dim=-1)
+        safe_cells = torch.where(valid.unsqueeze(-1), cells, torch.zeros_like(cells))
+        grid_coords = bbox_min.view(1, 1, 3) + safe_cells.to(dtype) * float(grid_spacing)
+        sq_dists = (grid_coords - chunk_coords.unsqueeze(1)).square().sum(dim=-1)
+        inside = valid & (sq_dists < expanded_atom_radii_sq[start:stop].view(-1, 1))
+        flat_indices = (
+            (safe_cells[..., 0] * ny + safe_cells[..., 1]) * nz + safe_cells[..., 2]
+        )
+        occupied[flat_indices[inside]] = True
+
+    return ~occupied
 
 
 def _external_reachable_grid(
@@ -1916,56 +2204,11 @@ def _external_reachable_grid(
         grid_points,
     )
 
-    free_grid = flat_free.reshape(nx, ny, nz).cpu()
-    seed_grid = torch.zeros_like(free_grid)
-    seed_grid[0, :, :] = free_grid[0, :, :]
-    seed_grid[-1, :, :] = free_grid[-1, :, :]
-    seed_grid[:, 0, :] = free_grid[:, 0, :]
-    seed_grid[:, -1, :] = free_grid[:, -1, :]
-    seed_grid[:, :, 0] = free_grid[:, :, 0]
-    seed_grid[:, :, -1] = free_grid[:, :, -1]
-
-    try:
-        from scipy import ndimage
-
-        reached_grid = torch.from_numpy(
-            ndimage.binary_propagation(
-                seed_grid.numpy(),
-                mask=free_grid.numpy(),
-            )
-        )
-    except ImportError:
-        from collections import deque
-
-        reached_grid = torch.zeros_like(free_grid)
-        queue: deque[tuple[int, int, int]] = deque(
-            tuple(index.tolist()) for index in seed_grid.nonzero(as_tuple=False)
-        )
-        for index in queue:
-            reached_grid[index] = True
-        while queue:
-            i, j, k = queue.popleft()
-            for di, dj, dk in (
-                (1, 0, 0),
-                (-1, 0, 0),
-                (0, 1, 0),
-                (0, -1, 0),
-                (0, 0, 1),
-                (0, 0, -1),
-            ):
-                ni, nj, nk = i + di, j + dj, k + dk
-                if (
-                    0 <= ni < nx
-                    and 0 <= nj < ny
-                    and 0 <= nk < nz
-                    and bool(free_grid[ni, nj, nk].item())
-                    and not bool(reached_grid[ni, nj, nk].item())
-                ):
-                    reached_grid[ni, nj, nk] = True
-                    queue.append((ni, nj, nk))
+    free_grid = flat_free.reshape(nx, ny, nz)
+    reached_grid = _flood_fill_reachable_grid(free_grid)
 
     result = (
-        reached_grid.to(device=device),
+        reached_grid,
         bbox_min,
         grid_spacing,
         dims.to(device=device),
@@ -1978,6 +2221,34 @@ def _external_reachable_grid(
     return result
 
 
+def _flood_fill_reachable_grid(free_grid: torch.Tensor) -> torch.Tensor:
+    """Flood-fill exterior-reachable cells using torch operations on-device."""
+
+    seed_grid = torch.zeros_like(free_grid)
+    seed_grid[0, :, :] = free_grid[0, :, :]
+    seed_grid[-1, :, :] = free_grid[-1, :, :]
+    seed_grid[:, 0, :] = free_grid[:, 0, :]
+    seed_grid[:, -1, :] = free_grid[:, -1, :]
+    seed_grid[:, :, 0] = free_grid[:, :, 0]
+    seed_grid[:, :, -1] = free_grid[:, :, -1]
+
+    reached_grid = seed_grid
+    max_iterations = sum(int(size) for size in free_grid.shape)
+    for _ in range(max_iterations):
+        expanded = reached_grid.clone()
+        expanded[1:, :, :] = expanded[1:, :, :] | reached_grid[:-1, :, :]
+        expanded[:-1, :, :] = expanded[:-1, :, :] | reached_grid[1:, :, :]
+        expanded[:, 1:, :] = expanded[:, 1:, :] | reached_grid[:, :-1, :]
+        expanded[:, :-1, :] = expanded[:, :-1, :] | reached_grid[:, 1:, :]
+        expanded[:, :, 1:] = expanded[:, :, 1:] | reached_grid[:, :, :-1]
+        expanded[:, :, :-1] = expanded[:, :, :-1] | reached_grid[:, :, 1:]
+        expanded = expanded & free_grid
+        if bool(torch.equal(expanded, reached_grid)):
+            return reached_grid
+        reached_grid = expanded
+    return reached_grid
+
+
 def _probe_centers_accessible_from_exterior(
     probe_centers: torch.Tensor,
     atom_coords: torch.Tensor,
@@ -1986,6 +2257,7 @@ def _probe_centers_accessible_from_exterior(
     valid_center_mask: Optional[torch.Tensor] = None,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = 2_000_000,
+    assume_centers_feasible: bool = False,
 ) -> torch.Tensor:
     """
     Return whether probe centers lie in the exterior component of center-space.
@@ -2015,11 +2287,18 @@ def _probe_centers_accessible_from_exterior(
     expanded_atom_radii = calc_atom_radii + probe_radius
     expanded_atom_radii_sq = expanded_atom_radii.square()
 
-    feasible_centers = _centers_feasible_against_all_atoms(
-        calc_centers,
-        calc_atom_coords,
-        expanded_atom_radii_sq,
-    )
+    if assume_centers_feasible:
+        feasible_centers = torch.ones(
+            calc_centers.shape[0],
+            dtype=torch.bool,
+            device=calc_device,
+        )
+    else:
+        feasible_centers = _centers_feasible_against_all_atoms(
+            calc_centers,
+            calc_atom_coords,
+            expanded_atom_radii_sq,
+        )
     feasible_indices = feasible_centers.nonzero(as_tuple=False).reshape(-1)
     if feasible_indices.numel() == 0:
         return accessible_mask

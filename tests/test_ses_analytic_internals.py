@@ -211,8 +211,6 @@ def test_analytic_input_density_and_unit_direction_helpers() -> None:
 
 
 def test_analytic_pair_graph_and_pair_sampling_helpers() -> None:
-    pytest.importorskip("scipy.spatial")
-
     coords, radii = _equilateral_atoms()
     context = _build_exterior_context(coords, radii, 1.0)
     expected_pairs = {(0, 1), (0, 2), (1, 2)}
