@@ -162,11 +162,18 @@ cython_debug/
 .codex
 .devcontainer
 .dockerignore
+.DS_Store
 
 Data
+!tests/data/
+!tests/data/**
 tmp
 
 AGENTS.md
 docker-compose.yml
 Dockerfile
 requirements-dev.txt
+
+*.zip
+*.tar
+*.tar.gz

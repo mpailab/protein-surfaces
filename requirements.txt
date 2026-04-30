@@ -1,0 +1,9 @@
+biopython
+faiss-cpu
+ipympl
+ipywidgets
+matplotlib
+numpy
+py3Dmol
+scipy
+torch
