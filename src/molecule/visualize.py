@@ -7,13 +7,13 @@ import py3Dmol
 import torch
 
 from molecule.examples import ATOM_COLORS, COVALENT_RADII, get_molecule
-from ses import sample_atom_sphere_points, sample_ses_points
-from ses_blocks import (
+from ses.analytic import (
     ATOM_BLOCK_TYPE,
     PAIR_BLOCK_TYPE,
     PROBE_BLOCK_TYPE,
-    sample_analytic_ses_points,
+    _sample_analytic_samples,
 )
+from ses.projection import sample_atom_points, _sample_projected_grid
 
 
 ANALYTIC_BLOCK_COLORS = {
@@ -33,8 +33,8 @@ def sample_display_points(molecule, m, probe_radius):
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    atom_points = sample_atom_sphere_points(coords, radii, m)
-    ses_points, valid_mask = sample_ses_points(coords, radii, m, probe_radius)
+    atom_points = sample_atom_points(coords, radii, m)
+    ses_points, valid_mask = _sample_projected_grid(coords, radii, m, probe_radius)
     finite_mask = torch.isfinite(atom_points).all(dim=-1) & torch.isfinite(ses_points).all(dim=-1)
     display_mask = valid_mask & finite_mask
 
@@ -80,7 +80,7 @@ def sample_analytic_display_points(
 
     coords = torch.as_tensor(molecule["coords"], dtype=dtype, device=device)
     radii = torch.as_tensor(molecule["radii"], dtype=dtype, device=device)
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         probe_radius,

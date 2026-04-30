@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from ses import (
+from ses.projection import (
     _PairGeometry,
     _PointAtomGeometry,
     _TangencyGeometry,
@@ -23,9 +23,10 @@ from ses import (
     _prepare_projection_inputs,
     _recover_probe_centers,
     _select_suitable_atom_indices,
-    project_points_to_ses,
-    sample_atom_sphere_points,
-    sample_ses_points,
+    project_points,
+    sample_atom_points,
+    sample_projected_points,
+    _sample_projected_grid,
 )
 
 
@@ -171,7 +172,7 @@ def _glucose_chair_atoms() -> tuple[torch.Tensor, torch.Tensor]:
     return atom_coords, atom_radii
 
 
-def test_sample_atom_sphere_points_returns_uniform_points_on_atom_spheres() -> None:
+def test_sample_atom_points_returns_uniform_points_on_atom_spheres() -> None:
     atom_coords = torch.tensor(
         [[1.0, 2.0, 3.0], [-1.0, 0.5, 2.0]],
         dtype=torch.float64,
@@ -179,7 +180,7 @@ def test_sample_atom_sphere_points_returns_uniform_points_on_atom_spheres() -> N
     atom_radii = torch.tensor([[1.5], [2.0]], dtype=torch.float64)
     num_points = 10
 
-    points = sample_atom_sphere_points(atom_coords, atom_radii, num_points)
+    points = sample_atom_points(atom_coords, atom_radii, num_points)
 
     assert points.shape == (num_points, 2, 3)
 
@@ -207,23 +208,23 @@ def test_sample_atom_sphere_points_returns_uniform_points_on_atom_spheres() -> N
     assert torch.allclose(first_atom_directions[:, 2], expected_z, atol=1e-12)
 
 
-def test_sample_atom_sphere_points_promotes_integer_inputs_to_float() -> None:
+def test_sample_atom_points_promotes_integer_inputs_to_float() -> None:
     atom_coords = torch.tensor([[0, 0, 0], [1, 2, 3]], dtype=torch.int64)
     atom_radii = torch.tensor([1.0, 2.0], dtype=torch.float64)
 
-    points = sample_atom_sphere_points(atom_coords, atom_radii, 4)
+    points = sample_atom_points(atom_coords, atom_radii, 4)
 
     assert points.dtype == torch.float64
     assert points.shape == (4, 2, 3)
 
 
-def test_sample_atom_sphere_points_handles_empty_axes() -> None:
-    empty_atom_points = sample_atom_sphere_points(
+def test_sample_atom_points_handles_empty_axes() -> None:
+    empty_atom_points = sample_atom_points(
         atom_coords=torch.empty((0, 3), dtype=torch.float32),
         atom_radii=torch.empty((0, 1), dtype=torch.float32),
         m=5,
     )
-    empty_sample_points = sample_atom_sphere_points(
+    empty_sample_points = sample_atom_points(
         atom_coords=torch.zeros((2, 3), dtype=torch.float32),
         atom_radii=torch.ones((2, 1), dtype=torch.float32),
         m=0,
@@ -251,7 +252,7 @@ def test_sample_atom_sphere_points_handles_empty_axes() -> None:
         (torch.zeros((2, 3)), torch.ones(2), True, TypeError, "integer"),
     ],
 )
-def test_sample_atom_sphere_points_rejects_invalid_inputs(
+def test_sample_atom_points_rejects_invalid_inputs(
     atom_coords: torch.Tensor,
     atom_radii: torch.Tensor,
     m: object,
@@ -259,10 +260,39 @@ def test_sample_atom_sphere_points_rejects_invalid_inputs(
     match: str,
 ) -> None:
     with pytest.raises(exception, match=match):
-        sample_atom_sphere_points(atom_coords, atom_radii, m)
+        sample_atom_points(atom_coords, atom_radii, m)
 
 
-def test_sample_ses_points_matches_explicit_sampling_and_projection() -> None:
+def test_sample_projected_points_returns_flat_points_and_atom_features() -> None:
+    atom_coords = torch.tensor(
+        [[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]],
+        dtype=torch.float64,
+    )
+    atom_radii = torch.tensor([1.0, 1.5], dtype=torch.float64)
+
+    points, atom_features = sample_projected_points(
+        atom_coords,
+        atom_radii,
+        m=8,
+        probe_radius=0.8,
+        include_atom_features=True,
+    )
+    points_only = sample_projected_points(
+        atom_coords,
+        atom_radii,
+        m=8,
+        probe_radius=0.8,
+    )
+
+    assert points.ndim == 2
+    assert points.shape[1] == 3
+    assert atom_features.shape == (points.shape[0], atom_coords.shape[0])
+    assert torch.equal(points, points_only)
+    assert torch.all((atom_features == 0) | (atom_features == 1))
+    assert torch.all(atom_features.sum(dim=1) == 1)
+
+
+def test_sample_projected_points_matches_explicit_sampling_and_projection() -> None:
     atom_coords = torch.tensor(
         [[0.0, 0.0, 0.0], [8.0, 0.0, 0.0]],
         dtype=torch.float64,
@@ -271,19 +301,19 @@ def test_sample_ses_points_matches_explicit_sampling_and_projection() -> None:
     num_points = 6
     probe_radius = 0.8
 
-    expected_sampled_points = sample_atom_sphere_points(
+    expected_sampled_points = sample_atom_points(
         atom_coords,
         atom_radii,
         num_points,
     )
-    expected_ses_points, expected_valid_mask = project_points_to_ses(
+    expected_ses_points, expected_valid_mask = project_points(
         points=expected_sampled_points,
         atom_coords=atom_coords,
         atom_radii=atom_radii,
         probe_radius=probe_radius,
     )
 
-    ses_points, valid_mask = sample_ses_points(
+    ses_points, valid_mask = _sample_projected_grid(
         atom_coords,
         atom_radii,
         num_points,
@@ -295,11 +325,11 @@ def test_sample_ses_points_matches_explicit_sampling_and_projection() -> None:
 
 
 @pytest.mark.parametrize("pdb_id", ALL_SES_FIXTURE_IDS)
-def test_sample_ses_points_runs_on_all_fixture_npy_molecules(pdb_id: str) -> None:
+def test_sample_projected_points_runs_on_all_fixture_npy_molecules(pdb_id: str) -> None:
     atom_coords, atom_radii = _load_fixture_atoms(pdb_id)
     num_points = 2
 
-    ses_points, valid_mask = sample_ses_points(
+    ses_points, valid_mask = _sample_projected_grid(
         atom_coords,
         atom_radii,
         num_points,
@@ -316,19 +346,19 @@ def test_sample_ses_points_runs_on_all_fixture_npy_molecules(pdb_id: str) -> Non
     assert bool((atom_distances >= atom_radii.unsqueeze(0) - 1e-8).all().item())
 
 
-def test_sample_ses_points_handles_empty_sample_axis() -> None:
+def test_sample_projected_points_handles_empty_sample_axis() -> None:
     atom_coords = torch.zeros((2, 3), dtype=torch.float32)
     atom_radii = torch.ones((2, 1), dtype=torch.float32)
 
-    ses_points, valid_mask = sample_ses_points(atom_coords, atom_radii, 0, 1.4)
+    ses_points, valid_mask = _sample_projected_grid(atom_coords, atom_radii, 0, 1.4)
 
     assert ses_points.shape == (0, 2, 3)
     assert valid_mask.shape == (0, 2)
 
 
-def test_sample_ses_points_rejects_negative_probe_radius() -> None:
+def test_sample_projected_points_rejects_negative_probe_radius() -> None:
     with pytest.raises(ValueError, match="probe_radius"):
-        sample_ses_points(
+        _sample_projected_grid(
             atom_coords=torch.zeros((1, 3)),
             atom_radii=torch.ones((1, 1)),
             m=1,
@@ -336,13 +366,13 @@ def test_sample_ses_points_rejects_negative_probe_radius() -> None:
         )
 
 
-def test_project_points_to_ses_keeps_atom_surface_point_without_neighbors() -> None:
+def test_project_points_keeps_atom_surface_point_without_neighbors() -> None:
     coords = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float64)
     radii = torch.tensor([1.0], dtype=torch.float64)
     points = torch.tensor([[[1.0, 0.0, 0.0]]], dtype=torch.float64)
     probe_radius = 0.5
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -353,13 +383,13 @@ def test_project_points_to_ses_keeps_atom_surface_point_without_neighbors() -> N
     assert torch.allclose(projected_points, points)
 
 
-def test_project_points_to_ses_keeps_off_axis_single_atom_surface_point() -> None:
+def test_project_points_keeps_off_axis_single_atom_surface_point() -> None:
     coords = torch.tensor([[1.0, -2.0, 0.5]], dtype=torch.float64)
     radii = torch.tensor([2.0], dtype=torch.float64)
     direction = torch.tensor([0.0, 0.6, 0.8], dtype=torch.float64)
     points = (coords + radii[0] * direction).unsqueeze(0)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -370,7 +400,7 @@ def test_project_points_to_ses_keeps_off_axis_single_atom_surface_point() -> Non
     assert torch.allclose(projected_points, points, atol=1e-12, rtol=0)
 
 
-def test_project_points_to_ses_uses_single_plane_when_only_one_neighbor_exists() -> None:
+def test_project_points_uses_single_plane_when_only_one_neighbor_exists() -> None:
     coords = torch.tensor(
         [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
         dtype=torch.float64,
@@ -393,7 +423,7 @@ def test_project_points_to_ses_uses_single_plane_when_only_one_neighbor_exists()
     )
     probe_radius = 1.0
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -413,7 +443,7 @@ def test_project_points_to_ses_uses_single_plane_when_only_one_neighbor_exists()
     assert torch.allclose(projected_points[0, 0], expected_point, atol=1e-12, rtol=0)
 
 
-def test_project_points_to_ses_projects_two_atom_owner_points_to_shared_probe() -> None:
+def test_project_points_projects_two_atom_owner_points_to_shared_probe() -> None:
     coords = torch.tensor(
         [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
         dtype=torch.float64,
@@ -435,7 +465,7 @@ def test_project_points_to_ses_projects_two_atom_owner_points_to_shared_probe() 
         dtype=torch.float64,
     )
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -452,7 +482,7 @@ def test_project_points_to_ses_projects_two_atom_owner_points_to_shared_probe() 
     assert torch.allclose(projected_points, expected_points, atol=1e-12, rtol=0)
 
 
-def test_project_points_to_ses_uses_two_planes_for_three_atom_probe_position() -> None:
+def test_project_points_uses_two_planes_for_three_atom_probe_position() -> None:
     coords = torch.tensor(
         [
             [0.0, 0.0, 0.0],
@@ -487,7 +517,7 @@ def test_project_points_to_ses_uses_two_planes_for_three_atom_probe_position() -
         ]
     )
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -501,7 +531,7 @@ def test_project_points_to_ses_uses_two_planes_for_three_atom_probe_position() -
     assert torch.allclose(projected_points[0, 0], expected_point, atol=1e-12, rtol=0)
 
 
-def test_project_points_to_ses_projects_three_atom_owner_points_to_shared_probe() -> None:
+def test_project_points_projects_three_atom_owner_points_to_shared_probe() -> None:
     coords = torch.tensor(
         [
             [0.0, 0.0, 0.0],
@@ -528,7 +558,7 @@ def test_project_points_to_ses_projects_three_atom_owner_points_to_shared_probe(
         )
     points = torch.stack([torch.stack(owner_points)])
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -643,7 +673,7 @@ def test_compute_probe_centers_allows_ethanol_carbon_points_to_hydrogen_pairs() 
         dtype=torch.float64,
     )
     probe_radius = 1.4
-    points = sample_atom_sphere_points(coords, radii, 900)[[39, 60, 67, 288]]
+    points = sample_atom_points(coords, radii, 900)[[39, 60, 67, 288]]
 
     probe_centers, valid_point_mask = _compute_probe_centers(
         points,
@@ -675,12 +705,12 @@ def test_compute_probe_centers_allows_ethanol_carbon_points_to_hydrogen_pairs() 
         )
 
 
-def test_project_points_to_ses_keeps_ch4_outward_hydrogen_surface_points() -> None:
+def test_project_points_keeps_ch4_outward_hydrogen_surface_points() -> None:
     coords, radii = _methane_atoms()
-    points = sample_atom_sphere_points(coords, radii, 900)
+    points = sample_atom_points(coords, radii, 900)
     num_samples = points.shape[0]
 
-    _, valid_point_mask = project_points_to_ses(
+    _, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -734,7 +764,7 @@ def test_probe_centers_accessible_from_exterior_rejects_enclosed_cavity() -> Non
     assert torch.equal(accessible_mask, torch.tensor([[False, True]]))
 
 
-def test_project_points_to_ses_rejects_interior_probe_center() -> None:
+def test_project_points_rejects_interior_probe_center() -> None:
     coords, radii = _octahedral_probe_cage_atoms()
     directions = coords / torch.linalg.norm(coords, dim=-1, keepdim=True)
     points = coords + radii.unsqueeze(-1) * directions
@@ -746,7 +776,7 @@ def test_project_points_to_ses_rejects_interior_probe_center() -> None:
         radii,
         probe_radius=1.4,
     )
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points.unsqueeze(0),
         atom_coords=coords,
         atom_radii=radii,
@@ -763,11 +793,11 @@ def test_project_points_to_ses_rejects_interior_probe_center() -> None:
     assert torch.isfinite(projected_points).all()
 
 
-def test_project_points_to_ses_rejects_glucose_chair_infeasible_patch_outlier() -> None:
+def test_project_points_rejects_glucose_chair_infeasible_patch_outlier() -> None:
     coords, radii = _glucose_chair_atoms()
-    points = sample_atom_sphere_points(coords, radii, 350)
+    points = sample_atom_points(coords, radii, 350)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -799,7 +829,7 @@ def test_any_pair_repair_ignores_irrelevant_ethanol_oxygen_point() -> None:
         dtype=torch.float64,
     )
     probe_radius = 1.4
-    points = sample_atom_sphere_points(coords, radii, 900)[[86]]
+    points = sample_atom_points(coords, radii, 900)[[86]]
     point_geometry = _compute_point_atom_geometry(points, coords, radii)
     pair_geometry = _compute_pair_geometry(coords, radii, probe_radius)
     tangency_geometry = _compute_tangency_geometry(
@@ -861,12 +891,12 @@ def test_any_pair_repair_ignores_irrelevant_ethanol_oxygen_point() -> None:
     )
 
 
-def test_project_points_to_ses_promotes_integer_points_to_float() -> None:
+def test_project_points_promotes_integer_points_to_float() -> None:
     coords = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float64)
     radii = torch.tensor([1.0], dtype=torch.float64)
     points = torch.tensor([[[1, 0, 0]]], dtype=torch.int64)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -882,12 +912,12 @@ def test_project_points_to_ses_promotes_integer_points_to_float() -> None:
     assert torch.allclose(projected_points, expected_points)
 
 
-def test_project_points_to_ses_handles_empty_atom_axis() -> None:
+def test_project_points_handles_empty_atom_axis() -> None:
     points = torch.empty((2, 0, 3), dtype=torch.float32)
     coords = torch.empty((0, 3), dtype=torch.float32)
     radii = torch.empty((0,), dtype=torch.float32)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=coords,
         atom_radii=radii,
@@ -898,13 +928,13 @@ def test_project_points_to_ses_handles_empty_atom_axis() -> None:
     assert valid_point_mask.shape == (2, 0)
 
 
-def test_project_points_to_ses_rejects_negative_probe_radius() -> None:
+def test_project_points_rejects_negative_probe_radius() -> None:
     points = torch.zeros((1, 1, 3))
     coords = torch.zeros((1, 3))
     radii = torch.ones(1)
 
     with pytest.raises(ValueError, match="probe_radius"):
-        project_points_to_ses(
+        project_points(
             points=points,
             atom_coords=coords,
             atom_radii=radii,
@@ -912,13 +942,13 @@ def test_project_points_to_ses_rejects_negative_probe_radius() -> None:
         )
 
 
-def test_project_points_to_ses_rejects_negative_atom_radii() -> None:
+def test_project_points_rejects_negative_atom_radii() -> None:
     points = torch.zeros((1, 1, 3))
     coords = torch.zeros((1, 3))
     radii = torch.tensor([-1.0])
 
     with pytest.raises(ValueError, match="atom_radii"):
-        project_points_to_ses(
+        project_points(
             points=points,
             atom_coords=coords,
             atom_radii=radii,
@@ -927,13 +957,13 @@ def test_project_points_to_ses_rejects_negative_atom_radii() -> None:
 
 
 @pytest.mark.parametrize("pdb_id", SES_FIXTURE_IDS)
-def test_project_points_to_ses_projects_fixture_npy_atom_surface_points(
+def test_project_points_projects_fixture_npy_atom_surface_points(
     pdb_id: str,
 ) -> None:
     atom_coords, atom_radii = _load_fixture_atoms(pdb_id)
     points = _outward_atom_surface_points(atom_coords, atom_radii)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=atom_coords,
         atom_radii=atom_radii,
@@ -966,11 +996,11 @@ def test_project_points_to_ses_projects_fixture_npy_atom_surface_points(
     )
 
 
-def test_project_points_to_ses_keeps_fixture_dtype_for_float32_npy_inputs() -> None:
+def test_project_points_keeps_fixture_dtype_for_float32_npy_inputs() -> None:
     atom_coords, atom_radii = _load_fixture_atoms("4Q6I_J", dtype=torch.float32)
     points = _outward_atom_surface_points(atom_coords, atom_radii)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=atom_coords,
         atom_radii=atom_radii,
@@ -982,18 +1012,18 @@ def test_project_points_to_ses_keeps_fixture_dtype_for_float32_npy_inputs() -> N
     assert torch.isfinite(projected_points).all()
 
 
-def test_project_points_to_ses_is_atom_order_equivariant_on_fixture_npy_atoms() -> None:
+def test_project_points_is_atom_order_equivariant_on_fixture_npy_atoms() -> None:
     atom_coords, atom_radii = _load_fixture_atoms("2PQ2_B")
     points = _outward_atom_surface_points(atom_coords, atom_radii)
     atom_order = torch.arange(atom_coords.shape[0] - 1, -1, -1)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=atom_coords,
         atom_radii=atom_radii,
         probe_radius=1.4,
     )
-    reordered_projected_points, reordered_valid_point_mask = project_points_to_ses(
+    reordered_projected_points, reordered_valid_point_mask = project_points(
         points=points[:, atom_order],
         atom_coords=atom_coords[atom_order],
         atom_radii=atom_radii[atom_order],
@@ -1009,11 +1039,11 @@ def test_project_points_to_ses_is_atom_order_equivariant_on_fixture_npy_atoms() 
     )
 
 
-def test_project_points_to_ses_keeps_4ft4_fixture_projection_finite() -> None:
+def test_project_points_keeps_4ft4_fixture_projection_finite() -> None:
     atom_coords, atom_radii = _load_fixture_atoms("4FT4_Q")
-    points = sample_atom_sphere_points(atom_coords, atom_radii, 2)
+    points = sample_atom_points(atom_coords, atom_radii, 2)
 
-    projected_points, valid_point_mask = project_points_to_ses(
+    projected_points, valid_point_mask = project_points(
         points=points,
         atom_coords=atom_coords,
         atom_radii=atom_radii,

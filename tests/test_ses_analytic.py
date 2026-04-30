@@ -5,15 +5,16 @@ import torch
 
 from data import read_pdb_tensors
 from molecule.examples import get_molecule
-from ses_blocks import (
+from ses.analytic import (
     ATOM_BLOCK_TYPE,
     PAIR_BLOCK_TYPE,
     PROBE_BLOCK_TYPE,
-    build_analytic_ses_blocks,
-    sample_analytic_ses_points,
-    sample_atom_contact_blocks,
-    sample_pair_torus_blocks,
-    sample_probe_sphere_blocks,
+    build_analytic_blocks,
+    sample_analytic_points,
+    _sample_analytic_samples,
+    _sample_atom_blocks,
+    _sample_pair_blocks,
+    _sample_probe_blocks,
 )
 
 
@@ -49,10 +50,41 @@ def _water_atoms(dtype: torch.dtype = torch.float64) -> tuple[torch.Tensor, torc
     return coords, radii
 
 
-def test_sample_analytic_ses_points_returns_support_metadata() -> None:
+def test_sample_analytic_points_returns_flat_points_and_atom_features() -> None:
     coords, radii = _three_atom_cavity()
 
-    samples = sample_analytic_ses_points(
+    points, atom_features = sample_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=5.0,
+        atom_filter_samples=16,
+        pair_filter_samples=6,
+        include_atom_features=True,
+        max_grid_points=100_000,
+    )
+    points_only = sample_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=5.0,
+        atom_filter_samples=16,
+        pair_filter_samples=6,
+        max_grid_points=100_000,
+    )
+
+    assert points.ndim == 2
+    assert points.shape[1] == 3
+    assert atom_features.shape == (points.shape[0], coords.shape[0])
+    assert torch.equal(points, points_only)
+    assert torch.all((atom_features == 0) | (atom_features == 1))
+    assert torch.all(atom_features.sum(dim=1) >= 1)
+
+
+def test_sample_analytic_points_returns_support_metadata() -> None:
+    coords, radii = _three_atom_cavity()
+
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -82,12 +114,12 @@ def test_sample_analytic_ses_points_returns_support_metadata() -> None:
     )
 
 
-def test_sample_analytic_ses_points_preserves_gradient_path() -> None:
+def test_sample_analytic_points_preserves_gradient_path() -> None:
     coords, radii = _three_atom_cavity(dtype=torch.float32)
     coords.requires_grad_(True)
     radii.requires_grad_(True)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -111,7 +143,7 @@ def test_sample_analytic_ses_points_preserves_gradient_path() -> None:
 def test_analytic_blocks_can_be_sampled_independently() -> None:
     coords, radii = _three_atom_cavity()
 
-    blocks, context = build_analytic_ses_blocks(
+    blocks, context = build_analytic_blocks(
         coords,
         radii,
         1.4,
@@ -119,17 +151,17 @@ def test_analytic_blocks_can_be_sampled_independently() -> None:
         pair_filter_samples=6,
         max_grid_points=100_000,
     )
-    atom_samples = sample_atom_contact_blocks(
+    atom_samples = _sample_atom_blocks(
         context,
         blocks.atom_indices,
         point_area=8.0,
     )
-    pair_samples = sample_pair_torus_blocks(
+    pair_samples = _sample_pair_blocks(
         context,
         blocks.pair_indices,
         point_area=8.0,
     )
-    probe_samples = sample_probe_sphere_blocks(
+    probe_samples = _sample_probe_blocks(
         context,
         blocks,
         point_area=8.0,
@@ -145,7 +177,7 @@ def test_analytic_blocks_can_be_sampled_independently() -> None:
 def test_water_probe_sphere_samples_are_mirrored_across_molecular_plane() -> None:
     coords, radii = _water_atoms()
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -181,7 +213,7 @@ def test_ethanol_default_filters_keep_narrow_reentrant_blocks() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    blocks, _ = build_analytic_ses_blocks(
+    blocks, _ = build_analytic_blocks(
         coords,
         radii,
         1.4,
@@ -198,7 +230,7 @@ def test_benzene_uses_unfiltered_pair_graph_for_probe_blocks() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -229,7 +261,7 @@ def test_probe_density_scale_increases_probe_patch_samples() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    base_samples = sample_analytic_ses_points(
+    base_samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -237,7 +269,7 @@ def test_probe_density_scale_increases_probe_patch_samples() -> None:
         probe_density_scale=1.0,
         max_grid_points=200_000,
     )
-    denser_samples = sample_analytic_ses_points(
+    denser_samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -256,7 +288,7 @@ def test_cyclohexane_probe_triangles_include_interior_samples() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -281,7 +313,7 @@ def test_cyclohexane_default_filter_keeps_small_atom_contact_patches() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -306,7 +338,7 @@ def test_cyclohexane_probe_density_matches_atom_and_pair_defaults() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -328,7 +360,7 @@ def test_hexane_multi_support_probe_patches_cover_full_hull() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -378,7 +410,7 @@ def test_hexane_coarse_probe_sampling_handles_interior_supports() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -407,7 +439,7 @@ def test_cryptand_large_probe_patches_are_not_edge_overconcentrated() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,
@@ -476,7 +508,7 @@ def test_double_chamber_cage_probe_blocks_cover_both_chambers() -> None:
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
-    blocks, _ = build_analytic_ses_blocks(
+    blocks, _ = build_analytic_blocks(
         coords,
         radii,
         1.4,
@@ -489,7 +521,7 @@ def test_double_chamber_cage_probe_blocks_cover_both_chambers() -> None:
     assert bool((centers[:, 0] > 1.0).any().item())
 
 
-def test_sample_analytic_ses_points_smoke_on_real_benchmark_pdb() -> None:
+def test_sample_analytic_points_smoke_on_real_benchmark_pdb() -> None:
     pdb_path = Path("Data/01-benchmark_pdbs/2DS2_A.pdb")
     if not pdb_path.exists():
         pytest.skip("benchmark PDB fixture is not available")
@@ -503,7 +535,7 @@ def test_sample_analytic_ses_points_smoke_on_real_benchmark_pdb() -> None:
     coords = atoms.atom_coords[:80]
     radii = atoms.atom_radii[:80]
 
-    samples = sample_analytic_ses_points(
+    samples = _sample_analytic_samples(
         coords,
         radii,
         1.4,

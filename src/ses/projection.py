@@ -1,16 +1,15 @@
 """Solvent-excluded surface sampling and projection interfaces.
 
-External interfaces:
-    sample_atom_sphere_points: sample evenly distributed points on atom spheres.
-    sample_ses_points: sample atom-sphere points and project them onto SES.
-    project_points_to_ses: project sampled atom-sphere points onto SES.
+External interface:
+    sample_projected_points: return SES point coordinates and, optionally,
+        dense atom-assignment features.
 """
 
 from __future__ import annotations
 
 import math
 from collections import OrderedDict
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Union
 
 import torch
 
@@ -106,7 +105,7 @@ class _TangencyGeometry(NamedTuple):
     tangency_plane_mask: torch.Tensor
 
 
-def sample_atom_sphere_points(
+def sample_atom_points(
     atom_coords: torch.Tensor, # coordinates of atom centers, shape (n, 3)
     atom_radii: torch.Tensor,  # radii of atoms, shape (n, 1), (n,), or n elements
     m: int,                    # number of points sampled on each atom sphere
@@ -170,7 +169,7 @@ def sample_atom_sphere_points(
     )
 
 
-def sample_ses_points(
+def _sample_projected_grid(
     atom_coords: torch.Tensor, # coordinates of atom centers, shape (n, 3)
     atom_radii: torch.Tensor,  # radii of atoms, shape (n, 1), (n,), or n elements
     m: int,                    # number of points sampled on each atom sphere
@@ -178,7 +177,7 @@ def sample_ses_points(
 ) -> tuple[torch.Tensor,       # projected SES points, shape (m, n, 3)
            torch.Tensor]:      # validity mask, shape (m, n)
     """
-    Sample atom-sphere points and project them onto the solvent-excluded surface.
+    Sample atom-sphere points and project them onto a structured SES grid.
 
     Args:
         atom_coords: Atom center coordinates, shape (n, 3).
@@ -191,13 +190,71 @@ def sample_ses_points(
         valid_point_mask: Whether each projected point has an externally
             accessible probe center, shape (m, n).
     """
-    points = sample_atom_sphere_points(atom_coords, atom_radii, m)
-    return project_points_to_ses(
+    points = sample_atom_points(atom_coords, atom_radii, m)
+    return project_points(
         points=points,
         atom_coords=atom_coords,
         atom_radii=atom_radii,
         probe_radius=probe_radius,
     )
+
+
+def sample_projected_points(
+    atom_coords: torch.Tensor,
+    atom_radii: torch.Tensor,
+    m: int,
+    probe_radius: float,
+    *,
+    include_atom_features: bool = False,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Sample visible SES points with the projection-based interface.
+
+    This is the package-level projection scenario: callers receive a flat point
+    cloud with shape ``(num_points, 3)``.  If atom binding is needed, set
+    ``include_atom_features=True`` to also receive a dense one-hot feature
+    tensor with shape ``(num_points, num_atoms)``.  A value of one means the SES
+    point came from the corresponding atom's sampled sphere before projection.
+
+    Args:
+        atom_coords: Atom center coordinates, shape ``(n, 3)``.
+        atom_radii: Atom radii, shape ``(n,)`` or any shape with ``n`` values.
+        m: Number of starting points sampled on each atom sphere.
+        probe_radius: Solvent probe radius.
+        include_atom_features: If true, also return dense atom-assignment
+            features aligned with the returned point rows.
+
+    Returns:
+        ``points`` when ``include_atom_features`` is false, otherwise
+        ``(points, atom_features)``.
+    """
+
+    projected_points, valid_mask = _sample_projected_grid(
+        atom_coords,
+        atom_radii,
+        m,
+        probe_radius,
+    )
+    finite_mask = torch.isfinite(projected_points).all(dim=-1)
+    visible_mask = valid_mask & finite_mask
+    points = projected_points[visible_mask]
+
+    if not include_atom_features:
+        return points
+
+    num_atoms = projected_points.shape[1]
+    owner_indices = (
+        torch.arange(num_atoms, device=projected_points.device)
+        .view(1, num_atoms)
+        .expand(projected_points.shape[0], num_atoms)[visible_mask]
+    )
+    atom_features = torch.zeros(
+        (points.shape[0], num_atoms),
+        dtype=points.dtype,
+        device=points.device,
+    )
+    if owner_indices.numel() > 0:
+        atom_features.scatter_(1, owner_indices.unsqueeze(1), 1)
+    return points, atom_features
 
 
 def _select_suitable_atom_indices(
@@ -2071,7 +2128,7 @@ def _probe_centers_accessible_from_exterior(
     return accessible_mask
 
 
-def project_points_to_ses(
+def project_points(
     points: torch.Tensor,      # coordinates of sampled points, shape (m, n, 3)
     atom_coords: torch.Tensor, # coordinates of atom centers, shape (n, 3)
     atom_radii: torch.Tensor,  # radii of atoms, shape (n,)
@@ -2133,3 +2190,10 @@ def project_points_to_ses(
     )
 
     return projected_points_on_ses, valid_point_mask
+
+
+__all__ = [
+    "project_points",
+    "sample_atom_points",
+    "sample_projected_points",
+]
