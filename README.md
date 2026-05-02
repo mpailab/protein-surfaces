@@ -3,15 +3,15 @@ Machine learning solutions for protein-surfaces analysis
 
 ## SES point sampling
 
-The `src/ses` package provides two interfaces for scattering points on a
-solvent-excluded surface (SES). Both accept atom coordinates, atom radii and a
-solvent probe radius. Both return a flat tensor of SES point coordinates, and
-can optionally return atom-binding features for every point.
+The `src/ses` package provides three interfaces for scattering points on a
+solvent-excluded surface (SES). All three accept atom coordinates, atom radii
+and a solvent probe radius. They return a flat tensor of SES point coordinates,
+and can optionally return atom-binding features for every point.
 
 ```python
 import torch
 
-from ses import sample_analytic_points, sample_projected_points
+from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
 
 atom_coords = torch.tensor(
     [
@@ -59,10 +59,30 @@ assert analytic_points.shape[1] == 3
 assert analytic_features.shape == (analytic_points.shape[0], atom_coords.shape[0])
 ```
 
+`sample_sdf_points` follows the level-set surface generation idea used by
+dMaSIF: seed probe-center candidates around atoms, project them onto a smooth
+signed-distance level set, reject inaccessible centers and shift them back by
+one probe radius to the SES.
+
+```python
+sdf_points, sdf_features = sample_sdf_points(
+    atom_coords,
+    atom_radii,
+    m=128,
+    probe_radius=probe_radius,
+    smoothness=0.3,
+    include_atom_features=True,
+)
+
+assert sdf_points.shape[1] == 3
+assert sdf_features.shape == (sdf_points.shape[0], atom_coords.shape[0])
+```
+
 The feature tensor has one column per input atom. Projection features are
 one-hot because every point originates from one owner atom. Analytic features
 are multi-hot because pair and reentrant patches can be supported by multiple
-atoms.
+atoms. SDF features are binary supports derived from the smooth SDF ownership
+weights.
 
 See `src/ses/README.md` and `src/ses/example.py` for the full interface
 description and larger examples.

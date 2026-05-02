@@ -6,13 +6,13 @@ solvent probe rolling over atom van der Waals spheres. The package is written
 around PyTorch tensors so sampled points can be used directly in downstream
 geometry, visualization and machine-learning pipelines.
 
-The package-level public API intentionally exposes two high-level samplers:
+The package-level public API intentionally exposes three high-level samplers:
 
 ```python
-from ses import sample_analytic_points, sample_projected_points
+from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
 ```
 
-Both interfaces share the same basic input and output convention:
+All three interfaces share the same basic input and output convention:
 
 - `atom_coords`: tensor with shape `(num_atoms, 3)`.
 - `atom_radii`: tensor with one radius per atom.
@@ -47,6 +47,10 @@ sphere, so every feature row has exactly one active atom column.
 Analytic features are multi-hot. An atom contact patch has one active atom, a
 pair torus patch has two active atoms, and a fixed-probe reentrant patch can
 have three or more active atoms.
+
+SDF features are binary supports derived from smooth SDF ownership weights. The
+strongest atom is always active, and neighboring atoms become active when their
+smooth ownership weight passes the feature threshold.
 
 ```python
 active_atom_indices = atom_features[row].nonzero(as_tuple=False).reshape(-1)
@@ -169,12 +173,69 @@ Use the analytic sampler when:
 The analytic sampler usually gives more meaningful atom-support metadata than
 projection, but block discovery is more involved.
 
+## SDF Level-Set Sampler
+
+`sample_sdf_points` samples a smooth signed-distance-function level set in
+probe-center space:
+
+```python
+points = sample_sdf_points(
+    atom_coords,
+    atom_radii,
+    m=128,
+    probe_radius=1.4,
+    smoothness=0.3,
+)
+```
+
+With features:
+
+```python
+points, atom_features = sample_sdf_points(
+    atom_coords,
+    atom_radii,
+    m=128,
+    probe_radius=1.4,
+    smoothness=0.3,
+    include_atom_features=True,
+)
+```
+
+### Idea
+
+This interface follows the level-set sampling strategy used by dMaSIF, adapted
+to this package's SES convention:
+
+1. It places `m` deterministic Fibonacci-lattice candidates on every atom
+   sphere expanded by `probe_radius`.
+2. It iteratively projects those probe-center candidates onto the zero level
+   set of a smooth minimum of signed distances to expanded atom spheres.
+3. It keeps only finite, feasible centers that are accessible from the exterior
+   probe-center component.
+4. It shifts surviving centers inward by one `probe_radius` along the SDF
+   normal to produce SES points.
+
+`smoothness` controls how sharply the soft minimum approximates the hard union
+of expanded atom spheres. Smaller values hug the analytic surface more closely;
+larger values smooth crowded regions more aggressively. `subsample_spacing`
+optionally applies a cubic-grid average to nearby probe centers before the
+final normal shift.
+
+### When To Use It
+
+Use the SDF sampler when:
+
+- you want a differentiable-geometry inspired level-set point cloud;
+- density should be controlled by deterministic seeds per atom, like
+  projection, with optional grid subsampling;
+- approximate multi-atom support features from a smooth SDF are useful.
+
 ## Complete Example
 
 ```python
 import torch
 
-from ses import sample_analytic_points, sample_projected_points
+from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
 
 atom_types = ("O", "H1", "H2")
 atom_coords = torch.tensor(
@@ -204,6 +265,15 @@ analytic_points, analytic_features = sample_analytic_points(
     include_atom_features=True,
 )
 
+sdf_points, sdf_features = sample_sdf_points(
+    atom_coords,
+    atom_radii,
+    m=128,
+    probe_radius=probe_radius,
+    smoothness=0.3,
+    include_atom_features=True,
+)
+
 def decode_bindings(atom_features: torch.Tensor) -> list[tuple[str, ...]]:
     bindings = []
     for row in atom_features:
@@ -218,6 +288,10 @@ print(decode_bindings(projected_features[:5]))
 print(analytic_points.shape)
 print(analytic_features.shape)
 print(decode_bindings(analytic_features[:5]))
+
+print(sdf_points.shape)
+print(sdf_features.shape)
+print(decode_bindings(sdf_features[:5]))
 ```
 
 ## Reusing Analytic Blocks
@@ -264,6 +338,7 @@ the provided `atom_coords` and `atom_radii`.
 | --- | --- | --- | --- |
 | `sample_projected_points` | `m`, points per atom | One-hot owner atom | Quick deterministic SES clouds |
 | `sample_analytic_points` | `point_area`, approximate area per point | Multi-hot support atoms | Area-aware SES sampling and support metadata |
+| `sample_sdf_points` | `m`, level-set seeds per atom | Binary smooth-SDF supports | Smooth level-set SES clouds |
 
-The examples in `src/ses/example.py` are executable and show the same two
+The examples in `src/ses/example.py` are executable and show the same three
 interfaces with comments focused on atom-type binding.

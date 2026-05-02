@@ -1,19 +1,21 @@
-"""Examples for the two SES point-sampling interfaces.
+"""Examples for the SES point-sampling interfaces.
 
-The package exposes two complementary ways to scatter points on a
+The package exposes complementary ways to scatter points on a
 solvent-excluded surface:
 
 * ``sample_projected_points`` starts from points on atom spheres and projects
   them onto the SES.
 * ``sample_analytic_points`` samples explicit analytic SES blocks: atom contact
   patches, pair toroidal patches and fixed-probe reentrant patches.
+* ``sample_sdf_points`` samples a smooth SDF level set in probe-center space and
+  shifts centers back to the SES.
 """
 
 from __future__ import annotations
 
 import torch
 
-from . import sample_analytic_points, sample_projected_points
+from . import sample_analytic_points, sample_projected_points, sample_sdf_points
 
 
 def water_atoms(
@@ -90,6 +92,28 @@ def analytic_example() -> tuple[torch.Tensor, torch.Tensor]:
     return points, atom_features
 
 
+def sdf_example() -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample SES points with the SDF level-set method."""
+
+    atom_types, atom_coords, atom_radii = water_atoms()
+
+    # The SDF interface uses ``m`` deterministic level-set seeds per atom.
+    # Features are binary supports derived from the smooth SDF ownership weights.
+    points, atom_features = sample_sdf_points(
+        atom_coords,
+        atom_radii,
+        m=128,
+        probe_radius=1.4,
+        smoothness=0.3,
+        include_atom_features=True,
+        max_grid_points=200_000,
+    )
+
+    assert atom_features.shape == (points.shape[0], len(atom_types))
+    assert torch.all(atom_features.sum(dim=1) >= 1)
+    return points, atom_features
+
+
 def first_bindings(
     atom_features: torch.Tensor,
     atom_types: tuple[str, ...],
@@ -108,6 +132,7 @@ if __name__ == "__main__":
     atom_types, _, _ = water_atoms()
     projected_points, projected_features = projection_example()
     analytic_points, analytic_features = analytic_example()
+    sdf_points, sdf_features = sdf_example()
 
     print(f"Projection sampler produced {projected_points.shape[0]} points")
     print(f"Projection feature shape: {tuple(projected_features.shape)}")
@@ -115,3 +140,6 @@ if __name__ == "__main__":
     print(f"Analytic sampler produced {analytic_points.shape[0]} points")
     print(f"Analytic feature shape: {tuple(analytic_features.shape)}")
     print(f"Analytic first bindings: {first_bindings(analytic_features, atom_types)}")
+    print(f"SDF sampler produced {sdf_points.shape[0]} points")
+    print(f"SDF feature shape: {tuple(sdf_features.shape)}")
+    print(f"SDF first bindings: {first_bindings(sdf_features, atom_types)}")
