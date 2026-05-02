@@ -46,6 +46,7 @@ _DEFAULT_PAIR_BUDGET = 8_000_000
 _DEFAULT_MAX_PROBE_TRIPLES = 5_000_000
 _DEFAULT_MAX_PROBE_SUPPORT_ATOMS = 16
 _DEFAULT_MAX_GRID_POINTS = 50_000_000
+_DEFAULT_TRIPLE_COMBO_BUDGET = 8_000_000
 
 # Probe-patch rejection sampling keeps a small pool of extra candidates for
 # coarse patches and then greedily picks well-spaced directions from that pool.
@@ -575,16 +576,13 @@ def _extract_probe_blocks(
     )
     flat_centers = centers.reshape(-1, 3)
     flat_valid = valid.reshape(-1) & torch.isfinite(flat_centers).all(dim=-1)
-    flat_seeds = triple_indices.repeat_interleave(2, dim=0)
-    flat_signs = torch.arange(2, device=context.device, dtype=torch.long).repeat(
-        triple_indices.shape[0],
-    )
     if not bool(flat_valid.any().item()):
         return empty
 
+    flat_valid_indices = flat_valid.nonzero(as_tuple=False).reshape(-1)
     flat_centers = flat_centers[flat_valid]
-    flat_seeds = flat_seeds[flat_valid]
-    flat_signs = flat_signs[flat_valid]
+    flat_seeds = triple_indices[torch.div(flat_valid_indices, 2, rounding_mode="floor")]
+    flat_signs = flat_valid_indices.remainder(2)
     feasible = context.centers_feasible(flat_centers)
     accessible = context.centers_accessible(flat_centers, feasible)
     if not bool(accessible.any().item()):
@@ -1320,37 +1318,45 @@ def _candidate_pair_indices_grid(context: ExteriorContext) -> Optional[torch.Ten
     )
     pair_chunks = []
     atom_range = torch.arange(context.num_atoms, dtype=torch.long, device=context.device)
+    slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=context.device)
     for start in range(0, context.num_atoms, rows_per_block):
         stop = min(start + rows_per_block, context.num_atoms)
         first_indices = atom_range[start:stop]
         first_cells = atom_cells[start:stop]
-        for offset in offsets:
-            keys, valid_cells = _atom_cell_query_keys(first_cells + offset.view(1, 3), table)
-            starts_in_table = torch.searchsorted(table.sorted_keys, keys, right=False)
-            stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
-            for slot in range(table.max_occupancy):
-                positions = starts_in_table + slot
-                has_atom = valid_cells & (positions < stops_in_table)
-                second_indices = table.sorted_atom_indices[
-                    positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
-                ]
-                valid = has_atom & (second_indices > first_indices)
-                first_valid = first_indices[valid]
-                second_valid = second_indices[valid]
-                diffs = context.atom_coords[first_valid] - context.atom_coords[second_valid]
-                dist_sq = diffs.square().sum(dim=-1)
-                first_radii = context.expanded_radii[first_valid]
-                second_radii = context.expanded_radii[second_valid]
-                pair_valid = (
-                    (dist_sq < (first_radii + second_radii).square())
-                    & (dist_sq > (first_radii - second_radii).square())
-                )
-                pair_chunks.append(
-                    torch.stack(
-                        (first_valid[pair_valid], second_valid[pair_valid]),
-                        dim=-1,
-                    )
-                )
+        query_cells = first_cells.unsqueeze(1) + offsets.view(1, -1, 3)
+        flat_keys, flat_valid_cells = _atom_cell_query_keys(
+            query_cells.reshape(-1, 3),
+            table,
+        )
+        keys = flat_keys.reshape(first_indices.shape[0], offsets.shape[0])
+        valid_cells = flat_valid_cells.reshape(first_indices.shape[0], offsets.shape[0])
+        starts_in_table = torch.searchsorted(table.sorted_keys, keys, right=False)
+        stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
+        positions = starts_in_table.unsqueeze(-1) + slot_offsets.view(1, 1, -1)
+        has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
+        second_indices = table.sorted_atom_indices[
+            positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
+        ]
+        valid = has_atom & (second_indices > first_indices.view(-1, 1, 1))
+        if not bool(valid.any().item()):
+            continue
+
+        first_valid = first_indices.view(-1, 1, 1).expand_as(second_indices)[valid]
+        second_valid = second_indices[valid]
+        diffs = context.atom_coords[first_valid] - context.atom_coords[second_valid]
+        dist_sq = diffs.square().sum(dim=-1)
+        first_radii = context.expanded_radii[first_valid]
+        second_radii = context.expanded_radii[second_valid]
+        pair_valid = (
+            (dist_sq < (first_radii + second_radii).square())
+            & (dist_sq > (first_radii - second_radii).square())
+        )
+        pair_chunks.append(
+            torch.stack(
+                (first_valid[pair_valid], second_valid[pair_valid]),
+                dim=-1,
+            )
+        )
     if not pair_chunks:
         return torch.empty((0, 2), dtype=torch.long, device=context.device)
     pairs = torch.cat(pair_chunks, dim=0)
@@ -1728,16 +1734,34 @@ def _candidate_triple_indices(
 
     if pair_indices.numel() == 0:
         return torch.empty((0, 3), dtype=torch.long, device=pair_indices.device)
+    if max_triples is not None and max_triples <= 0:
+        return torch.empty((0, 3), dtype=torch.long, device=pair_indices.device)
 
-    first_atoms = pair_indices[:, 0].to(torch.long)
-    second_atoms = pair_indices[:, 1].to(torch.long)
-    starts = torch.cat((first_atoms, second_atoms), dim=0)
-    neighbors = torch.cat((second_atoms, first_atoms), dim=0)
-    sort_keys = starts * int(num_atoms) + neighbors
-    order = torch.argsort(sort_keys)
-    starts = starts[order]
-    neighbors = neighbors[order]
-    counts = torch.bincount(starts, minlength=num_atoms)
+    pairs = pair_indices.to(dtype=torch.long)
+    pairs = torch.sort(pairs, dim=-1).values
+    in_range = (
+        (pairs[:, 0] >= 0)
+        & (pairs[:, 1] < int(num_atoms))
+        & (pairs[:, 0] < pairs[:, 1])
+    )
+    pairs = pairs[in_range]
+    if pairs.numel() == 0:
+        return torch.empty((0, 3), dtype=torch.long, device=pair_indices.device)
+
+    pair_keys = pairs[:, 0] * int(num_atoms) + pairs[:, 1]
+    order = torch.argsort(pair_keys)
+    pair_keys = pair_keys[order]
+    pairs = pairs[order]
+    unique = torch.ones((pairs.shape[0],), dtype=torch.bool, device=pairs.device)
+    unique[1:] = pair_keys[1:] != pair_keys[:-1]
+    pairs = pairs[unique]
+    pair_keys = pair_keys[unique]
+
+    first_atoms = pairs[:, 0]
+    counts = torch.bincount(first_atoms, minlength=int(num_atoms))
+    max_degree = int(counts.max().item()) if counts.numel() > 0 else 0
+    if max_degree < 2:
+        return torch.empty((0, 3), dtype=torch.long, device=pair_indices.device)
     offsets = torch.cat(
         (
             torch.zeros((1,), dtype=torch.long, device=pair_indices.device),
@@ -1745,41 +1769,95 @@ def _candidate_triple_indices(
         ),
         dim=0,
     )
-
+    # Real protein pair graphs are locally bounded, so enumerate triangles as
+    # batched combinations inside each atom's forward neighborhood.  This keeps
+    # the work proportional to local degree and maps cleanly to GPU kernels.
+    max_combos = max_degree * (max_degree - 1) // 2
+    rows_per_batch = max(
+        1,
+        min(int(num_atoms), _DEFAULT_TRIPLE_COMBO_BUDGET // max(1, max_combos)),
+    )
+    combo_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     triple_chunks = []
     triple_count = 0
-    limit_reached = False
-    for first in range(num_atoms):
-        first_start = int(offsets[first].item())
-        first_stop = int(offsets[first + 1].item())
-        first_neighbors = neighbors[first_start:first_stop]
-        greater_neighbors = first_neighbors[first_neighbors > first]
-        for second_tensor in greater_neighbors:
-            second = int(second_tensor.item())
-            second_start = int(offsets[second].item())
-            second_stop = int(offsets[second + 1].item())
-            second_neighbors = neighbors[second_start:second_stop]
-            candidates = greater_neighbors[greater_neighbors > second]
-            if candidates.numel() == 0:
-                continue
-            positions = torch.searchsorted(second_neighbors, candidates)
-            matches = positions < second_neighbors.numel()
-            safe_positions = positions.clamp_max(max(second_neighbors.numel() - 1, 0))
-            matches = matches & (second_neighbors[safe_positions] == candidates)
-            third_atoms = candidates[matches]
-            if third_atoms.numel() == 0:
-                continue
-            first_column = torch.full_like(third_atoms, first)
-            second_column = torch.full_like(third_atoms, second)
-            chunk = torch.stack((first_column, second_column, third_atoms), dim=-1)
-            if max_triples is not None and triple_count + chunk.shape[0] >= max_triples:
-                chunk = chunk[: max_triples - triple_count]
-                limit_reached = True
-            triple_chunks.append(chunk)
-            triple_count += int(chunk.shape[0])
-            if limit_reached:
+    for start in range(0, int(num_atoms), rows_per_batch):
+        stop = min(start + rows_per_batch, int(num_atoms))
+        batch_counts = counts[start:stop]
+        batch_degree = int(batch_counts.max().item()) if batch_counts.numel() > 0 else 0
+        if batch_degree < 2:
+            continue
+
+        first_pair = int(offsets[start].item())
+        last_pair = int(offsets[stop].item())
+        if last_pair <= first_pair:
+            continue
+
+        neighbors = torch.full(
+            (stop - start, batch_degree),
+            -1,
+            dtype=torch.long,
+            device=pair_indices.device,
+        )
+        local_pairs = pairs[first_pair:last_pair]
+        local_first = local_pairs[:, 0] - start
+        local_slots = (
+            torch.arange(first_pair, last_pair, dtype=torch.long, device=pair_indices.device)
+            - offsets[local_pairs[:, 0]]
+        )
+        slot_mask = local_slots < batch_degree
+        neighbors[local_first[slot_mask], local_slots[slot_mask]] = local_pairs[slot_mask, 1]
+
+        combos = combo_cache.get(batch_degree)
+        if combos is None:
+            combos = torch.triu_indices(
+                batch_degree,
+                batch_degree,
+                offset=1,
+                dtype=torch.long,
+                device=pair_indices.device,
+            )
+            combo_cache[batch_degree] = (combos[0], combos[1])
+        combo_first, combo_second = combo_cache[batch_degree]
+        combo_count = int(combo_first.numel())
+        first_column = torch.arange(
+            start,
+            stop,
+            dtype=torch.long,
+            device=pair_indices.device,
+        ).repeat_interleave(combo_count)
+        second_column = neighbors[:, combo_first].reshape(-1)
+        third_column = neighbors[:, combo_second].reshape(-1)
+        valid = third_column >= 0
+        if not bool(valid.any().item()):
+            continue
+
+        second_valid = second_column[valid]
+        third_valid = third_column[valid]
+        candidate_keys = second_valid * int(num_atoms) + third_valid
+        positions = torch.searchsorted(pair_keys, candidate_keys)
+        in_bounds = positions < pair_keys.shape[0]
+        safe_positions = positions.clamp_max(max(pair_keys.shape[0] - 1, 0))
+        matches = in_bounds & (pair_keys[safe_positions] == candidate_keys)
+        if not bool(matches.any().item()):
+            continue
+
+        chunk = torch.stack(
+            (
+                first_column[valid][matches],
+                second_valid[matches],
+                third_valid[matches],
+            ),
+            dim=-1,
+        )
+        if max_triples is not None:
+            remaining = int(max_triples) - triple_count
+            if remaining <= 0:
                 break
-        if limit_reached:
+            if chunk.shape[0] > remaining:
+                chunk = chunk[:remaining]
+        triple_chunks.append(chunk)
+        triple_count += int(chunk.shape[0])
+        if max_triples is not None and triple_count >= int(max_triples):
             break
     if not triple_chunks:
         return torch.empty((0, 3), dtype=torch.long, device=pair_indices.device)

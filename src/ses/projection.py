@@ -1747,35 +1747,51 @@ def _segment_clearance_mask_with_atom_grid(
     segment_lens_sq = segment_dirs.square().sum(dim=-1).clamp_min(
         torch.finfo(starts.dtype).eps,
     )
-    for offset in offsets:
-        keys, valid_cells = _atom_cell_query_keys(
-            midpoint_cells + offset.view(1, 3),
+    rows_per_block = max(
+        1,
+        min(
+            starts.shape[0],
+            _PAIRWISE_ELEMENT_BUDGET // max(1, offsets.shape[0] * table.max_occupancy),
+        ),
+    )
+    slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=starts.device)
+    for start in range(0, starts.shape[0], rows_per_block):
+        stop = min(start + rows_per_block, starts.shape[0])
+        query_cells = midpoint_cells[start:stop].unsqueeze(1) + offsets.view(1, -1, 3)
+        flat_keys, flat_valid_cells = _atom_cell_query_keys(
+            query_cells.reshape(-1, 3),
             table,
         )
+        keys = flat_keys.reshape(stop - start, offsets.shape[0])
+        valid_cells = flat_valid_cells.reshape(stop - start, offsets.shape[0])
         starts_in_table = torch.searchsorted(table.sorted_keys, keys, right=False)
         stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
-        for slot in range(table.max_occupancy):
-            positions = starts_in_table + slot
-            has_atom = valid_cells & (positions < stops_in_table) & clear_mask
-            atom_indices = table.sorted_atom_indices[
-                positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
-            ]
-            candidate_coords = atom_coords[atom_indices]
-            start_to_atoms = candidate_coords - starts
-            nearest_params = (
-                start_to_atoms * segment_dirs
-            ).sum(dim=-1) / segment_lens_sq
-            nearest_params = nearest_params.clamp(0, 1)
-            closest_points = starts + nearest_params.unsqueeze(-1) * segment_dirs
-            closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
-            local_radii_sq = expanded_atom_radii_sq[atom_indices]
-            tol = (
-                256
-                * torch.finfo(starts.dtype).eps
-                * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
-            )
-            blocked = has_atom & (closest_dists_sq < local_radii_sq - tol)
-            clear_mask = clear_mask & ~blocked
+        positions = starts_in_table.unsqueeze(-1) + slot_offsets.view(1, 1, -1)
+        has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
+        atom_indices = table.sorted_atom_indices[
+            positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
+        ]
+        candidate_coords = atom_coords[atom_indices]
+        block_starts = starts[start:stop]
+        block_dirs = segment_dirs[start:stop]
+        start_to_atoms = candidate_coords - block_starts.view(-1, 1, 1, 3)
+        nearest_params = (
+            start_to_atoms * block_dirs.view(-1, 1, 1, 3)
+        ).sum(dim=-1) / segment_lens_sq[start:stop].view(-1, 1, 1)
+        nearest_params = nearest_params.clamp(0, 1)
+        closest_points = (
+            block_starts.view(-1, 1, 1, 3)
+            + nearest_params.unsqueeze(-1) * block_dirs.view(-1, 1, 1, 3)
+        )
+        closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
+        local_radii_sq = expanded_atom_radii_sq[atom_indices]
+        tol = (
+            256
+            * torch.finfo(starts.dtype).eps
+            * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
+        )
+        blocked = has_atom & (closest_dists_sq < local_radii_sq - tol)
+        clear_mask[start:stop] = ~blocked.any(dim=(1, 2))
     return clear_mask
 
 
@@ -1947,40 +1963,38 @@ def _centers_feasible_with_atom_table(
         1,
         min(centers.shape[0], _PAIRWISE_ELEMENT_BUDGET // max(1, 27 * table.max_occupancy)),
     )
+    slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=centers.device)
 
     for start in range(0, centers.shape[0], rows_per_block):
         stop = min(start + rows_per_block, centers.shape[0])
         block_centers = centers[start:stop]
-        block_feasible = torch.ones(
-            block_centers.shape[0],
-            dtype=torch.bool,
-            device=centers.device,
-        )
         center_cells = torch.floor(block_centers / table.cell_size).to(torch.long)
-        for offset in offsets:
-            keys, valid_cells = _atom_cell_query_keys(
-                center_cells + offset.view(1, 3),
-                table,
-            )
-            starts_in_table = torch.searchsorted(table.sorted_keys, keys, right=False)
-            stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
-            for slot in range(table.max_occupancy):
-                positions = starts_in_table + slot
-                has_atom = valid_cells & (positions < stops_in_table) & block_feasible
-                atom_indices = table.sorted_atom_indices[
-                    positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
-                ]
-                candidate_coords = atom_coords[atom_indices]
-                sq_dists = (block_centers - candidate_coords).square().sum(dim=-1)
-                local_radii_sq = expanded_atom_radii_sq[atom_indices]
-                tol = (
-                    float(tol_scale)
-                    * torch.finfo(centers.dtype).eps
-                    * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
-                )
-                blocked = has_atom & (sq_dists < local_radii_sq - tol)
-                block_feasible = block_feasible & ~blocked
-        feasible[start:stop] = block_feasible
+        query_cells = center_cells.unsqueeze(1) + offsets.view(1, -1, 3)
+        flat_keys, flat_valid_cells = _atom_cell_query_keys(
+            query_cells.reshape(-1, 3),
+            table,
+        )
+        keys = flat_keys.reshape(block_centers.shape[0], offsets.shape[0])
+        valid_cells = flat_valid_cells.reshape(block_centers.shape[0], offsets.shape[0])
+        starts_in_table = torch.searchsorted(table.sorted_keys, keys, right=False)
+        stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
+
+        positions = starts_in_table.unsqueeze(-1) + slot_offsets.view(1, 1, -1)
+        has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
+        safe_positions = positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
+        atom_indices = table.sorted_atom_indices[safe_positions]
+        candidate_coords = atom_coords[atom_indices]
+        sq_dists = (
+            block_centers.view(-1, 1, 1, 3) - candidate_coords
+        ).square().sum(dim=-1)
+        local_radii_sq = expanded_atom_radii_sq[atom_indices]
+        tol = (
+            float(tol_scale)
+            * torch.finfo(centers.dtype).eps
+            * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
+        )
+        blocked = has_atom & (sq_dists < local_radii_sq - tol)
+        feasible[start:stop] = ~blocked.any(dim=(1, 2))
 
     return feasible
 
