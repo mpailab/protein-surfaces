@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
+from ses.sdf import _sdf_values_and_normals
 
 
 NPY_DATA_DIR = Path(__file__).resolve().parent / "data" / "npy"
@@ -144,6 +145,72 @@ def test_sample_sdf_points_runs_on_real_fixture() -> None:
     assert torch.isfinite(points).all()
     assert atom_features.shape == (points.shape[0], coords.shape[0])
     assert torch.all(atom_features.sum(dim=1) >= 1)
+
+
+def test_sample_sdf_points_preserves_gradients_to_atom_inputs() -> None:
+    coords, radii = _two_separated_atoms()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+
+    points = sample_sdf_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        smoothness=0.05,
+        level_tolerance=1e-6,
+    )
+
+    assert points.requires_grad
+    loss = points.square().sum()
+    loss.backward()
+
+    assert coords.grad is not None
+    assert radii.grad is not None
+    assert torch.isfinite(coords.grad).all()
+    assert torch.isfinite(radii.grad).all()
+    assert float(coords.grad.abs().sum()) > 0
+    assert float(radii.grad.abs().sum()) > 0
+
+
+def test_sdf_normals_preserve_gradients_to_atom_inputs() -> None:
+    coords, radii = _three_atom_cavity()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+    centers = coords + torch.tensor(
+        [
+            [0.0, 0.0, 3.0],
+            [0.4, 0.2, 3.2],
+            [-0.2, 0.5, 3.1],
+        ],
+        dtype=coords.dtype,
+    )
+    expanded_radii = radii + 1.4
+
+    _, normals = _sdf_values_and_normals(
+        centers,
+        coords,
+        expanded_radii,
+        smoothness=0.2,
+    )
+    normal_weights = torch.tensor(
+        [
+            [0.2, -0.4, 0.7],
+            [-0.5, 0.3, 0.1],
+            [0.6, 0.2, -0.3],
+        ],
+        dtype=normals.dtype,
+    )
+    loss = (normals * normal_weights).sum()
+    loss.backward()
+
+    assert normals.requires_grad
+    assert coords.grad is not None
+    assert radii.grad is not None
+    assert torch.isfinite(coords.grad).all()
+    assert torch.isfinite(radii.grad).all()
+    assert float(coords.grad.abs().sum()) > 0
+    assert float(radii.grad.abs().sum()) > 0
 
 
 def test_sample_sdf_points_subsample_spacing_reduces_density() -> None:

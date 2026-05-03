@@ -36,6 +36,24 @@ def _three_atom_cavity() -> tuple[torch.Tensor, torch.Tensor]:
     return coords, radii
 
 
+def _assert_points_backprop_to_atom_inputs(
+    points: torch.Tensor,
+    coords: torch.Tensor,
+    radii: torch.Tensor,
+) -> None:
+    assert points.shape[0] > 0
+    assert points.requires_grad
+
+    points.square().sum().backward()
+
+    assert coords.grad is not None
+    assert radii.grad is not None
+    assert torch.isfinite(coords.grad).all()
+    assert torch.isfinite(radii.grad).all()
+    assert float(coords.grad.abs().sum()) > 0
+    assert float(radii.grad.abs().sum()) > 0
+
+
 def test_package_exports_only_high_level_samplers() -> None:
     assert set(ses.__all__) == {
         "sample_analytic_points",
@@ -70,6 +88,16 @@ def test_projected_sampler_returns_flat_points_and_one_hot_atom_features() -> No
     assert torch.all(atom_features.sum(dim=0) > 0)
 
 
+def test_projected_sampler_preserves_gradients_to_atom_inputs() -> None:
+    coords, radii = _two_separated_atoms()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+
+    points = sample_projected_points(coords, radii, m=8, probe_radius=0.8)
+
+    _assert_points_backprop_to_atom_inputs(points, coords, radii)
+
+
 def test_analytic_sampler_returns_flat_points_and_multi_hot_atom_features() -> None:
     coords, radii = _three_atom_cavity()
 
@@ -102,6 +130,24 @@ def test_analytic_sampler_returns_flat_points_and_multi_hot_atom_features() -> N
     assert bool((atom_features.sum(dim=1) > 1).any().item())
 
 
+def test_analytic_sampler_preserves_gradients_to_atom_inputs() -> None:
+    coords, radii = _three_atom_cavity()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+
+    points = sample_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=6.0,
+        atom_filter_samples=16,
+        pair_filter_samples=6,
+        max_grid_points=100_000,
+    )
+
+    _assert_points_backprop_to_atom_inputs(points, coords, radii)
+
+
 def test_sdf_sampler_returns_flat_points_and_atom_features() -> None:
     coords, radii = _three_atom_cavity()
 
@@ -130,6 +176,24 @@ def test_sdf_sampler_returns_flat_points_and_atom_features() -> None:
     assert torch.all((atom_features == 0) | (atom_features == 1))
     assert torch.all(atom_features.sum(dim=1) >= 1)
     assert bool((atom_features.sum(dim=1) > 1).any().item())
+
+
+def test_sdf_sampler_preserves_gradients_to_atom_inputs() -> None:
+    coords, radii = _two_separated_atoms()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+
+    points = sample_sdf_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        smoothness=0.05,
+        level_tolerance=1e-6,
+        max_grid_points=100_000,
+    )
+
+    _assert_points_backprop_to_atom_inputs(points, coords, radii)
 
 
 def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None:

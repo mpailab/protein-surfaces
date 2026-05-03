@@ -17,8 +17,11 @@ import torch
 _PAIRWISE_ELEMENT_BUDGET = 8_000_000
 _EXTERNAL_GRID_CACHE_SIZE = 4
 _LOCAL_ATOM_INDEX_CACHE_SIZE = 4
+_ATOM_CELL_TABLE_CACHE_SIZE = 8
+_GRID_FIRST_ACCESSIBLE_CENTER_THRESHOLD = 4096
 _EXTERNAL_GRID_CACHE: "OrderedDict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]]" = OrderedDict()
 _LOCAL_ATOM_INDEX_CACHE: "OrderedDict[tuple[object, ...], torch.Tensor]" = OrderedDict()
+_ATOM_CELL_TABLE_CACHE: "OrderedDict[tuple[object, ...], object]" = OrderedDict()
 
 
 def _tensor_cache_token(tensor: torch.Tensor) -> tuple[object, ...]:
@@ -1768,20 +1771,30 @@ def _segment_clearance_mask_with_atom_grid(
         stops_in_table = torch.searchsorted(table.sorted_keys, keys, right=True)
         positions = starts_in_table.unsqueeze(-1) + slot_offsets.view(1, 1, -1)
         has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
-        atom_indices = table.sorted_atom_indices[
-            positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
-        ]
-        candidate_coords = atom_coords[atom_indices]
         block_starts = starts[start:stop]
         block_dirs = segment_dirs[start:stop]
-        start_to_atoms = candidate_coords - block_starts.view(-1, 1, 1, 3)
+        block_clear = torch.ones(
+            block_starts.shape[0],
+            dtype=torch.bool,
+            device=starts.device,
+        )
+        if not bool(has_atom.any().item()):
+            clear_mask[start:stop] = block_clear
+            continue
+
+        center_rows, cell_rows, slot_rows = has_atom.nonzero(as_tuple=True)
+        atom_indices = table.sorted_atom_indices[
+            positions[center_rows, cell_rows, slot_rows]
+        ]
+        candidate_coords = atom_coords[atom_indices]
+        start_to_atoms = candidate_coords - block_starts[center_rows]
         nearest_params = (
-            start_to_atoms * block_dirs.view(-1, 1, 1, 3)
-        ).sum(dim=-1) / segment_lens_sq[start:stop].view(-1, 1, 1)
+            start_to_atoms * block_dirs[center_rows]
+        ).sum(dim=-1) / segment_lens_sq[start:stop][center_rows]
         nearest_params = nearest_params.clamp(0, 1)
         closest_points = (
-            block_starts.view(-1, 1, 1, 3)
-            + nearest_params.unsqueeze(-1) * block_dirs.view(-1, 1, 1, 3)
+            block_starts[center_rows]
+            + nearest_params.unsqueeze(-1) * block_dirs[center_rows]
         )
         closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
         local_radii_sq = expanded_atom_radii_sq[atom_indices]
@@ -1790,8 +1803,9 @@ def _segment_clearance_mask_with_atom_grid(
             * torch.finfo(starts.dtype).eps
             * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
         )
-        blocked = has_atom & (closest_dists_sq < local_radii_sq - tol)
-        clear_mask[start:stop] = ~blocked.any(dim=(1, 2))
+        blocked = closest_dists_sq < local_radii_sq - tol
+        block_clear[center_rows[blocked]] = False
+        clear_mask[start:stop] = block_clear
     return clear_mask
 
 
@@ -1868,6 +1882,12 @@ def _build_atom_cell_table(
     if atom_coords.shape[0] == 0 or cell_size <= 0:
         return None
 
+    cache_key = (_tensor_cache_token(atom_coords), float(cell_size))
+    cached = _ATOM_CELL_TABLE_CACHE.get(cache_key)
+    if cached is not None:
+        _ATOM_CELL_TABLE_CACHE.move_to_end(cache_key)
+        return cached  # type: ignore[return-value]
+
     atom_cells = torch.floor(atom_coords / cell_size).to(torch.long)
     origin = atom_cells.min(dim=0).values - 1
     max_cell = atom_cells.max(dim=0).values + 1
@@ -1883,7 +1903,7 @@ def _build_atom_cell_table(
     max_occupancy = int(counts.max().item()) if counts.numel() > 0 else 0
     if max_occupancy <= 0:
         return None
-    return _AtomCellTable(
+    table = _AtomCellTable(
         origin=origin,
         dims=dims,
         cell_size=float(cell_size),
@@ -1891,6 +1911,11 @@ def _build_atom_cell_table(
         sorted_atom_indices=order.to(torch.long).contiguous(),
         max_occupancy=max_occupancy,
     )
+    _ATOM_CELL_TABLE_CACHE[cache_key] = table
+    _ATOM_CELL_TABLE_CACHE.move_to_end(cache_key)
+    while len(_ATOM_CELL_TABLE_CACHE) > _ATOM_CELL_TABLE_CACHE_SIZE:
+        _ATOM_CELL_TABLE_CACHE.popitem(last=False)
+    return table
 
 
 def _linear_cell_keys(shifted_cells: torch.Tensor, dims: torch.Tensor) -> torch.Tensor:
@@ -1981,11 +2006,22 @@ def _centers_feasible_with_atom_table(
 
         positions = starts_in_table.unsqueeze(-1) + slot_offsets.view(1, 1, -1)
         has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
-        safe_positions = positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
-        atom_indices = table.sorted_atom_indices[safe_positions]
+        block_feasible = torch.ones(
+            block_centers.shape[0],
+            dtype=torch.bool,
+            device=centers.device,
+        )
+        if not bool(has_atom.any().item()):
+            feasible[start:stop] = block_feasible
+            continue
+
+        center_rows, cell_rows, slot_rows = has_atom.nonzero(as_tuple=True)
+        atom_indices = table.sorted_atom_indices[
+            positions[center_rows, cell_rows, slot_rows]
+        ]
         candidate_coords = atom_coords[atom_indices]
         sq_dists = (
-            block_centers.view(-1, 1, 1, 3) - candidate_coords
+            block_centers[center_rows] - candidate_coords
         ).square().sum(dim=-1)
         local_radii_sq = expanded_atom_radii_sq[atom_indices]
         tol = (
@@ -1993,8 +2029,9 @@ def _centers_feasible_with_atom_table(
             * torch.finfo(centers.dtype).eps
             * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
         )
-        blocked = has_atom & (sq_dists < local_radii_sq - tol)
-        feasible[start:stop] = ~blocked.any(dim=(1, 2))
+        blocked = sq_dists < local_radii_sq - tol
+        block_feasible[center_rows[blocked]] = False
+        feasible[start:stop] = block_feasible
 
     return feasible
 
@@ -2263,6 +2300,71 @@ def _flood_fill_reachable_grid(free_grid: torch.Tensor) -> torch.Tensor:
     return reached_grid
 
 
+def _grid_accessible_query_centers(
+    query_centers: torch.Tensor,
+    atom_coords: torch.Tensor,
+    expanded_atom_radii: torch.Tensor,
+    expanded_atom_radii_sq: torch.Tensor,
+    grid_spacing: float,
+    max_grid_points: int,
+    cache_key: Optional[tuple[object, ...]],
+) -> torch.Tensor:
+    """Check center accessibility through the cached exterior grid first."""
+
+    if query_centers.shape[0] == 0:
+        return torch.empty((0,), dtype=torch.bool, device=query_centers.device)
+
+    reachable_grid, bbox_min, grid_spacing, dims = _external_reachable_grid(
+        atom_coords,
+        expanded_atom_radii,
+        query_centers,
+        grid_spacing,
+        max_grid_points,
+        cache_key=cache_key,
+    )
+
+    frac_indices = (query_centers - bbox_min) / grid_spacing
+    base_indices = torch.floor(frac_indices).to(torch.long)
+    dims_long = dims.to(dtype=torch.long)
+    grid_accessible = torch.zeros(
+        query_centers.shape[0],
+        dtype=torch.bool,
+        device=query_centers.device,
+    )
+    zero_corner = torch.zeros((1, 3), dtype=torch.long, device=query_centers.device)
+
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                offsets = torch.tensor([dx, dy, dz], dtype=torch.long, device=query_centers.device)
+                corner_indices = torch.minimum(
+                    torch.maximum(
+                        base_indices + offsets,
+                        zero_corner,
+                    ),
+                    (dims_long - 1).unsqueeze(0),
+                )
+                reached_corner_mask = reachable_grid[
+                    corner_indices[:, 0],
+                    corner_indices[:, 1],
+                    corner_indices[:, 2],
+                ]
+                unresolved = reached_corner_mask & ~grid_accessible
+                unresolved_indices = unresolved.nonzero(as_tuple=False).reshape(-1)
+                if unresolved_indices.numel() == 0:
+                    continue
+                corner_points = bbox_min + corner_indices[unresolved].to(query_centers.dtype) * grid_spacing
+                segment_clear = _segment_clearance_mask(
+                    query_centers[unresolved],
+                    corner_points,
+                    atom_coords,
+                    expanded_atom_radii_sq,
+                )
+                grid_accessible[unresolved_indices[segment_clear]] = True
+
+    return grid_accessible
+
+
 def _probe_centers_accessible_from_exterior(
     probe_centers: torch.Tensor,
     atom_coords: torch.Tensor,
@@ -2335,28 +2437,43 @@ def _probe_centers_accessible_from_exterior(
     )
 
     feasible_query_centers = calc_centers[feasible_indices]
-    molecule_center = calc_atom_coords.mean(dim=0, keepdim=True)
-    exterior_dirs = feasible_query_centers - molecule_center
-    exterior_dir_norms = torch.linalg.norm(exterior_dirs, dim=-1, keepdim=True)
-    fallback_dirs = torch.zeros_like(exterior_dirs)
-    fallback_dirs[:, 0] = 1
-    exterior_dirs = torch.where(
-        exterior_dir_norms > torch.finfo(calc_dtype).eps,
-        exterior_dirs / exterior_dir_norms.clamp_min(torch.finfo(calc_dtype).eps),
-        fallback_dirs,
+    use_grid_first = (
+        feasible_query_centers.shape[0] >= _GRID_FIRST_ACCESSIBLE_CENTER_THRESHOLD
+        and calc_atom_coords.shape[0] >= 64
     )
-    exterior_radius = (
-        torch.linalg.norm(calc_atom_coords - molecule_center, dim=-1).max()
-        + expanded_atom_radii.max()
-        + 4.0 * effective_spacing
-    )
-    exterior_points = molecule_center + exterior_dirs * exterior_radius
-    query_accessible = _segment_clearance_mask(
-        feasible_query_centers,
-        exterior_points,
-        calc_atom_coords,
-        expanded_atom_radii_sq,
-    )
+    if use_grid_first:
+        query_accessible = _grid_accessible_query_centers(
+            feasible_query_centers,
+            calc_atom_coords,
+            expanded_atom_radii,
+            expanded_atom_radii_sq,
+            effective_spacing,
+            max_grid_points,
+            grid_cache_key,
+        )
+    else:
+        molecule_center = calc_atom_coords.mean(dim=0, keepdim=True)
+        exterior_dirs = feasible_query_centers - molecule_center
+        exterior_dir_norms = torch.linalg.norm(exterior_dirs, dim=-1, keepdim=True)
+        fallback_dirs = torch.zeros_like(exterior_dirs)
+        fallback_dirs[:, 0] = 1
+        exterior_dirs = torch.where(
+            exterior_dir_norms > torch.finfo(calc_dtype).eps,
+            exterior_dirs / exterior_dir_norms.clamp_min(torch.finfo(calc_dtype).eps),
+            fallback_dirs,
+        )
+        exterior_radius = (
+            torch.linalg.norm(calc_atom_coords - molecule_center, dim=-1).max()
+            + expanded_atom_radii.max()
+            + 4.0 * effective_spacing
+        )
+        exterior_points = molecule_center + exterior_dirs * exterior_radius
+        query_accessible = _segment_clearance_mask(
+            feasible_query_centers,
+            exterior_points,
+            calc_atom_coords,
+            expanded_atom_radii_sq,
+        )
     unresolved_query_mask = ~query_accessible
     unresolved_query_indices = unresolved_query_mask.nonzero(
         as_tuple=False,
@@ -2365,56 +2482,42 @@ def _probe_centers_accessible_from_exterior(
         flat_accessible = accessible_mask.reshape(-1)
         flat_accessible[flat_candidate_indices[feasible_indices[query_accessible]]] = True
         return accessible_mask
-    grid_query_centers = feasible_query_centers[unresolved_query_indices]
-
-    reachable_grid, bbox_min, effective_spacing, dims = _external_reachable_grid(
-        calc_atom_coords,
-        expanded_atom_radii,
-        grid_query_centers,
-        effective_spacing,
-        max_grid_points,
-        cache_key=grid_cache_key,
-    )
-
-    frac_indices = (grid_query_centers - bbox_min) / effective_spacing
-    base_indices = torch.floor(frac_indices).to(torch.long)
-    dims_long = dims.to(dtype=torch.long)
-    grid_accessible = torch.zeros(
-        grid_query_centers.shape[0],
-        dtype=torch.bool,
-        device=calc_device,
-    )
-
-    for dx in (0, 1):
-        for dy in (0, 1):
-            for dz in (0, 1):
-                offsets = torch.tensor([dx, dy, dz], dtype=torch.long, device=calc_device)
-                corner_indices = torch.minimum(
-                    torch.maximum(
-                        base_indices + offsets,
-                        torch.zeros((1, 3), dtype=torch.long, device=calc_device),
-                    ),
-                    (dims_long - 1).unsqueeze(0),
-                )
-                reached_corner_mask = reachable_grid[
-                    corner_indices[:, 0],
-                    corner_indices[:, 1],
-                    corner_indices[:, 2],
-                ]
-                unresolved = reached_corner_mask & ~grid_accessible
-                unresolved_indices = unresolved.nonzero(as_tuple=False).reshape(-1)
-                if unresolved_indices.numel() == 0:
-                    continue
-                corner_points = bbox_min + corner_indices[unresolved].to(calc_dtype) * effective_spacing
-                segment_clear = _segment_clearance_mask(
-                    grid_query_centers[unresolved],
-                    corner_points,
-                    calc_atom_coords,
-                    expanded_atom_radii_sq,
-                )
-                grid_accessible[unresolved_indices[segment_clear]] = True
-
-    query_accessible[unresolved_query_indices[grid_accessible]] = True
+    unresolved_query_centers = feasible_query_centers[unresolved_query_indices]
+    if use_grid_first:
+        molecule_center = calc_atom_coords.mean(dim=0, keepdim=True)
+        exterior_dirs = unresolved_query_centers - molecule_center
+        exterior_dir_norms = torch.linalg.norm(exterior_dirs, dim=-1, keepdim=True)
+        fallback_dirs = torch.zeros_like(exterior_dirs)
+        fallback_dirs[:, 0] = 1
+        exterior_dirs = torch.where(
+            exterior_dir_norms > torch.finfo(calc_dtype).eps,
+            exterior_dirs / exterior_dir_norms.clamp_min(torch.finfo(calc_dtype).eps),
+            fallback_dirs,
+        )
+        exterior_radius = (
+            torch.linalg.norm(calc_atom_coords - molecule_center, dim=-1).max()
+            + expanded_atom_radii.max()
+            + 4.0 * effective_spacing
+        )
+        exterior_points = molecule_center + exterior_dirs * exterior_radius
+        segment_accessible = _segment_clearance_mask(
+            unresolved_query_centers,
+            exterior_points,
+            calc_atom_coords,
+            expanded_atom_radii_sq,
+        )
+        query_accessible[unresolved_query_indices[segment_accessible]] = True
+    else:
+        grid_accessible = _grid_accessible_query_centers(
+            unresolved_query_centers,
+            calc_atom_coords,
+            expanded_atom_radii,
+            expanded_atom_radii_sq,
+            effective_spacing,
+            max_grid_points,
+            grid_cache_key,
+        )
+        query_accessible[unresolved_query_indices[grid_accessible]] = True
 
     flat_accessible = accessible_mask.reshape(-1)
     flat_accessible[flat_candidate_indices[feasible_indices[query_accessible]]] = True

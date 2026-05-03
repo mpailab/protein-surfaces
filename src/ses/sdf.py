@@ -95,10 +95,7 @@ def _soft_expanded_atom_sdf(
 ) -> torch.Tensor:
     """Smooth minimum of signed distances to expanded atom spheres."""
 
-    center_distances = torch.linalg.norm(
-        points.unsqueeze(1) - atom_coords.unsqueeze(0),
-        dim=-1,
-    )
+    center_distances = torch.cdist(points, atom_coords)
     signed_distances = center_distances - expanded_atom_radii.unsqueeze(0)
     return -float(smoothness) * torch.logsumexp(
         -signed_distances / float(smoothness),
@@ -152,19 +149,29 @@ def _sdf_values_and_normals(
     rows = _max_sdf_rows(atom_coords.shape[0], pairwise_element_budget)
     values = []
     normals = []
-    with torch.enable_grad():
-        for start in range(0, points.shape[0], rows):
-            stop = min(start + rows, points.shape[0])
-            block = points[start:stop].detach().clone().requires_grad_(True)
-            block_values = _soft_expanded_atom_sdf(
-                block,
-                atom_coords,
-                expanded_atom_radii,
-                smoothness,
-            )
-            block_grads = torch.autograd.grad(block_values.sum(), block)[0]
-            values.append(block_values.detach())
-            normals.append(_normalize_vectors(block_grads.detach()))
+    eps = torch.finfo(points.dtype).eps
+    for start in range(0, points.shape[0], rows):
+        stop = min(start + rows, points.shape[0])
+        block = points[start:stop]
+        center_distances = torch.cdist(block, atom_coords)
+        signed_distances = center_distances - expanded_atom_radii.unsqueeze(0)
+        scaled_distances = -signed_distances / float(smoothness)
+        block_values = -float(smoothness) * torch.logsumexp(
+            scaled_distances,
+            dim=-1,
+        )
+        weights = torch.softmax(scaled_distances, dim=-1)
+        inv_distance_weights = torch.where(
+            center_distances > eps,
+            weights / center_distances.clamp_min(eps),
+            torch.zeros_like(weights),
+        )
+        block_grads = (
+            block * inv_distance_weights.sum(dim=-1, keepdim=True)
+            - inv_distance_weights @ atom_coords
+        )
+        values.append(block_values)
+        normals.append(_normalize_vectors(block_grads))
     return torch.cat(values, dim=0), torch.cat(normals, dim=0)
 
 
@@ -179,7 +186,7 @@ def _project_centers_to_sdf_level(
 ) -> torch.Tensor:
     """Move probe-center candidates onto the zero level set of the smooth SDF."""
 
-    projected = centers.detach()
+    projected = centers
     for _ in range(iterations):
         sdf_values, normals = _sdf_values_and_normals(
             projected,
@@ -189,7 +196,7 @@ def _project_centers_to_sdf_level(
             pairwise_element_budget=pairwise_element_budget,
         )
         projected = projected - sdf_values.unsqueeze(-1) * normals
-    return projected.detach()
+    return projected
 
 
 def _grid_subsample(points: torch.Tensor, spacing: Optional[float]) -> torch.Tensor:
@@ -233,9 +240,7 @@ def _points_outside_atoms(
     radii_sq = atom_radii.square().unsqueeze(0)
     for start in range(0, points.shape[0], rows):
         stop = min(start + rows, points.shape[0])
-        sq_dists = (
-            points[start:stop].unsqueeze(1) - atom_coords.unsqueeze(0)
-        ).square().sum(dim=-1)
+        sq_dists = torch.cdist(points[start:stop], atom_coords).square()
         tol = (
             256
             * torch.finfo(points.dtype).eps

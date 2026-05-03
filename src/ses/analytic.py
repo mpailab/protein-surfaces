@@ -52,6 +52,7 @@ _DEFAULT_TRIPLE_COMBO_BUDGET = 8_000_000
 # coarse patches and then greedily picks well-spaced directions from that pool.
 _WELL_SPACED_SELECTION_LIMIT = 256
 _WELL_SPACED_CANDIDATE_FACTOR = 12
+_FAST_TRIANGLE_WEIGHT_COUNT_LIMIT = 16
 
 
 @dataclass(frozen=True)
@@ -1988,33 +1989,45 @@ def _probe_patch_area_estimates(
     support_coords = atom_coords[safe_indices]
     support_radii = expanded_radii[safe_indices].clamp_min(torch.finfo(centers.dtype).eps)
     normals = (centers.unsqueeze(1) - support_coords) / support_radii.unsqueeze(-1)
-    areas = []
-    for row in range(normals.shape[0]):
+    support_counts = support_mask.sum(dim=-1)
+    areas = torch.zeros((normals.shape[0],), dtype=centers.dtype, device=centers.device)
+
+    triangle_rows = (support_counts == 3).nonzero(as_tuple=False).reshape(-1)
+    if triangle_rows.numel() > 0:
+        triangle_slots = support_mask[triangle_rows].nonzero(as_tuple=False)[:, 1].reshape(-1, 3)
+        triangle_normals = normals[triangle_rows.unsqueeze(-1), triangle_slots]
+        first = triangle_normals[:, 0]
+        second = triangle_normals[:, 1]
+        third = triangle_normals[:, 2]
+        determinant = torch.abs((first * torch.cross(second, third, dim=-1)).sum(dim=-1))
+        denominator = (
+            1
+            + (first * second).sum(dim=-1)
+            + (second * third).sum(dim=-1)
+            + (third * first).sum(dim=-1)
+        )
+        areas[triangle_rows] = 2 * torch.atan2(
+            determinant,
+            denominator.clamp_min(torch.finfo(centers.dtype).eps),
+        )
+
+    polygon_rows = (support_counts > 3).nonzero(as_tuple=False).reshape(-1)
+    for row_tensor in polygon_rows:
+        row = int(row_tensor.item())
         valid_normals = normals[row, support_mask[row]]
-        if valid_normals.shape[0] < 3:
-            areas.append(torch.zeros((), dtype=centers.dtype, device=centers.device))
-        elif valid_normals.shape[0] == 3:
-            areas.append(
-                _spherical_triangle_area(
-                    valid_normals[0],
-                    valid_normals[1],
-                    valid_normals[2],
-                )
+        anchor = valid_normals.mean(dim=0)
+        anchor = anchor / torch.linalg.norm(anchor).clamp_min(torch.finfo(centers.dtype).eps)
+        order = _convex_hull_normal_order(valid_normals, anchor)
+        ordered = valid_normals[order]
+        area = torch.zeros((), dtype=centers.dtype, device=centers.device)
+        for idx in range(ordered.shape[0]):
+            area = area + _spherical_triangle_area(
+                anchor,
+                ordered[idx],
+                ordered[(idx + 1) % ordered.shape[0]],
             )
-        else:
-            anchor = valid_normals.mean(dim=0)
-            anchor = anchor / torch.linalg.norm(anchor).clamp_min(torch.finfo(centers.dtype).eps)
-            order = _convex_hull_normal_order(valid_normals, anchor)
-            ordered = valid_normals[order]
-            area = torch.zeros((), dtype=centers.dtype, device=centers.device)
-            for idx in range(ordered.shape[0]):
-                area = area + _spherical_triangle_area(
-                    anchor,
-                    ordered[idx],
-                    ordered[(idx + 1) % ordered.shape[0]],
-                )
-            areas.append(area)
-    return torch.stack(areas).clamp_min(0) * float(probe_radius) ** 2
+        areas[row] = area
+    return areas.clamp_min(0) * float(probe_radius) ** 2
 
 
 def _spherical_triangle_area(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
@@ -2159,10 +2172,42 @@ def _packed_probe_patch_weights(
 
     row_chunks = []
     weight_chunks = []
-    for row, count_tensor in enumerate(counts):
+    support_counts = support_mask.sum(dim=-1)
+    fast_triangle_mask = (
+        (support_counts == 3)
+        & (counts > 0)
+        & (counts <= _FAST_TRIANGLE_WEIGHT_COUNT_LIMIT)
+    )
+    fast_rows = fast_triangle_mask.nonzero(as_tuple=False).reshape(-1)
+    if fast_rows.numel() > 0:
+        fast_counts = counts[fast_rows]
+        for count_tensor in torch.unique(fast_counts):
+            count = int(count_tensor.item())
+            rows = fast_rows[fast_counts == count]
+            support_slots = support_mask[rows].nonzero(as_tuple=False)[:, 1].reshape(-1, 3)
+            local_weights = _triangle_weight_rows(count, 3, dtype, device)[:, :3]
+            if count >= 12:
+                local_weights = local_weights[:count]
+            packed_weights = torch.zeros(
+                (rows.shape[0], local_weights.shape[0], max_support),
+                dtype=dtype,
+                device=device,
+            )
+            scatter_slots = support_slots.unsqueeze(1).expand(
+                -1,
+                local_weights.shape[0],
+                -1,
+            )
+            scatter_weights = local_weights.unsqueeze(0).expand(rows.shape[0], -1, -1)
+            packed_weights.scatter_(2, scatter_slots, scatter_weights)
+            row_chunks.append(rows.repeat_interleave(local_weights.shape[0]))
+            weight_chunks.append(packed_weights.reshape(-1, max_support))
+
+    slow_rows = ((~fast_triangle_mask) & (counts > 0)).nonzero(as_tuple=False).reshape(-1)
+    for row_tensor in slow_rows:
+        row = int(row_tensor.item())
+        count_tensor = counts[row]
         count = int(count_tensor.item())
-        if count <= 0:
-            continue
         support_slots = support_mask[row].nonzero(as_tuple=False).reshape(-1)
         support_count = int(support_slots.numel())
         if support_count < 3:
