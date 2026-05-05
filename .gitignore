@@ -161,7 +161,6 @@ cython_debug/
 
 .codex
 .devcontainer
-.dockerignore
 .DS_Store
 
 Data

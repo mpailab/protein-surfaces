@@ -1,0 +1,14 @@
+.git
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+.mypy_cache
+tmp/__pycache__
+torch/__pycache__
+Data
+tmp
+*.tar
+*.tar.gz
+*.zip
+ses.ipynb

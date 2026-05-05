@@ -86,3 +86,20 @@ weights.
 
 See `src/ses/README.md` and `src/ses/example.py` for the full interface
 description and larger examples.
+
+## GPU benchmark collection
+
+For full-dataset GPU measurements on a CUDA server, run:
+
+```bash
+scripts/run_gpu_benchmarks.sh
+```
+
+The command builds a CUDA Docker image, runs all SES methods on
+`Data/01-benchmark_pdbs`, and writes streaming JSONL plus a summary JSON under
+`tmp/gpu_benchmarks/`. The wrapper defaults to a focused parameter sweep, three
+repeats, and a limited set of PyTorch profiler traces so the first full run has
+both diagnostic and cleaner timing samples. The benchmark records internal
+section timings, intermediate tensor sizes, CUDA memory, parameter summaries,
+and reference-surface distance metrics. See `docs/gpu_benchmark.md` for smoke
+runs, resume, sharding, profiling, and sweep options.
