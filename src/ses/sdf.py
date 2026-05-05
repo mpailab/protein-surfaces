@@ -21,6 +21,7 @@ from .projection import (
 
 
 _DEFAULT_PAIRWISE_ELEMENT_BUDGET = 8_000_000
+_DEFAULT_GPU_PAIRWISE_ELEMENT_BUDGET = 64_000_000
 _DEFAULT_MAX_GRID_POINTS = 2_000_000
 
 
@@ -69,12 +70,31 @@ def _prepare_sdf_inputs(
     return coords, radii
 
 
-def _max_sdf_rows(num_atoms: int, pairwise_element_budget: int) -> int:
+def _effective_pairwise_element_budget(
+    device: torch.device,
+    pairwise_element_budget: int,
+) -> int:
+    if torch.device(device).type == "cuda":
+        return max(int(pairwise_element_budget), _DEFAULT_GPU_PAIRWISE_ELEMENT_BUDGET)
+    return int(pairwise_element_budget)
+
+
+def _max_sdf_rows(
+    num_atoms: int,
+    pairwise_element_budget: int,
+    *,
+    device: Optional[torch.device] = None,
+) -> int:
     """Return a chunk size that keeps point-atom distance matrices bounded."""
 
     if num_atoms <= 0:
         return 1
-    return max(1, int(pairwise_element_budget) // max(1, int(num_atoms)))
+    budget = (
+        _effective_pairwise_element_budget(device, pairwise_element_budget)
+        if device is not None
+        else int(pairwise_element_budget)
+    )
+    return max(1, budget // max(1, int(num_atoms)))
 
 
 def _normalize_vectors(vectors: torch.Tensor) -> torch.Tensor:
@@ -116,7 +136,11 @@ def _sdf_values(
     if points.shape[0] == 0:
         return torch.empty((0,), dtype=points.dtype, device=points.device)
 
-    rows = _max_sdf_rows(atom_coords.shape[0], pairwise_element_budget)
+    rows = _max_sdf_rows(
+        atom_coords.shape[0],
+        pairwise_element_budget,
+        device=points.device,
+    )
     values = []
     for start in range(0, points.shape[0], rows):
         stop = min(start + rows, points.shape[0])
@@ -146,7 +170,11 @@ def _sdf_values_and_normals(
         empty_normals = torch.empty((0, 3), dtype=points.dtype, device=points.device)
         return empty_values, empty_normals
 
-    rows = _max_sdf_rows(atom_coords.shape[0], pairwise_element_budget)
+    rows = _max_sdf_rows(
+        atom_coords.shape[0],
+        pairwise_element_budget,
+        device=points.device,
+    )
     values = []
     normals = []
     eps = torch.finfo(points.dtype).eps
@@ -235,7 +263,11 @@ def _points_outside_atoms(
     if atom_coords.shape[0] == 0:
         return torch.ones((points.shape[0],), dtype=torch.bool, device=points.device)
 
-    rows = _max_sdf_rows(atom_coords.shape[0], pairwise_element_budget)
+    rows = _max_sdf_rows(
+        atom_coords.shape[0],
+        pairwise_element_budget,
+        device=points.device,
+    )
     masks = []
     radii_sq = atom_radii.square().unsqueeze(0)
     for start in range(0, points.shape[0], rows):
@@ -271,7 +303,11 @@ def _sdf_atom_features(
     if num_points == 0 or num_atoms == 0:
         return features
 
-    rows = _max_sdf_rows(num_atoms, pairwise_element_budget)
+    rows = _max_sdf_rows(
+        num_atoms,
+        pairwise_element_budget,
+        device=centers.device,
+    )
     for start in range(0, num_points, rows):
         stop = min(start + rows, num_points)
         center_distances = torch.linalg.norm(

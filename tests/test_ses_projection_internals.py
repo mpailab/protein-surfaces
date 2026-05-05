@@ -13,7 +13,6 @@ from ses.projection import (
     _compute_triple_probe_centers,
     _external_reachable_grid,
     _grid_free_mask,
-    _grid_free_mask_with_kdtree,
     _grid_free_mask_with_torch,
     _max_pairwise_rows,
     _pair_patch_membership,
@@ -292,15 +291,6 @@ def test_projection_grid_occupancy_and_reachability_helpers() -> None:
         dims,
         grid_points,
     )
-    kdtree_mask = _grid_free_mask_with_kdtree(
-        atom_coords,
-        expanded_radii,
-        expanded_radii_sq,
-        bbox_min,
-        grid_spacing,
-        dims,
-        grid_points,
-    )
     dispatch_mask = _grid_free_mask(
         atom_coords,
         expanded_radii,
@@ -311,7 +301,6 @@ def test_projection_grid_occupancy_and_reachability_helpers() -> None:
         grid_points,
     )
 
-    assert torch.equal(torch_mask, kdtree_mask)
     assert torch.equal(dispatch_mask, torch_mask)
     assert not bool(torch_mask[13].item())
 

@@ -13,7 +13,6 @@ from ses.analytic import (
     _allocate_counts_by_weights,
     _build_exterior_context,
     _candidate_pair_indices,
-    _candidate_pair_indices_kdtree,
     _candidate_pair_indices_torch,
     _candidate_triple_indices,
     _centers_feasible_against_atoms,
@@ -216,7 +215,6 @@ def test_analytic_pair_graph_and_pair_sampling_helpers() -> None:
     expected_pairs = {(0, 1), (0, 2), (1, 2)}
 
     assert _row_set(_candidate_pair_indices_torch(context)) == expected_pairs
-    assert _row_set(_candidate_pair_indices_kdtree(context)) == expected_pairs
     assert _row_set(_candidate_pair_indices(context)) == expected_pairs
 
     pair_indices = torch.tensor([[0, 1]], dtype=torch.long)

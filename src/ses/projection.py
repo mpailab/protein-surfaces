@@ -15,6 +15,7 @@ import torch
 
 
 _PAIRWISE_ELEMENT_BUDGET = 8_000_000
+_GPU_PAIRWISE_ELEMENT_BUDGET = 64_000_000
 _EXTERNAL_GRID_CACHE_SIZE = 4
 _LOCAL_ATOM_INDEX_CACHE_SIZE = 4
 _ATOM_CELL_TABLE_CACHE_SIZE = 8
@@ -22,6 +23,14 @@ _GRID_FIRST_ACCESSIBLE_CENTER_THRESHOLD = 4096
 _EXTERNAL_GRID_CACHE: "OrderedDict[tuple[object, ...], tuple[torch.Tensor, torch.Tensor, float, torch.Tensor]]" = OrderedDict()
 _LOCAL_ATOM_INDEX_CACHE: "OrderedDict[tuple[object, ...], torch.Tensor]" = OrderedDict()
 _ATOM_CELL_TABLE_CACHE: "OrderedDict[tuple[object, ...], object]" = OrderedDict()
+
+
+def _effective_pairwise_element_budget(device: torch.device) -> int:
+    """Use larger temporary distance matrices on GPU to reduce host-side chunking."""
+
+    if torch.device(device).type == "cuda":
+        return max(_PAIRWISE_ELEMENT_BUDGET, _GPU_PAIRWISE_ELEMENT_BUDGET)
+    return _PAIRWISE_ELEMENT_BUDGET
 
 
 def _tensor_cache_token(tensor: torch.Tensor) -> tuple[object, ...]:
@@ -1662,6 +1671,7 @@ def _segment_clearance_mask(
     max_rows = _max_pairwise_rows(
         starts.shape[0],
         atom_coords.shape[0],
+        device=starts.device,
     )
     if starts.shape[0] > max_rows:
         clear_mask = torch.empty(
@@ -1754,7 +1764,8 @@ def _segment_clearance_mask_with_atom_grid(
         1,
         min(
             starts.shape[0],
-            _PAIRWISE_ELEMENT_BUDGET // max(1, offsets.shape[0] * table.max_occupancy),
+            _effective_pairwise_element_budget(starts.device)
+            // max(1, offsets.shape[0] * table.max_occupancy),
         ),
     )
     slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=starts.device)
@@ -1809,7 +1820,12 @@ def _segment_clearance_mask_with_atom_grid(
     return clear_mask
 
 
-def _max_pairwise_rows(row_count: int, column_count: int) -> int:
+def _max_pairwise_rows(
+    row_count: int,
+    column_count: int,
+    *,
+    device: Optional[torch.device] = None,
+) -> int:
     """
     Bound row chunks for temporary `(rows, atoms)` distance matrices.
     """
@@ -1817,7 +1833,12 @@ def _max_pairwise_rows(row_count: int, column_count: int) -> int:
         return 1
     if column_count <= 0:
         return row_count
-    return max(1, min(row_count, _PAIRWISE_ELEMENT_BUDGET // column_count))
+    budget = (
+        _effective_pairwise_element_budget(device)
+        if device is not None
+        else _PAIRWISE_ELEMENT_BUDGET
+    )
+    return max(1, min(row_count, budget // column_count))
 
 
 def _centers_feasible_against_all_atoms(
@@ -1844,7 +1865,11 @@ def _centers_feasible_against_all_atoms(
         return grid_feasible
 
     feasible = torch.empty(centers.shape[0], dtype=torch.bool, device=centers.device)
-    max_rows = _max_pairwise_rows(centers.shape[0], atom_coords.shape[0])
+    max_rows = _max_pairwise_rows(
+        centers.shape[0],
+        atom_coords.shape[0],
+        device=centers.device,
+    )
     for start in range(0, centers.shape[0], max_rows):
         stop = min(start + max_rows, centers.shape[0])
         center_sq_dists = (
@@ -1986,7 +2011,11 @@ def _centers_feasible_with_atom_table(
     feasible = torch.ones(centers.shape[0], dtype=torch.bool, device=centers.device)
     rows_per_block = max(
         1,
-        min(centers.shape[0], _PAIRWISE_ELEMENT_BUDGET // max(1, 27 * table.max_occupancy)),
+        min(
+            centers.shape[0],
+            _effective_pairwise_element_budget(centers.device)
+            // max(1, 27 * table.max_occupancy),
+        ),
     )
     slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=centers.device)
 
@@ -2058,29 +2087,6 @@ def _grid_free_mask(
     )
 
 
-def _grid_free_mask_with_kdtree(
-    atom_coords: torch.Tensor,
-    expanded_atom_radii: torch.Tensor,
-    expanded_atom_radii_sq: torch.Tensor,
-    bbox_min: torch.Tensor,
-    grid_spacing: float,
-    dims: torch.Tensor,
-    grid_points: int,
-) -> torch.Tensor:
-    """
-    Compatibility wrapper for the device-generic occupancy implementation.
-    """
-
-    return _grid_free_mask_with_torch(
-        atom_coords,
-        expanded_atom_radii_sq,
-        bbox_min,
-        grid_spacing,
-        dims,
-        grid_points,
-    )
-
-
 def _grid_free_mask_with_torch(
     atom_coords: torch.Tensor,
     expanded_atom_radii_sq: torch.Tensor,
@@ -2108,14 +2114,22 @@ def _grid_free_mask_with_torch(
     flat_free = torch.empty(grid_points, dtype=torch.bool, device=device)
     nx, ny, nz = (int(dim.item()) for dim in dims)
     yz_size = ny * nz
-    block_size = _max_pairwise_rows(grid_points, atom_coords.shape[0])
+    block_size = _max_pairwise_rows(
+        grid_points,
+        atom_coords.shape[0],
+        device=device,
+    )
     max_radius = torch.sqrt(expanded_atom_radii_sq.max().clamp_min(0))
     cell_size = float(max_radius.clamp_min(torch.finfo(dtype).eps).item())
     atom_table = _build_atom_cell_table(atom_coords, cell_size)
     if atom_table is not None and atom_table.max_occupancy * 27 < atom_coords.shape[0]:
         block_size = max(
             1,
-            min(grid_points, _PAIRWISE_ELEMENT_BUDGET // max(1, 27 * atom_table.max_occupancy)),
+            min(
+                grid_points,
+                _effective_pairwise_element_budget(device)
+                // max(1, 27 * atom_table.max_occupancy),
+            ),
         )
     for start in range(0, grid_points, block_size):
         stop = min(start + block_size, grid_points)

@@ -43,16 +43,30 @@ PROBE_BLOCK_TYPE = 3
 # Memory and combinatorial guards.  They bound all-pairs/all-triples style
 # operations without changing the intended lightweight CPU verification path.
 _DEFAULT_PAIR_BUDGET = 8_000_000
+_DEFAULT_GPU_PAIR_BUDGET = 64_000_000
 _DEFAULT_MAX_PROBE_TRIPLES = 5_000_000
 _DEFAULT_MAX_PROBE_SUPPORT_ATOMS = 16
 _DEFAULT_MAX_GRID_POINTS = 50_000_000
 _DEFAULT_TRIPLE_COMBO_BUDGET = 8_000_000
+_DEFAULT_GPU_TRIPLE_COMBO_BUDGET = 64_000_000
 
 # Probe-patch rejection sampling keeps a small pool of extra candidates for
 # coarse patches and then greedily picks well-spaced directions from that pool.
 _WELL_SPACED_SELECTION_LIMIT = 256
 _WELL_SPACED_CANDIDATE_FACTOR = 12
 _FAST_TRIANGLE_WEIGHT_COUNT_LIMIT = 16
+
+
+def _effective_pair_budget(device: torch.device, pair_budget: int = _DEFAULT_PAIR_BUDGET) -> int:
+    if torch.device(device).type == "cuda":
+        return max(int(pair_budget), _DEFAULT_GPU_PAIR_BUDGET)
+    return int(pair_budget)
+
+
+def _effective_triple_combo_budget(device: torch.device) -> int:
+    if torch.device(device).type == "cuda":
+        return _DEFAULT_GPU_TRIPLE_COMBO_BUDGET
+    return _DEFAULT_TRIPLE_COMBO_BUDGET
 
 
 @dataclass(frozen=True)
@@ -219,6 +233,9 @@ class AnalyticSamples:
             support weights.  This is convenient for tests and small molecules,
             but may be expensive for large systems.
         blocks: Optional block topology that produced these samples.
+        probe_centers: Optional probe-center coordinates aligned with
+            ``points``.  Public analytic callers do not need this field; fast
+            tiled samplers use it for global molecule filtering.
     """
 
     points: torch.Tensor
@@ -229,6 +246,7 @@ class AnalyticSamples:
     support_weights: torch.Tensor
     atom_weights: Optional[torch.Tensor] = None
     blocks: Optional[AnalyticBlocks] = None
+    probe_centers: Optional[torch.Tensor] = None
 
 
 def _build_exterior_context(
@@ -1258,7 +1276,11 @@ def _centers_feasible_against_atoms(
         return feasible.reshape(centers.shape[:-1])
 
     feasible = torch.empty(flat_centers.shape[0], dtype=torch.bool, device=centers.device)
-    block_rows = max(1, min(flat_centers.shape[0], pair_budget // atom_coords.shape[0]))
+    effective_pair_budget = _effective_pair_budget(centers.device, pair_budget)
+    block_rows = max(
+        1,
+        min(flat_centers.shape[0], effective_pair_budget // atom_coords.shape[0]),
+    )
     expanded_sq = expanded_radii.square()
     for start in range(0, flat_centers.shape[0], block_rows):
         stop = min(start + block_rows, flat_centers.shape[0])
@@ -1285,12 +1307,6 @@ def _candidate_pair_indices(context: ExteriorContext) -> torch.Tensor:
     return _candidate_pair_indices_torch(context)
 
 
-def _candidate_pair_indices_kdtree(context: ExteriorContext) -> torch.Tensor:
-    """Compatibility wrapper for the device-generic pair enumerator."""
-
-    return _candidate_pair_indices(context)
-
-
 def _candidate_pair_indices_grid(context: ExteriorContext) -> Optional[torch.Tensor]:
     """Find expanded-sphere intersections with a device-generic atom grid."""
 
@@ -1315,7 +1331,10 @@ def _candidate_pair_indices_grid(context: ExteriorContext) -> Optional[torch.Ten
     ).reshape(-1, 3)
     rows_per_block = max(
         1,
-        min(context.num_atoms, _DEFAULT_PAIR_BUDGET // max(1, 27 * table.max_occupancy)),
+        min(
+            context.num_atoms,
+            _effective_pair_budget(context.device) // max(1, 27 * table.max_occupancy),
+        ),
     )
     pair_chunks = []
     atom_range = torch.arange(context.num_atoms, dtype=torch.long, device=context.device)
@@ -1376,7 +1395,10 @@ def _candidate_pair_indices_torch(context: ExteriorContext) -> torch.Tensor:
 
     pair_chunks = []
     num_atoms = context.num_atoms
-    rows_per_block = max(1, min(num_atoms, _DEFAULT_PAIR_BUDGET // num_atoms))
+    rows_per_block = max(
+        1,
+        min(num_atoms, _effective_pair_budget(context.device) // num_atoms),
+    )
     atom_range = torch.arange(num_atoms, device=context.device)
     for start in range(0, num_atoms, rows_per_block):
         stop = min(start + rows_per_block, num_atoms)
@@ -1776,7 +1798,10 @@ def _candidate_triple_indices(
     max_combos = max_degree * (max_degree - 1) // 2
     rows_per_batch = max(
         1,
-        min(int(num_atoms), _DEFAULT_TRIPLE_COMBO_BUDGET // max(1, max_combos)),
+        min(
+            int(num_atoms),
+            _effective_triple_combo_budget(pair_indices.device) // max(1, max_combos),
+        ),
     )
     combo_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
     triple_chunks = []
@@ -1902,7 +1927,13 @@ def _probe_center_supports(
 
     support_rows = []
     mask_rows = []
-    center_chunks = max(1, min(centers.shape[0], _DEFAULT_PAIR_BUDGET // atom_coords.shape[0]))
+    center_chunks = max(
+        1,
+        min(
+            centers.shape[0],
+            _effective_pair_budget(centers.device) // atom_coords.shape[0],
+        ),
+    )
     for start in range(0, centers.shape[0], center_chunks):
         stop = min(start + center_chunks, centers.shape[0])
         dists = torch.linalg.norm(

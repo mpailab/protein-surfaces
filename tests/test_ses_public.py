@@ -1,7 +1,13 @@
 import torch
+import pytest
 
 import ses
-from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
+from ses import (
+    sample_analytic_points,
+    sample_projected_points,
+    sample_sdf_points,
+    sample_tiled_analytic_points,
+)
 from ses.example import (
     analytic_example,
     first_bindings,
@@ -54,17 +60,142 @@ def _assert_points_backprop_to_atom_inputs(
     assert float(radii.grad.abs().sum()) > 0
 
 
+def _assert_public_samplers_preserve_device(device: torch.device) -> None:
+    projected_coords, projected_radii = (
+        tensor.to(device=device) for tensor in _two_separated_atoms()
+    )
+    cavity_coords, cavity_radii = (
+        tensor.to(device=device) for tensor in _three_atom_cavity()
+    )
+
+    sampler_outputs = [
+        sample_projected_points(
+            projected_coords,
+            projected_radii,
+            m=4,
+            probe_radius=0.8,
+            include_atom_features=True,
+        ),
+        sample_analytic_points(
+            cavity_coords,
+            cavity_radii,
+            1.4,
+            point_area=6.0,
+            atom_filter_samples=16,
+            pair_filter_samples=6,
+            include_atom_features=True,
+            max_grid_points=100_000,
+        ),
+        sample_sdf_points(
+            projected_coords,
+            projected_radii,
+            m=8,
+            probe_radius=0.8,
+            smoothness=0.05,
+            level_tolerance=1e-6,
+            include_atom_features=True,
+            max_grid_points=100_000,
+        ),
+        sample_tiled_analytic_points(
+            cavity_coords,
+            cavity_radii,
+            1.4,
+            point_area=4.0,
+            tile_size=4.0,
+            tile_overlap=2.0,
+            include_atom_features=True,
+            max_grid_points=100_000,
+        ),
+    ]
+
+    for points, atom_features in sampler_outputs:
+        assert points.device == device
+        assert atom_features.device == device
+
+
+def _assert_public_samplers_backprop_on_device(device: torch.device) -> None:
+    sampler_cases = [
+        (
+            _two_separated_atoms,
+            lambda coords, radii: sample_projected_points(
+                coords,
+                radii,
+                m=8,
+                probe_radius=0.8,
+            ),
+        ),
+        (
+            _three_atom_cavity,
+            lambda coords, radii: sample_analytic_points(
+                coords,
+                radii,
+                1.4,
+                point_area=6.0,
+                atom_filter_samples=16,
+                pair_filter_samples=6,
+                max_grid_points=100_000,
+            ),
+        ),
+        (
+            _two_separated_atoms,
+            lambda coords, radii: sample_sdf_points(
+                coords,
+                radii,
+                m=8,
+                probe_radius=0.8,
+                smoothness=0.05,
+                level_tolerance=1e-6,
+                max_grid_points=100_000,
+            ),
+        ),
+        (
+            _three_atom_cavity,
+            lambda coords, radii: sample_tiled_analytic_points(
+                coords,
+                radii,
+                1.4,
+                point_area=4.0,
+                tile_size=4.0,
+                tile_overlap=2.0,
+                max_grid_points=100_000,
+            ),
+        ),
+    ]
+
+    for molecule_factory, sampler in sampler_cases:
+        coords, radii = molecule_factory()
+        coords = coords.to(device=device).requires_grad_(True)
+        radii = radii.to(device=device).requires_grad_(True)
+        _assert_points_backprop_to_atom_inputs(sampler(coords, radii), coords, radii)
+
+
 def test_package_exports_only_high_level_samplers() -> None:
     assert set(ses.__all__) == {
         "sample_analytic_points",
         "sample_projected_points",
         "sample_sdf_points",
+        "sample_tiled_analytic_points",
     }
     assert ses.sample_analytic_points is sample_analytic_points
     assert ses.sample_projected_points is sample_projected_points
     assert ses.sample_sdf_points is sample_sdf_points
+    assert ses.sample_tiled_analytic_points is sample_tiled_analytic_points
     assert not hasattr(ses, "build_analytic_blocks")
     assert not hasattr(ses, "project_points")
+
+
+def test_public_samplers_preserve_cpu_device() -> None:
+    _assert_public_samplers_preserve_device(torch.device("cpu"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_public_samplers_preserve_cuda_device() -> None:
+    _assert_public_samplers_preserve_device(torch.device("cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_public_samplers_backprop_on_cuda() -> None:
+    _assert_public_samplers_backprop_on_device(torch.device("cuda"))
 
 
 def test_projected_sampler_returns_flat_points_and_one_hot_atom_features() -> None:
@@ -196,6 +327,55 @@ def test_sdf_sampler_preserves_gradients_to_atom_inputs() -> None:
     _assert_points_backprop_to_atom_inputs(points, coords, radii)
 
 
+def test_tiled_analytic_sampler_returns_flat_points_and_atom_features() -> None:
+    coords, radii = _three_atom_cavity()
+
+    points = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=4.0,
+        tile_size=4.0,
+        tile_overlap=2.0,
+        max_grid_points=100_000,
+    )
+    feature_points, atom_features = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=4.0,
+        tile_size=4.0,
+        tile_overlap=2.0,
+        include_atom_features=True,
+        max_grid_points=100_000,
+    )
+
+    assert torch.equal(points, feature_points)
+    assert points.ndim == 2
+    assert points.shape[1] == 3
+    assert atom_features.shape == (points.shape[0], coords.shape[0])
+    assert torch.all((atom_features == 0) | (atom_features == 1))
+    assert torch.all(atom_features.sum(dim=1) >= 1)
+
+
+def test_tiled_analytic_sampler_preserves_gradients_to_atom_inputs() -> None:
+    coords, radii = _three_atom_cavity()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+
+    points = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=4.0,
+        tile_size=4.0,
+        tile_overlap=2.0,
+        max_grid_points=100_000,
+    )
+
+    _assert_points_backprop_to_atom_inputs(points, coords, radii)
+
+
 def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None:
     coords = torch.empty((0, 3), dtype=torch.float64)
     radii = torch.empty((0,), dtype=torch.float64)
@@ -220,6 +400,12 @@ def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None
         probe_radius=1.4,
         include_atom_features=True,
     )
+    tiled_points, tiled_features = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        include_atom_features=True,
+    )
 
     assert projected_points.shape == (0, 3)
     assert projected_features.shape == (0, 0)
@@ -227,6 +413,8 @@ def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None
     assert analytic_features.shape == (0, 0)
     assert sdf_points.shape == (0, 3)
     assert sdf_features.shape == (0, 0)
+    assert tiled_points.shape == (0, 3)
+    assert tiled_features.shape == (0, 0)
 
 
 def test_examples_decode_atom_feature_bindings() -> None:

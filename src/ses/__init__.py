@@ -10,9 +10,11 @@ and should be imported from those modules directly when needed.
 from .analytic import sample_analytic_points
 from .projection import sample_projected_points
 from .sdf import sample_sdf_points
+from .tiled_analytic import sample_tiled_analytic_points
 
 __all__ = [
     "sample_analytic_points",
     "sample_projected_points",
     "sample_sdf_points",
+    "sample_tiled_analytic_points",
 ]
