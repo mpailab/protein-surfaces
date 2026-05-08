@@ -9,16 +9,17 @@ IMAGE="${SES_BENCH_IMAGE:-protein-surfaces-gpu-bench:latest}"
 DOCKERFILE="${SES_BENCH_DOCKERFILE:-Dockerfile.gpu}"
 PYTHON_VERSION="${SES_BENCH_PYTHON_VERSION:-3.9}"
 TORCH_INDEX_URL="${SES_BENCH_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
-OUTPUT="${SES_BENCH_OUTPUT:-tmp/gpu_benchmarks/ses_gpu_benchmark_$(date -u +%Y%m%dT%H%M%SZ).jsonl}"
+PROGRAM_VERSION="${SES_BENCH_PROGRAM_VERSION:-0.0.1}"
+OUTPUT="${SES_BENCH_OUTPUT:-tmp/gpu_benchmarks/ses_gpu_benchmark_${PROGRAM_VERSION}.jsonl}"
 DATA_DIR="${SES_BENCH_DATA_DIR:-Data/01-benchmark_pdbs}"
 SURFACE_DIR="${SES_BENCH_SURFACE_DIR:-Data/01-benchmark_surfaces}"
 SKIP_BUILD="${SES_BENCH_SKIP_BUILD:-0}"
 INSTALL_DEPS="${SES_BENCH_INSTALL_DEPS:-0}"
+AUTO_RESUME="${SES_BENCH_AUTO_RESUME:-1}"
 CONTAINER="${SES_BENCH_CONTAINER:-}"
 CONTAINER_WORKDIR="${SES_BENCH_CONTAINER_WORKDIR:-/workspace}"
 EXEC_USER="${SES_BENCH_EXEC_USER:-}"
 RUN_LOCAL="${SES_BENCH_RUN_LOCAL:-0}"
-PROGRAM_VERSION="${SES_BENCH_PROGRAM_VERSION:-0.0.1}"
 DEFAULT_SWEEP_PRESET="${SES_BENCH_SWEEP_PRESET:-focused}"
 DEFAULT_REPEATS="${SES_BENCH_REPEATS:-3}"
 DEFAULT_TORCH_PROFILE_LIMIT="${SES_BENCH_TORCH_PROFILE_LIMIT:-100}"
@@ -29,9 +30,28 @@ DEFAULT_ARGS=(
   --torch-profile-limit "${DEFAULT_TORCH_PROFILE_LIMIT}"
 )
 
+USER_ARGS=("$@")
+RUN_ARGS=("${DEFAULT_ARGS[@]}")
+
+user_args_contain() {
+  local expected="$1"
+  local arg
+  for arg in "${USER_ARGS[@]}"; do
+    if [[ "${arg}" == "${expected}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [[ "${AUTO_RESUME}" == "1" ]] && ! user_args_contain "--resume" && ! user_args_contain "--overwrite"; then
+  RUN_ARGS+=(--resume)
+fi
+RUN_ARGS+=("${USER_ARGS[@]}")
+
 print_defaults() {
   echo "[ses-gpu-bench] Output: ${OUTPUT}"
-  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: program_version=${PROGRAM_VERSION}, sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}"
+  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: program_version=${PROGRAM_VERSION}, auto_resume=${AUTO_RESUME}, sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}"
 }
 
 missing_dependency_message() {
@@ -118,7 +138,7 @@ if [[ "${RUN_LOCAL}" == "1" ]]; then
   SES_BENCH_DATA_DIR="${DATA_DIR}" \
   SES_BENCH_SURFACE_DIR="${SURFACE_DIR}" \
   SES_BENCH_PROGRAM_VERSION="${PROGRAM_VERSION}" \
-    python scripts/benchmark_ses_gpu.py "${DEFAULT_ARGS[@]}" "$@"
+    python scripts/benchmark_ses_gpu.py "${RUN_ARGS[@]}"
   exit 0
 fi
 
@@ -146,7 +166,7 @@ if [[ -n "${CONTAINER}" ]]; then
   fi
   docker "${DOCKER_EXEC_ARGS[@]}" \
     "${CONTAINER}" \
-    python scripts/benchmark_ses_gpu.py "${DEFAULT_ARGS[@]}" "$@"
+    python scripts/benchmark_ses_gpu.py "${RUN_ARGS[@]}"
   exit 0
 fi
 
@@ -179,4 +199,4 @@ docker run --rm \
   -v "${REPO_ROOT}:/workspace" \
   -w /workspace \
   "${IMAGE}" \
-  python scripts/benchmark_ses_gpu.py "${DEFAULT_ARGS[@]}" "$@"
+  python scripts/benchmark_ses_gpu.py "${RUN_ARGS[@]}"

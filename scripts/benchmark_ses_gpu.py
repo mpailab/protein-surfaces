@@ -408,8 +408,8 @@ def _utc_now() -> str:
 
 
 def _default_output_path() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"tmp/gpu_benchmarks/ses_gpu_benchmark_{stamp}.jsonl"
+    program_version = os.environ.get("SES_BENCH_PROGRAM_VERSION", PROGRAM_VERSION)
+    return f"tmp/gpu_benchmarks/ses_gpu_benchmark_{program_version}.jsonl"
 
 
 def _parse_methods(value: str) -> List[str]:

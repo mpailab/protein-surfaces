@@ -27,13 +27,13 @@ The script builds `protein-surfaces-gpu-bench:latest`, starts a container with
 results to:
 
 ```text
-tmp/gpu_benchmarks/ses_gpu_benchmark_<UTC timestamp>.jsonl
+tmp/gpu_benchmarks/ses_gpu_benchmark_<program version>.jsonl
 ```
 
 A compact summary is written next to it as:
 
 ```text
-tmp/gpu_benchmarks/ses_gpu_benchmark_<UTC timestamp>.summary.json
+tmp/gpu_benchmarks/ses_gpu_benchmark_<program version>.summary.json
 ```
 
 Send both files back for optimization work. The JSONL file is the most useful
@@ -51,6 +51,11 @@ and `SES_BENCH_TORCH_PROFILE_LIMIT` before running the wrapper.
 Each run records `program_version`, defaulting to `0.0.1`. For release
 benchmarks, set `SES_BENCH_PROGRAM_VERSION` to the same semantic version as the
 GitHub tag, for example `0.1.0`.
+
+The wrapper automatically passes `--resume` by default, so restarting the same
+program version skips already recorded molecule/method/parameter/repeat results
+and only fills missing records. Use `--overwrite` when you intentionally want
+to rebuild the benchmark file for the same version.
 
 ## Smoke Run
 
@@ -111,16 +116,24 @@ scripts/run_gpu_benchmarks.sh --limit 10
 
 ## Resuming
 
-Results are written after every molecule/method pair. If a long run stops, reuse
-the same output path and pass `--resume`:
+Results are written after every molecule/method pair. The wrapper uses a stable
+versioned output path and enables resume by default:
+
+```bash
+scripts/run_gpu_benchmarks.sh
+```
+
+For a custom output path, keep using the same file:
 
 ```bash
 SES_BENCH_OUTPUT=tmp/gpu_benchmarks/full.jsonl \
-scripts/run_gpu_benchmarks.sh --resume
+scripts/run_gpu_benchmarks.sh
 ```
 
 Resume skips records whose method parameter hash already exists in that JSONL
-file. If you change benchmark parameters, write to a new output file.
+file for the same `program_version`. If you change benchmark parameters, the
+method parameter hash changes and the missing records are added. Set
+`SES_BENCH_AUTO_RESUME=0` to restore the older fail-if-output-exists behavior.
 
 ## Parameter Sweeps
 
@@ -262,6 +275,7 @@ practical.
 - `SES_BENCH_DATA_DIR`: PDB dataset directory.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
 - `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.1`.
+- `SES_BENCH_AUTO_RESUME=0`: disable wrapper auto-resume. Auto-resume is enabled by default.
 - `SES_BENCH_CONTAINER`: run inside an already-running Docker container with `docker exec`.
 - `SES_BENCH_CONTAINER_WORKDIR`: repository path inside that container. Default: `/workspace`.
 - `SES_BENCH_EXEC_USER`: optional user passed to `docker exec --user`.
