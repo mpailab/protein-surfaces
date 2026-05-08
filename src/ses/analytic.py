@@ -1081,8 +1081,9 @@ def sample_analytic_points(
     include_normals: bool = False,
     include_adjacency: bool = False,
     adjacency_weight: AdjacencyWeightMode = "euclidean",
-    adjacency_neighbors: int = 8,
+    adjacency_neighbors: int = 6,
     adjacency_candidate_neighbors: Optional[int] = None,
+    adjacency_prune_redundant: bool = False,
     blocks: Optional[AnalyticBlocks] = None,
     atom_filter_samples: int = 256,
     pair_filter_samples: int = 24,
@@ -1122,8 +1123,10 @@ def sample_analytic_points(
             the returned point rows.
         adjacency_weight: Edge weights, either ``"euclidean"`` or ``"geodesic"``.
         adjacency_neighbors: Maximum local surface neighbors kept per point.
-        adjacency_candidate_neighbors: Euclidean nearest-neighbor candidates
-            tested before normal/tangent surface filtering.
+        adjacency_candidate_neighbors: Nearest-neighbor candidates tested in
+            the selected adjacency metric before normal/tangent filtering.
+        adjacency_prune_redundant: If true, balance kept neighbors across
+            angular sectors in each point's local tangent plane.
         blocks: Optional precomputed blocks from :func:`build_analytic_blocks`.
         atom_filter_samples: Contact-patch discovery samples per atom when
             ``blocks`` is not supplied.
@@ -1178,6 +1181,7 @@ def sample_analytic_points(
             weight_mode=adjacency_weight,
             neighbors=adjacency_neighbors,
             candidate_neighbors=adjacency_candidate_neighbors,
+            prune_redundant_edges=adjacency_prune_redundant,
         )
         if include_adjacency
         else None

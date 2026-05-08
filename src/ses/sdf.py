@@ -339,8 +339,9 @@ def sample_sdf_points(
     include_normals: bool = False,
     include_adjacency: bool = False,
     adjacency_weight: AdjacencyWeightMode = "euclidean",
-    adjacency_neighbors: int = 8,
+    adjacency_neighbors: int = 6,
     adjacency_candidate_neighbors: Optional[int] = None,
+    adjacency_prune_redundant: bool = False,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = _DEFAULT_MAX_GRID_POINTS,
     pairwise_element_budget: int = _DEFAULT_PAIRWISE_ELEMENT_BUDGET,
@@ -379,8 +380,10 @@ def sample_sdf_points(
             the returned point rows.
         adjacency_weight: Edge weights, either ``"euclidean"`` or ``"geodesic"``.
         adjacency_neighbors: Maximum local surface neighbors kept per point.
-        adjacency_candidate_neighbors: Euclidean nearest-neighbor candidates
-            tested before normal/tangent surface filtering.
+        adjacency_candidate_neighbors: Nearest-neighbor candidates tested in
+            the selected adjacency metric before normal/tangent filtering.
+        adjacency_prune_redundant: If true, balance kept neighbors across
+            angular sectors in each point's local tangent plane.
         grid_spacing: Optional exterior flood-fill grid spacing.
         max_grid_points: Safety cap for exterior flood-fill grids.
         pairwise_element_budget: Approximate maximum point-atom distance matrix
@@ -422,6 +425,8 @@ def sample_sdf_points(
                 weight_mode=adjacency_weight,
                 neighbors=adjacency_neighbors,
                 candidate_neighbors=adjacency_candidate_neighbors,
+                prune_redundant_edges=adjacency_prune_redundant,
+                pairwise_element_budget=pairwise_element_budget,
             )
             if include_adjacency
             else None
@@ -525,6 +530,8 @@ def sample_sdf_points(
             weight_mode=adjacency_weight,
             neighbors=adjacency_neighbors,
             candidate_neighbors=adjacency_candidate_neighbors,
+            prune_redundant_edges=adjacency_prune_redundant,
+            pairwise_element_budget=pairwise_element_budget,
         )
         if include_adjacency
         else None

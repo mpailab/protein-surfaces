@@ -97,13 +97,20 @@ points, normals, adjacency = sample_analytic_points(
 )
 ```
 
-The returned adjacency is a symmetric sparse COO tensor.  Candidate edges are
-chosen from local nearest neighbors, then filtered so they connect samples on the
-same SES patch or on adjacent patch families. For analytic samplers this uses
-block topology: atom contact patches connect to their neighboring pair torus
-patches, and pair torus patches connect to fixed-probe reentrant patches. Direct
-atom-to-probe shortcuts are rejected. Projection and SDF samplers use their
-available atom-support metadata as an approximation of the same rule.
+The returned adjacency is a symmetric sparse COO tensor. Candidate edges are
+chosen from a compact topology-aware nearest-neighbor pool, so samples connect
+on the same SES patch or on adjacent patch families before the normal/tangent
+surface checks run. For analytic samplers this uses block topology: atom contact
+patches connect to their neighboring pair torus patches, pair torus patches
+connect to fixed-probe reentrant patches, and boundary atom-to-probe links are
+kept when the local support metadata allows them. Concretely, nested support
+sets are treated as required neighboring SES patches: atom-pair when the atom
+belongs to the pair, atom-probe when the probe rests on the atom, and pair-probe
+when the probe rests on both atoms in the pair. Projection and SDF samplers use
+their available atom-support metadata as an approximation of the same rule. By
+default the graph is built for fast GPU construction and bounded degrees: all
+topologically allowed same-patch and adjacent-patch candidates compete in one
+nearest-neighbor pool, without separate reserve or repair passes.
 
 By default edge weights are Euclidean distances between endpoint coordinates.
 Pass `adjacency_weight="geodesic"` to use a local normal-angle geodesic

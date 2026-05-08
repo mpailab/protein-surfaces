@@ -315,6 +315,29 @@ def test_projected_sampler_can_return_surface_adjacency() -> None:
     assert torch.all(full_adjacency.coalesce().values() >= adjacency.coalesce().values())
 
 
+def test_projected_adjacency_connects_neighboring_atom_patches() -> None:
+    _, coords, radii = water_atoms()
+
+    points, atom_features, adjacency = sample_projected_points(
+        coords,
+        radii,
+        m=64,
+        probe_radius=1.4,
+        include_atom_features=True,
+        include_adjacency=True,
+        adjacency_neighbors=4,
+        adjacency_candidate_neighbors=12,
+    )
+
+    _assert_sparse_adjacency(points, adjacency)
+    owners = atom_features.argmax(dim=1)
+    edge_indices = adjacency.coalesce().indices()
+    keep = edge_indices[0] < edge_indices[1]
+    edge_indices = edge_indices[:, keep]
+
+    assert bool((owners[edge_indices[0]] != owners[edge_indices[1]]).any().item())
+
+
 def test_projected_sampler_preserves_gradients_to_atom_inputs() -> None:
     coords, radii = _two_separated_atoms()
     coords.requires_grad_(True)

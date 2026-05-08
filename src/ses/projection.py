@@ -231,8 +231,9 @@ def sample_projected_points(
     include_normals: bool = False,
     include_adjacency: bool = False,
     adjacency_weight: AdjacencyWeightMode = "euclidean",
-    adjacency_neighbors: int = 8,
+    adjacency_neighbors: int = 6,
     adjacency_candidate_neighbors: Optional[int] = None,
+    adjacency_prune_redundant: bool = False,
 ) -> SamplerOutput:
     """Sample visible SES points with the projection-based interface.
 
@@ -259,8 +260,10 @@ def sample_projected_points(
             the returned point rows.
         adjacency_weight: Edge weights, either ``"euclidean"`` or ``"geodesic"``.
         adjacency_neighbors: Maximum local surface neighbors kept per point.
-        adjacency_candidate_neighbors: Euclidean nearest-neighbor candidates
-            tested before normal/tangent surface filtering.
+        adjacency_candidate_neighbors: Nearest-neighbor candidates tested in
+            the selected adjacency metric before normal/tangent filtering.
+        adjacency_prune_redundant: If true, balance kept neighbors across
+            angular sectors in each point's local tangent plane.
 
     Returns:
         ``points`` by default, ``(points, normals)`` when only normals are
@@ -309,6 +312,8 @@ def sample_projected_points(
             weight_mode=adjacency_weight,
             neighbors=adjacency_neighbors,
             candidate_neighbors=adjacency_candidate_neighbors,
+            prune_redundant_edges=adjacency_prune_redundant,
+            allow_disjoint_single_support_edges=True,
         )
         if include_adjacency
         else None

@@ -101,8 +101,9 @@ def sample_display_points(
     include_normals=False,
     include_edges=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
 ):
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
@@ -150,6 +151,8 @@ def sample_display_points(
             weight_mode=adjacency_weight,
             neighbors=adjacency_neighbors,
             candidate_neighbors=adjacency_candidate_neighbors,
+            prune_redundant_edges=adjacency_prune_redundant,
+            allow_disjoint_single_support_edges=True,
         )
     result = {
         "raw_atom_points": atom_points.reshape(-1, 3).detach().cpu().numpy(),
@@ -184,8 +187,9 @@ def sample_analytic_display_points(
     include_normals=False,
     include_edges=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
 ):
     """Sample analytic SES points and return NumPy arrays for visualization."""
 
@@ -234,6 +238,7 @@ def sample_analytic_display_points(
             weight_mode=adjacency_weight,
             neighbors=adjacency_neighbors,
             candidate_neighbors=adjacency_candidate_neighbors,
+            prune_redundant_edges=adjacency_prune_redundant,
         )
 
     result = {
@@ -273,8 +278,9 @@ def sample_sdf_display_points(
     include_normals=False,
     include_edges=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
 ):
     """Sample SDF level-set SES points and return NumPy arrays for visualization."""
 
@@ -301,6 +307,7 @@ def sample_sdf_display_points(
         adjacency_weight=adjacency_weight,
         adjacency_neighbors=adjacency_neighbors,
         adjacency_candidate_neighbors=adjacency_candidate_neighbors,
+        adjacency_prune_redundant=adjacency_prune_redundant,
         max_grid_points=max_grid_points,
     )
     if include_normals and include_edges:
@@ -358,8 +365,9 @@ def sample_tiled_analytic_display_points(
     include_normals=False,
     include_edges=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
 ):
     """Sample tiled analytic SES points and return NumPy arrays for visualization."""
 
@@ -413,6 +421,7 @@ def sample_tiled_analytic_display_points(
             weight_mode=adjacency_weight,
             neighbors=adjacency_neighbors,
             candidate_neighbors=adjacency_candidate_neighbors,
+            prune_redundant_edges=adjacency_prune_redundant,
         )
 
     result = {
@@ -571,8 +580,9 @@ def render_py3dmol_points(
     show_edges=False,
     show_normals=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
     edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
     edge_color=DEFAULT_SURFACE_EDGE_COLOR,
     edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
@@ -595,6 +605,7 @@ def render_py3dmol_points(
         adjacency_weight=adjacency_weight,
         adjacency_neighbors=adjacency_neighbors,
         adjacency_candidate_neighbors=adjacency_candidate_neighbors,
+        adjacency_prune_redundant=adjacency_prune_redundant,
     )
 
     view = py3Dmol.view(width=width, height=height)
@@ -677,8 +688,9 @@ def render_py3dmol_analytic_ses_points(
     show_edges=False,
     show_normals=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
     edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
     edge_color=DEFAULT_SURFACE_EDGE_COLOR,
     edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
@@ -714,6 +726,7 @@ def render_py3dmol_analytic_ses_points(
         adjacency_weight=adjacency_weight,
         adjacency_neighbors=adjacency_neighbors,
         adjacency_candidate_neighbors=adjacency_candidate_neighbors,
+        adjacency_prune_redundant=adjacency_prune_redundant,
     )
 
     view = py3Dmol.view(width=width, height=height)
@@ -797,8 +810,9 @@ def render_py3dmol_sdf_ses_points(
     show_edges=False,
     show_normals=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
     edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
     edge_color=DEFAULT_SURFACE_EDGE_COLOR,
     edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
@@ -832,6 +846,7 @@ def render_py3dmol_sdf_ses_points(
         adjacency_weight=adjacency_weight,
         adjacency_neighbors=adjacency_neighbors,
         adjacency_candidate_neighbors=adjacency_candidate_neighbors,
+        adjacency_prune_redundant=adjacency_prune_redundant,
     )
 
     view = py3Dmol.view(width=width, height=height)
@@ -916,8 +931,9 @@ def render_py3dmol_tiled_analytic_ses_points(
     show_edges=False,
     show_normals=False,
     adjacency_weight="euclidean",
-    adjacency_neighbors=8,
+    adjacency_neighbors=6,
     adjacency_candidate_neighbors=None,
+    adjacency_prune_redundant=False,
     edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
     edge_color=DEFAULT_SURFACE_EDGE_COLOR,
     edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
@@ -955,6 +971,7 @@ def render_py3dmol_tiled_analytic_ses_points(
         adjacency_weight=adjacency_weight,
         adjacency_neighbors=adjacency_neighbors,
         adjacency_candidate_neighbors=adjacency_candidate_neighbors,
+        adjacency_prune_redundant=adjacency_prune_redundant,
     )
 
     view = py3Dmol.view(width=width, height=height)

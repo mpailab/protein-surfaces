@@ -915,8 +915,9 @@ def sample_tiled_analytic_points(
     include_normals: bool = False,
     include_adjacency: bool = False,
     adjacency_weight: AdjacencyWeightMode = "euclidean",
-    adjacency_neighbors: int = 8,
+    adjacency_neighbors: int = 6,
     adjacency_candidate_neighbors: Optional[int] = None,
+    adjacency_prune_redundant: bool = False,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = _DEFAULT_MAX_GRID_POINTS,
     max_probe_triples: Optional[int] = _DEFAULT_MAX_PROBE_TRIPLES,
@@ -932,7 +933,9 @@ def sample_tiled_analytic_points(
     Set ``include_normals=True`` to also return outward SES normals aligned with
     the sampled points.
     Set ``include_adjacency=True`` to receive a sparse symmetric SES surface
-    adjacency matrix with shape ``(num_points, num_points)``.
+    adjacency matrix with shape ``(num_points, num_points)``.  By default the
+    graph builds a compact topology-aware candidate pool before normal/tangent
+    filtering.
     """
 
     need_sample_normals = include_normals or include_adjacency
@@ -967,6 +970,8 @@ def sample_tiled_analytic_points(
             weight_mode=adjacency_weight,
             neighbors=adjacency_neighbors,
             candidate_neighbors=adjacency_candidate_neighbors,
+            prune_redundant_edges=adjacency_prune_redundant,
+            pairwise_element_budget=pairwise_element_budget,
         )
         if include_adjacency
         else None
