@@ -28,6 +28,7 @@ from typing import Optional, Union
 import torch
 
 from ._outputs import SamplerOutput, _format_sample_outputs
+from .graph import AdjacencyWeightMode, build_surface_adjacency
 from .projection import (
     _atom_cell_query_keys,
     _build_atom_cell_table,
@@ -647,6 +648,7 @@ def _sample_atom_blocks(
     *,
     point_area: float,
     oversample_factor: float = 1.25,
+    include_normals: bool = False,
 ) -> AnalyticSamples:
     """Generate points on exterior atom-contact SES patches.
 
@@ -695,7 +697,7 @@ def _sample_atom_blocks(
         + context.atom_radii[owners].unsqueeze(-1) * directions
     )
     points = points[exterior]
-    normals = directions[exterior]
+    normals = directions[exterior] if include_normals else None
     owners = owners[exterior]
     owner_rows = owner_rows[exterior]
     support_indices = owners.unsqueeze(-1)
@@ -727,6 +729,7 @@ def _sample_pair_blocks(
     *,
     point_area: float,
     oversample_factor: float = 1.25,
+    include_normals: bool = False,
 ) -> AnalyticSamples:
     """Generate points on exterior pair toroidal SES patches.
 
@@ -780,9 +783,9 @@ def _sample_pair_blocks(
     with torch.no_grad():
         exterior = context.centers_exterior(probe_centers)
 
-    normals = (probe_centers - points) / float(context.probe_radius)
+    normals = (probe_centers - points) / float(context.probe_radius) if include_normals else None
     points = points[exterior]
-    normals = normals[exterior]
+    normals = normals[exterior] if normals is not None else None
     selected_pairs = selected_pairs[exterior]
     pair_rows = pair_rows[exterior]
     first_weights = first_weights[exterior]
@@ -816,6 +819,7 @@ def _sample_probe_blocks(
     point_area: float,
     oversample_factor: float = 1.25,
     probe_density_scale: float = 1.0,
+    include_normals: bool = False,
 ) -> AnalyticSamples:
     """Generate points on fixed-probe reentrant spherical SES patches.
 
@@ -925,7 +929,7 @@ def _sample_probe_blocks(
         finite = torch.isfinite(points).all(dim=-1)
         valid = center_valid[sample_block_rows] & finite
     points = points[valid]
-    normals = probe_dirs[valid]
+    normals = probe_dirs[valid] if include_normals else None
     sample_block_rows = sample_block_rows[valid]
     selected_support_indices = selected_support_indices[valid]
     selected_support_mask = selected_support_mask[valid]
@@ -961,6 +965,7 @@ def _sample_analytic_samples(
     oversample_factor: float = 1.25,
     probe_density_scale: float = 1.0,
     include_atom_weights: bool = False,
+    include_normals: bool = False,
     blocks: Optional[AnalyticBlocks] = None,
     atom_filter_samples: int = 256,
     pair_filter_samples: int = 24,
@@ -991,6 +996,7 @@ def _sample_analytic_samples(
         include_atom_weights: If true, also return a dense ``(points, atoms)``
             weighted atom-assignment matrix. The default sparse
             ``support_*`` fields are much cheaper for large molecules.
+        include_normals: If true, also populate ``AnalyticSamples.normals``.
         blocks: Optional precomputed blocks from :func:`build_analytic_blocks`.
         atom_filter_samples: Contact-patch discovery samples per atom when
             ``blocks`` is not supplied.
@@ -1037,12 +1043,14 @@ def _sample_analytic_samples(
         blocks.atom_indices,
         point_area=point_area,
         oversample_factor=oversample_factor,
+        include_normals=include_normals,
     )
     pair_samples = _sample_pair_blocks(
         context,
         blocks.pair_indices,
         point_area=point_area,
         oversample_factor=oversample_factor,
+        include_normals=include_normals,
     )
     probe_samples = _sample_probe_blocks(
         context,
@@ -1050,6 +1058,7 @@ def _sample_analytic_samples(
         point_area=point_area,
         oversample_factor=oversample_factor,
         probe_density_scale=probe_density_scale,
+        include_normals=include_normals,
     )
     samples = _concat_samples(
         (atom_samples, pair_samples, probe_samples),
@@ -1070,6 +1079,10 @@ def sample_analytic_points(
     probe_density_scale: float = 1.0,
     include_atom_features: bool = False,
     include_normals: bool = False,
+    include_adjacency: bool = False,
+    adjacency_weight: AdjacencyWeightMode = "euclidean",
+    adjacency_neighbors: int = 8,
+    adjacency_candidate_neighbors: Optional[int] = None,
     blocks: Optional[AnalyticBlocks] = None,
     atom_filter_samples: int = 256,
     pair_filter_samples: int = 24,
@@ -1089,6 +1102,8 @@ def sample_analytic_points(
     corresponding atom supports that analytic SES sample.
     Set ``include_normals=True`` to receive outward SES normals with shape
     ``(num_points, 3)``.
+    Set ``include_adjacency=True`` to receive a sparse symmetric SES surface
+    adjacency matrix with shape ``(num_points, num_points)``.
 
     Args:
         atom_coords: Atom coordinates, shape ``(n, 3)``.
@@ -1103,6 +1118,12 @@ def sample_analytic_points(
             features aligned with the returned point rows.
         include_normals: If true, also return outward SES normals aligned with
             the returned point rows.
+        include_adjacency: If true, also return a sparse adjacency matrix over
+            the returned point rows.
+        adjacency_weight: Edge weights, either ``"euclidean"`` or ``"geodesic"``.
+        adjacency_neighbors: Maximum local surface neighbors kept per point.
+        adjacency_candidate_neighbors: Euclidean nearest-neighbor candidates
+            tested before normal/tangent surface filtering.
         blocks: Optional precomputed blocks from :func:`build_analytic_blocks`.
         atom_filter_samples: Contact-patch discovery samples per atom when
             ``blocks`` is not supplied.
@@ -1120,9 +1141,11 @@ def sample_analytic_points(
     Returns:
         ``points`` by default, ``(points, normals)`` when only normals are
         requested, ``(points, atom_features)`` when only features are requested,
-        and ``(points, atom_features, normals)`` when both are requested.
+        and optional outputs in the order ``atom_features``, ``normals``,
+        ``adjacency`` when several are requested.
     """
 
+    need_sample_normals = include_normals or include_adjacency
     samples = _sample_analytic_samples(
         atom_coords,
         atom_radii,
@@ -1131,6 +1154,7 @@ def sample_analytic_points(
         oversample_factor=oversample_factor,
         probe_density_scale=probe_density_scale,
         include_atom_weights=False,
+        include_normals=need_sample_normals,
         blocks=blocks,
         atom_filter_samples=atom_filter_samples,
         pair_filter_samples=pair_filter_samples,
@@ -1141,9 +1165,29 @@ def sample_analytic_points(
         grid_spacing=grid_spacing,
         max_grid_points=max_grid_points,
     )
-    normals = samples.normals if include_normals else None
+    graph_normals = samples.normals
+    normals = graph_normals if include_normals else None
+    adjacency = (
+        build_surface_adjacency(
+            samples.points,
+            graph_normals,
+            support_indices=samples.support_indices,
+            support_mask=samples.support_mask,
+            block_types=samples.block_types,
+            block_indices=samples.block_indices,
+            weight_mode=adjacency_weight,
+            neighbors=adjacency_neighbors,
+            candidate_neighbors=adjacency_candidate_neighbors,
+        )
+        if include_adjacency
+        else None
+    )
     if not include_atom_features:
-        return _format_sample_outputs(samples.points, normals=normals)
+        return _format_sample_outputs(
+            samples.points,
+            normals=normals,
+            adjacency=adjacency,
+        )
 
     atom_features = _dense_atom_features(
         samples.support_indices,
@@ -1155,6 +1199,7 @@ def sample_analytic_points(
         samples.points,
         atom_features=atom_features,
         normals=normals,
+        adjacency=adjacency,
     )
 
 

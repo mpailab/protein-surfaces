@@ -9,6 +9,7 @@ from typing import Optional, Union
 import torch
 
 from ._outputs import SamplerOutput, _format_sample_outputs
+from .graph import AdjacencyWeightMode, build_surface_adjacency
 from .analytic import (
     ATOM_BLOCK_TYPE,
     AnalyticBlocks,
@@ -192,6 +193,7 @@ def _sample_contact_candidates(
     *,
     point_area: float,
     atom_density_scale: float,
+    include_normals: bool = False,
 ) -> AnalyticSamples:
     if local_indices.numel() == 0:
         context = _build_exterior_context(atom_coords, atom_radii, probe_radius)
@@ -218,7 +220,7 @@ def _sample_contact_candidates(
         + (atom_radii[owners] + float(probe_radius)).unsqueeze(-1) * directions
     )
     points = atom_coords[owners] + atom_radii[owners].unsqueeze(-1) * directions
-    normals = directions
+    normals = directions if include_normals else None
     support_indices = owners.unsqueeze(-1)
     support_mask = torch.ones_like(support_indices, dtype=torch.bool)
     support_weights = torch.ones(
@@ -251,6 +253,7 @@ def _sample_pair_candidates(
     *,
     point_area: float,
     pair_density_scale: float,
+    include_normals: bool = False,
 ) -> AnalyticSamples:
     local_context = _build_exterior_context(
         atom_coords[local_indices],
@@ -292,7 +295,7 @@ def _sample_pair_candidates(
         theta_values,
         arc_fracs,
     )
-    normals = (probe_centers - points) / float(probe_radius)
+    normals = (probe_centers - points) / float(probe_radius) if include_normals else None
     selected_pairs = local_indices[selected_local_pairs]
     support_weights = torch.stack((first_weights, second_weights), dim=-1)
     support_weights = support_weights / support_weights.sum(
@@ -327,6 +330,7 @@ def _sample_probe_candidates(
     probe_density_scale: float,
     max_grid_points: int,
     max_probe_triples: Optional[int],
+    include_normals: bool = False,
 ) -> AnalyticSamples:
     global_context = _build_exterior_context(atom_coords, atom_radii, probe_radius)
     empty = _empty_samples(global_context, max_support=3)
@@ -363,6 +367,7 @@ def _sample_probe_candidates(
         point_area=point_area,
         oversample_factor=1.0,
         probe_density_scale=probe_density_scale,
+        include_normals=include_normals,
     )
     if probe_samples.points.shape[0] == 0:
         return empty
@@ -725,6 +730,7 @@ def _sample_tiled_analytic_samples(
     max_probe_triples: Optional[int] = _DEFAULT_MAX_PROBE_TRIPLES,
     pairwise_element_budget: int = _DEFAULT_PAIRWISE_ELEMENT_BUDGET,
     include_atom_weights: bool = False,
+    include_normals: bool = False,
 ) -> AnalyticSamples:
     """Return tiled analytic samples with sparse support metadata."""
 
@@ -795,6 +801,7 @@ def _sample_tiled_analytic_samples(
         context.probe_radius,
         point_area=float(point_area),
         atom_density_scale=atom_density_scale,
+        include_normals=include_normals,
     )
     contact = _apply_tile_locality(
         contact,
@@ -821,6 +828,7 @@ def _sample_tiled_analytic_samples(
             context.probe_radius,
             point_area=float(point_area),
             pair_density_scale=pair_density_scale,
+            include_normals=include_normals,
         )
         if pair_density_scale > 0
         else _empty_samples(context, max_support=2)
@@ -852,6 +860,7 @@ def _sample_tiled_analytic_samples(
             probe_density_scale=float(probe_density_scale),
             max_grid_points=max_grid_points,
             max_probe_triples=None if max_probe_triples is None else int(max_probe_triples),
+            include_normals=include_normals,
         )
         if probe_density_scale > 0
         else _empty_samples(context, max_support=3)
@@ -904,6 +913,10 @@ def sample_tiled_analytic_points(
     exact_accessibility: bool = False,
     include_atom_features: bool = False,
     include_normals: bool = False,
+    include_adjacency: bool = False,
+    adjacency_weight: AdjacencyWeightMode = "euclidean",
+    adjacency_neighbors: int = 8,
+    adjacency_candidate_neighbors: Optional[int] = None,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = _DEFAULT_MAX_GRID_POINTS,
     max_probe_triples: Optional[int] = _DEFAULT_MAX_PROBE_TRIPLES,
@@ -918,8 +931,11 @@ def sample_tiled_analytic_points(
     fast exterior point clouds rather than exact analytic block coverage.
     Set ``include_normals=True`` to also return outward SES normals aligned with
     the sampled points.
+    Set ``include_adjacency=True`` to receive a sparse symmetric SES surface
+    adjacency matrix with shape ``(num_points, num_points)``.
     """
 
+    need_sample_normals = include_normals or include_adjacency
     samples = _sample_tiled_analytic_samples(
         atom_coords,
         atom_radii,
@@ -936,10 +952,31 @@ def sample_tiled_analytic_points(
         max_grid_points=max_grid_points,
         max_probe_triples=max_probe_triples,
         pairwise_element_budget=pairwise_element_budget,
+        include_normals=need_sample_normals,
     )
-    normals = samples.normals if include_normals else None
+    graph_normals = samples.normals
+    normals = graph_normals if include_normals else None
+    adjacency = (
+        build_surface_adjacency(
+            samples.points,
+            graph_normals,
+            support_indices=samples.support_indices,
+            support_mask=samples.support_mask,
+            block_types=samples.block_types,
+            block_indices=samples.block_indices,
+            weight_mode=adjacency_weight,
+            neighbors=adjacency_neighbors,
+            candidate_neighbors=adjacency_candidate_neighbors,
+        )
+        if include_adjacency
+        else None
+    )
     if not include_atom_features:
-        return _format_sample_outputs(samples.points, normals=normals)
+        return _format_sample_outputs(
+            samples.points,
+            normals=normals,
+            adjacency=adjacency,
+        )
 
     atom_features = _dense_atom_features(
         samples.support_indices,
@@ -951,6 +988,7 @@ def sample_tiled_analytic_points(
         samples.points,
         atom_features=atom_features,
         normals=normals,
+        adjacency=adjacency,
     )
 
 

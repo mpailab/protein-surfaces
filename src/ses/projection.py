@@ -14,6 +14,7 @@ from typing import NamedTuple, Optional, Union
 import torch
 
 from ._outputs import SamplerOutput, _format_sample_outputs
+from .graph import AdjacencyWeightMode, build_surface_adjacency
 
 
 _PAIRWISE_ELEMENT_BUDGET = 8_000_000
@@ -228,6 +229,10 @@ def sample_projected_points(
     *,
     include_atom_features: bool = False,
     include_normals: bool = False,
+    include_adjacency: bool = False,
+    adjacency_weight: AdjacencyWeightMode = "euclidean",
+    adjacency_neighbors: int = 8,
+    adjacency_candidate_neighbors: Optional[int] = None,
 ) -> SamplerOutput:
     """Sample visible SES points with the projection-based interface.
 
@@ -238,6 +243,8 @@ def sample_projected_points(
     point came from the corresponding atom's sampled sphere before projection.
     Set ``include_normals=True`` to receive outward SES normals with shape
     ``(num_points, 3)``.
+    Set ``include_adjacency=True`` to receive a sparse symmetric SES surface
+    adjacency matrix with shape ``(num_points, num_points)``.
 
     Args:
         atom_coords: Atom center coordinates, shape ``(n, 3)``.
@@ -248,21 +255,29 @@ def sample_projected_points(
             features aligned with the returned point rows.
         include_normals: If true, also return outward SES normals aligned with
             the returned point rows.
+        include_adjacency: If true, also return a sparse adjacency matrix over
+            the returned point rows.
+        adjacency_weight: Edge weights, either ``"euclidean"`` or ``"geodesic"``.
+        adjacency_neighbors: Maximum local surface neighbors kept per point.
+        adjacency_candidate_neighbors: Euclidean nearest-neighbor candidates
+            tested before normal/tangent surface filtering.
 
     Returns:
         ``points`` by default, ``(points, normals)`` when only normals are
         requested, ``(points, atom_features)`` when only features are requested,
-        and ``(points, atom_features, normals)`` when both are requested.
+        and optional outputs in the order ``atom_features``, ``normals``,
+        ``adjacency`` when several are requested.
     """
 
+    need_normals = include_normals or include_adjacency
     grid_outputs = _sample_projected_grid(
         atom_coords,
         atom_radii,
         m,
         probe_radius,
-        include_normals=include_normals,
+        include_normals=need_normals,
     )
-    if include_normals:
+    if need_normals:
         projected_points, valid_mask, projected_normals = grid_outputs
     else:
         projected_points, valid_mask = grid_outputs
@@ -270,25 +285,51 @@ def sample_projected_points(
     finite_mask = torch.isfinite(projected_points).all(dim=-1)
     visible_mask = valid_mask & finite_mask
     points = projected_points[visible_mask]
-    normals = projected_normals[visible_mask] if projected_normals is not None else None
+    graph_normals = projected_normals[visible_mask] if projected_normals is not None else None
+    normals = graph_normals if include_normals else None
+    num_atoms = projected_points.shape[1]
+    owner_indices = None
+    support_indices = None
+    support_mask = None
+    if include_atom_features or include_adjacency:
+        owner_indices = (
+            torch.arange(num_atoms, device=projected_points.device)
+            .view(1, num_atoms)
+            .expand(projected_points.shape[0], num_atoms)[visible_mask]
+        )
+    if include_adjacency:
+        support_indices = owner_indices.unsqueeze(-1)
+        support_mask = torch.ones_like(support_indices, dtype=torch.bool)
+    adjacency = (
+        build_surface_adjacency(
+            points,
+            graph_normals,
+            support_indices=support_indices,
+            support_mask=support_mask,
+            weight_mode=adjacency_weight,
+            neighbors=adjacency_neighbors,
+            candidate_neighbors=adjacency_candidate_neighbors,
+        )
+        if include_adjacency
+        else None
+    )
 
     if not include_atom_features:
-        return _format_sample_outputs(points, normals=normals)
+        return _format_sample_outputs(points, normals=normals, adjacency=adjacency)
 
-    num_atoms = projected_points.shape[1]
-    owner_indices = (
-        torch.arange(num_atoms, device=projected_points.device)
-        .view(1, num_atoms)
-        .expand(projected_points.shape[0], num_atoms)[visible_mask]
-    )
     atom_features = torch.zeros(
         (points.shape[0], num_atoms),
         dtype=points.dtype,
         device=points.device,
     )
-    if owner_indices.numel() > 0:
+    if owner_indices is not None and owner_indices.numel() > 0:
         atom_features.scatter_(1, owner_indices.unsqueeze(1), 1)
-    return _format_sample_outputs(points, atom_features=atom_features, normals=normals)
+    return _format_sample_outputs(
+        points,
+        atom_features=atom_features,
+        normals=normals,
+        adjacency=adjacency,
+    )
 
 
 def _select_suitable_atom_indices(
@@ -2624,14 +2665,6 @@ def project_points(
     # Finally, project the original points onto the probe spheres.
     point_probe_center_diffs = points - probe_centers
     point_probe_center_dists = torch.linalg.norm(point_probe_center_diffs, dim=-1)
-    eps = torch.finfo(points.dtype).eps
-    fallback_normals = torch.zeros_like(point_probe_center_diffs)
-    fallback_normals[..., 0] = 1
-    normals = torch.where(
-        point_probe_center_dists.unsqueeze(-1) > eps,
-        -point_probe_center_diffs / point_probe_center_dists.clamp_min(eps).unsqueeze(-1),
-        fallback_normals,
-    )
     projected_points_on_ses = (
         probe_centers
         + point_probe_center_diffs
@@ -2639,6 +2672,14 @@ def project_points(
     )
 
     if include_normals:
+        eps = torch.finfo(points.dtype).eps
+        fallback_normals = torch.zeros_like(point_probe_center_diffs)
+        fallback_normals[..., 0] = 1
+        normals = torch.where(
+            point_probe_center_dists.unsqueeze(-1) > eps,
+            -point_probe_center_diffs / point_probe_center_dists.clamp_min(eps).unsqueeze(-1),
+            fallback_normals,
+        )
         return projected_points_on_ses, valid_point_mask, normals
     return projected_points_on_ses, valid_point_mask
 

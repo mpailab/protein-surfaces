@@ -25,6 +25,7 @@ All four interfaces share the same basic input and output convention:
 - `points`: returned tensor with shape `(num_points, 3)`.
 - `atom_features`: optional dense tensor with shape `(num_points, num_atoms)`.
 - `normals`: optional outward SES normal tensor with shape `(num_points, 3)`.
+- `adjacency`: optional sparse COO tensor with shape `(num_points, num_points)`.
 
 All coordinates and radii are expected to use the same length unit. The examples
 below use Angstroms.
@@ -79,6 +80,35 @@ points, normals = sample_analytic_points(
 
 When both optional outputs are requested, the tuple order is
 `(points, atom_features, normals)`.
+
+## Surface Graphs
+
+Pass `include_adjacency=True` when downstream code needs a local graph over the
+sampled SES points.
+
+```python
+points, normals, adjacency = sample_analytic_points(
+    atom_coords,
+    atom_radii,
+    probe_radius=1.4,
+    point_area=0.5,
+    include_normals=True,
+    include_adjacency=True,
+)
+```
+
+The returned adjacency is a symmetric sparse COO tensor.  Candidate edges are
+chosen from local nearest neighbors, then filtered so they connect samples on the
+same SES patch or on adjacent patch families. For analytic samplers this uses
+block topology: atom contact patches connect to their neighboring pair torus
+patches, and pair torus patches connect to fixed-probe reentrant patches. Direct
+atom-to-probe shortcuts are rejected. Projection and SDF samplers use their
+available atom-support metadata as an approximation of the same rule.
+
+By default edge weights are Euclidean distances between endpoint coordinates.
+Pass `adjacency_weight="geodesic"` to use a local normal-angle geodesic
+approximation. When all optional outputs are requested, tuple order is
+`(points, atom_features, normals, adjacency)`.
 
 ## Projection Sampler
 

@@ -14,6 +14,7 @@ from typing import Optional
 import torch
 
 from ._outputs import SamplerOutput, _format_sample_outputs
+from .graph import AdjacencyWeightMode, build_surface_adjacency, dense_features_to_supports
 from .projection import (
     _centers_feasible_against_all_atoms,
     _probe_centers_accessible_from_exterior,
@@ -336,6 +337,10 @@ def sample_sdf_points(
     feature_threshold: float = 0.1,
     include_atom_features: bool = False,
     include_normals: bool = False,
+    include_adjacency: bool = False,
+    adjacency_weight: AdjacencyWeightMode = "euclidean",
+    adjacency_neighbors: int = 8,
+    adjacency_candidate_neighbors: Optional[int] = None,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = _DEFAULT_MAX_GRID_POINTS,
     pairwise_element_budget: int = _DEFAULT_PAIRWISE_ELEMENT_BUDGET,
@@ -350,6 +355,8 @@ def sample_sdf_points(
     normal.
     Set ``include_normals=True`` to also return the outward SES normals used for
     that final shift.
+    Set ``include_adjacency=True`` to receive a sparse symmetric SES surface
+    adjacency matrix with shape ``(num_points, num_points)``.
 
     Args:
         atom_coords: Atom center coordinates with shape ``(n, 3)``.
@@ -368,6 +375,12 @@ def sample_sdf_points(
         include_atom_features: If true, return ``(points, atom_features)``.
         include_normals: If true, also return outward SES normals aligned with
             the returned point rows.
+        include_adjacency: If true, also return a sparse adjacency matrix over
+            the returned point rows.
+        adjacency_weight: Edge weights, either ``"euclidean"`` or ``"geodesic"``.
+        adjacency_neighbors: Maximum local surface neighbors kept per point.
+        adjacency_candidate_neighbors: Euclidean nearest-neighbor candidates
+            tested before normal/tangent surface filtering.
         grid_spacing: Optional exterior flood-fill grid spacing.
         max_grid_points: Safety cap for exterior flood-fill grids.
         pairwise_element_budget: Approximate maximum point-atom distance matrix
@@ -376,7 +389,8 @@ def sample_sdf_points(
     Returns:
         ``points`` by default, ``(points, normals)`` when only normals are
         requested, ``(points, atom_features)`` when only features are requested,
-        and ``(points, atom_features, normals)`` when both are requested.
+        and optional outputs in the order ``atom_features``, ``normals``,
+        ``adjacency`` when several are requested.
     """
 
     if feature_threshold <= 0 or feature_threshold > 1:
@@ -399,9 +413,25 @@ def sample_sdf_points(
     num_atoms = coords.shape[0]
     if m == 0 or num_atoms == 0:
         empty_points = torch.empty((0, 3), dtype=coords.dtype, device=coords.device)
-        empty_normals = torch.empty_like(empty_points) if include_normals else None
+        graph_normals = torch.empty_like(empty_points) if (include_normals or include_adjacency) else None
+        empty_normals = graph_normals if include_normals else None
+        empty_adjacency = (
+            build_surface_adjacency(
+                empty_points,
+                graph_normals,
+                weight_mode=adjacency_weight,
+                neighbors=adjacency_neighbors,
+                candidate_neighbors=adjacency_candidate_neighbors,
+            )
+            if include_adjacency
+            else None
+        )
         if not include_atom_features:
-            return _format_sample_outputs(empty_points, normals=empty_normals)
+            return _format_sample_outputs(
+                empty_points,
+                normals=empty_normals,
+                adjacency=empty_adjacency,
+            )
         empty_features = torch.empty(
             (0, num_atoms),
             dtype=coords.dtype,
@@ -411,6 +441,7 @@ def sample_sdf_points(
             empty_points,
             atom_features=empty_features,
             normals=empty_normals,
+            adjacency=empty_adjacency,
         )
 
     expanded_radii = radii + float(probe_radius)
@@ -471,21 +502,45 @@ def sample_sdf_points(
     centers = centers[outside_mask]
 
     output_normals = normals if include_normals else None
-    if not include_atom_features:
-        return _format_sample_outputs(points, normals=output_normals)
-
-    atom_features = _sdf_atom_features(
-        centers,
-        coords,
-        expanded_radii,
-        float(smoothness),
-        float(feature_threshold),
-        pairwise_element_budget=pairwise_element_budget,
+    atom_features = None
+    support_indices = None
+    support_mask = None
+    if include_atom_features or include_adjacency:
+        atom_features = _sdf_atom_features(
+            centers,
+            coords,
+            expanded_radii,
+            float(smoothness),
+            float(feature_threshold),
+            pairwise_element_budget=pairwise_element_budget,
+        )
+    if include_adjacency:
+        support_indices, support_mask = dense_features_to_supports(atom_features)
+    adjacency = (
+        build_surface_adjacency(
+            points,
+            normals,
+            support_indices=support_indices,
+            support_mask=support_mask,
+            weight_mode=adjacency_weight,
+            neighbors=adjacency_neighbors,
+            candidate_neighbors=adjacency_candidate_neighbors,
+        )
+        if include_adjacency
+        else None
     )
+    if not include_atom_features:
+        return _format_sample_outputs(
+            points,
+            normals=output_normals,
+            adjacency=adjacency,
+        )
+
     return _format_sample_outputs(
         points,
         atom_features=atom_features,
         normals=output_normals,
+        adjacency=adjacency,
     )
 
 

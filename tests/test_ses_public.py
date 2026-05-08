@@ -74,6 +74,26 @@ def _assert_unit_normals(points: torch.Tensor, normals: torch.Tensor) -> None:
         )
 
 
+def _assert_sparse_adjacency(
+    points: torch.Tensor,
+    adjacency: torch.Tensor,
+    *,
+    expect_edges: bool = True,
+) -> None:
+    adjacency = adjacency.coalesce()
+    assert adjacency.layout == torch.sparse_coo
+    assert adjacency.shape == (points.shape[0], points.shape[0])
+    assert adjacency.device == points.device
+    assert adjacency.dtype == points.dtype
+    assert adjacency.indices().shape[0] == 2
+    assert torch.all(adjacency.indices()[0] != adjacency.indices()[1])
+    dense = adjacency.to_dense()
+    assert torch.allclose(dense, dense.transpose(0, 1))
+    if expect_edges:
+        assert adjacency.values().numel() > 0
+        assert bool((adjacency.values() > 0).all().item())
+
+
 def _assert_public_samplers_preserve_device(device: torch.device) -> None:
     projected_coords, projected_radii = (
         tensor.to(device=device) for tensor in _two_separated_atoms()
@@ -259,6 +279,40 @@ def test_projected_sampler_can_return_normals() -> None:
     expected = points - coords[owner_indices]
     expected = expected / torch.linalg.norm(expected, dim=-1, keepdim=True)
     assert torch.allclose(normals, expected, atol=1e-12, rtol=1e-12)
+
+
+def test_projected_sampler_can_return_surface_adjacency() -> None:
+    coords, radii = _two_separated_atoms()
+
+    points, adjacency = sample_projected_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        include_adjacency=True,
+        adjacency_neighbors=3,
+        adjacency_candidate_neighbors=6,
+    )
+    feature_points, atom_features, normals, full_adjacency = sample_projected_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        include_atom_features=True,
+        include_normals=True,
+        include_adjacency=True,
+        adjacency_weight="geodesic",
+        adjacency_neighbors=3,
+        adjacency_candidate_neighbors=6,
+    )
+
+    assert torch.equal(points, feature_points)
+    assert atom_features.shape == (points.shape[0], coords.shape[0])
+    _assert_unit_normals(feature_points, normals)
+    _assert_sparse_adjacency(points, adjacency)
+    _assert_sparse_adjacency(feature_points, full_adjacency)
+    assert torch.equal(adjacency.coalesce().indices(), full_adjacency.coalesce().indices())
+    assert torch.all(full_adjacency.coalesce().values() >= adjacency.coalesce().values())
 
 
 def test_projected_sampler_preserves_gradients_to_atom_inputs() -> None:
@@ -493,6 +547,62 @@ def test_tiled_analytic_sampler_can_return_normals() -> None:
     _assert_unit_normals(points, normals)
 
 
+def test_all_public_samplers_can_return_surface_adjacency() -> None:
+    projected_coords, projected_radii = _two_separated_atoms()
+    cavity_coords, cavity_radii = _three_atom_cavity()
+
+    sampler_outputs = [
+        sample_projected_points(
+            projected_coords,
+            projected_radii,
+            m=8,
+            probe_radius=0.8,
+            include_adjacency=True,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+        ),
+        sample_analytic_points(
+            cavity_coords,
+            cavity_radii,
+            1.4,
+            point_area=5.0,
+            atom_filter_samples=16,
+            pair_filter_samples=6,
+            include_adjacency=True,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+            max_grid_points=100_000,
+        ),
+        sample_sdf_points(
+            projected_coords,
+            projected_radii,
+            m=8,
+            probe_radius=0.8,
+            smoothness=0.05,
+            level_tolerance=1e-6,
+            include_adjacency=True,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+            max_grid_points=100_000,
+        ),
+        sample_tiled_analytic_points(
+            cavity_coords,
+            cavity_radii,
+            1.4,
+            point_area=4.0,
+            tile_size=4.0,
+            tile_overlap=2.0,
+            include_adjacency=True,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+            max_grid_points=100_000,
+        ),
+    ]
+
+    for points, adjacency in sampler_outputs:
+        _assert_sparse_adjacency(points, adjacency)
+
+
 def test_tiled_analytic_sampler_preserves_gradients_to_atom_inputs() -> None:
     coords, radii = _three_atom_cavity()
     coords.requires_grad_(True)
@@ -575,6 +685,36 @@ def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None
         include_atom_features=True,
         include_normals=True,
     )
+    projected_graph_points, projected_graph_features, projected_graph = sample_projected_points(
+        coords,
+        radii,
+        m=4,
+        probe_radius=1.4,
+        include_atom_features=True,
+        include_adjacency=True,
+    )
+    analytic_graph_points, analytic_graph_features, analytic_graph = sample_analytic_points(
+        coords,
+        radii,
+        1.4,
+        include_atom_features=True,
+        include_adjacency=True,
+    )
+    sdf_graph_points, sdf_graph_features, sdf_graph = sample_sdf_points(
+        coords,
+        radii,
+        m=4,
+        probe_radius=1.4,
+        include_atom_features=True,
+        include_adjacency=True,
+    )
+    tiled_graph_points, tiled_graph_features, tiled_graph = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        include_atom_features=True,
+        include_adjacency=True,
+    )
 
     assert projected_points.shape == (0, 3)
     assert projected_features.shape == (0, 0)
@@ -596,6 +736,18 @@ def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None
     assert tiled_normal_points.shape == (0, 3)
     assert tiled_normal_features.shape == (0, 0)
     assert tiled_normals.shape == (0, 3)
+    assert projected_graph_points.shape == (0, 3)
+    assert projected_graph_features.shape == (0, 0)
+    _assert_sparse_adjacency(projected_graph_points, projected_graph, expect_edges=False)
+    assert analytic_graph_points.shape == (0, 3)
+    assert analytic_graph_features.shape == (0, 0)
+    _assert_sparse_adjacency(analytic_graph_points, analytic_graph, expect_edges=False)
+    assert sdf_graph_points.shape == (0, 3)
+    assert sdf_graph_features.shape == (0, 0)
+    _assert_sparse_adjacency(sdf_graph_points, sdf_graph, expect_edges=False)
+    assert tiled_graph_points.shape == (0, 3)
+    assert tiled_graph_features.shape == (0, 0)
+    _assert_sparse_adjacency(tiled_graph_points, tiled_graph, expect_edges=False)
 
 
 def test_examples_decode_atom_feature_bindings() -> None:

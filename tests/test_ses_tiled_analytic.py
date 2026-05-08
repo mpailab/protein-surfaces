@@ -136,6 +136,7 @@ def test_tiled_analytic_water_features_match_support_metadata_and_weights() -> N
     )
 
     assert samples.atom_weights is not None
+    assert samples.normals is None
     assert torch.equal(points, samples.points)
     assert torch.equal(atom_features, metadata_features)
     assert samples.atom_weights.shape == atom_features.shape

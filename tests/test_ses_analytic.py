@@ -92,6 +92,7 @@ def test_sample_analytic_points_returns_support_metadata() -> None:
         atom_filter_samples=16,
         pair_filter_samples=6,
         include_atom_weights=True,
+        include_normals=True,
         max_grid_points=100_000,
     )
 
@@ -120,6 +121,23 @@ def test_sample_analytic_points_returns_support_metadata() -> None:
     assert set(samples.block_types.tolist()).issubset(
         {ATOM_BLOCK_TYPE, PAIR_BLOCK_TYPE, PROBE_BLOCK_TYPE},
     )
+
+
+def test_sample_analytic_samples_leaves_normals_lazy_by_default() -> None:
+    coords, radii = _three_atom_cavity()
+
+    samples = _sample_analytic_samples(
+        coords,
+        radii,
+        1.4,
+        point_area=5.0,
+        atom_filter_samples=16,
+        pair_filter_samples=6,
+        max_grid_points=100_000,
+    )
+
+    assert samples.points.shape[0] > 0
+    assert samples.normals is None
 
 
 def test_sample_analytic_points_preserves_gradient_path() -> None:

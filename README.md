@@ -6,8 +6,8 @@ Machine learning solutions for protein-surfaces analysis
 The `src/ses` package provides four interfaces for scattering points on a
 solvent-excluded surface (SES). All four accept atom coordinates, atom radii
 and a solvent probe radius. They return a flat tensor of SES point coordinates,
-and can optionally return atom-binding features and outward normals for every
-point.
+and can optionally return atom-binding features, outward normals and a sparse
+surface adjacency matrix.
 
 ```python
 import torch
@@ -36,18 +36,25 @@ projects visible points onto the SES. It is the simpler interface when density
 is controlled by a fixed number of starting points per atom.
 
 ```python
-projected_points, projected_features, projected_normals = sample_projected_points(
+(
+    projected_points,
+    projected_features,
+    projected_normals,
+    projected_adjacency,
+) = sample_projected_points(
     atom_coords,
     atom_radii,
     m=128,
     probe_radius=probe_radius,
     include_atom_features=True,
     include_normals=True,
+    include_adjacency=True,
 )
 
 assert projected_points.shape[1] == 3
 assert projected_features.shape == (projected_points.shape[0], atom_coords.shape[0])
 assert projected_normals.shape == projected_points.shape
+assert projected_adjacency.shape == (projected_points.shape[0], projected_points.shape[0])
 ```
 
 `sample_analytic_points` samples analytic SES blocks: atom contact patches,
@@ -93,8 +100,11 @@ atoms. SDF features are binary supports derived from the smooth SDF ownership
 weights.
 
 Pass `include_normals=True` to any sampler to append a `(num_points, 3)` unit
-normal tensor. When atom features are also requested, outputs are ordered as
-`(points, atom_features, normals)`.
+normal tensor. Pass `include_adjacency=True` to append a sparse COO matrix whose
+edges connect local samples from the same SES patch or from adjacent patch
+families. Edge weights are Euclidean by default; use `adjacency_weight="geodesic"`
+for a local geodesic approximation. Optional outputs are ordered as
+`(points, atom_features, normals, adjacency)` when all are requested.
 
 See `src/ses/README.md` and `src/ses/example.py` for the full interface
 description and larger examples.
