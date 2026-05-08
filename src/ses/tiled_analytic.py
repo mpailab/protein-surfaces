@@ -8,6 +8,7 @@ from typing import Optional, Union
 
 import torch
 
+from ._outputs import SamplerOutput, _format_sample_outputs
 from .analytic import (
     ATOM_BLOCK_TYPE,
     AnalyticBlocks,
@@ -217,6 +218,7 @@ def _sample_contact_candidates(
         + (atom_radii[owners] + float(probe_radius)).unsqueeze(-1) * directions
     )
     points = atom_coords[owners] + atom_radii[owners].unsqueeze(-1) * directions
+    normals = directions
     support_indices = owners.unsqueeze(-1)
     support_mask = torch.ones_like(support_indices, dtype=torch.bool)
     support_weights = torch.ones(
@@ -236,6 +238,7 @@ def _sample_contact_candidates(
         support_indices=support_indices,
         support_mask=support_mask,
         support_weights=support_weights,
+        normals=normals,
         probe_centers=probe_centers,
     )
 
@@ -289,6 +292,7 @@ def _sample_pair_candidates(
         theta_values,
         arc_fracs,
     )
+    normals = (probe_centers - points) / float(probe_radius)
     selected_pairs = local_indices[selected_local_pairs]
     support_weights = torch.stack((first_weights, second_weights), dim=-1)
     support_weights = support_weights / support_weights.sum(
@@ -308,6 +312,7 @@ def _sample_pair_candidates(
         support_indices=selected_pairs,
         support_mask=support_mask,
         support_weights=support_weights,
+        normals=normals,
         probe_centers=probe_centers,
     )
 
@@ -379,6 +384,7 @@ def _sample_probe_candidates(
         support_indices=global_supports,
         support_mask=probe_samples.support_mask,
         support_weights=probe_samples.support_weights,
+        normals=probe_samples.normals,
         probe_centers=probe_centers,
     )
 
@@ -619,6 +625,7 @@ def _index_samples(samples: AnalyticSamples, mask_or_indices: torch.Tensor) -> A
         support_indices=samples.support_indices[mask_or_indices],
         support_mask=samples.support_mask[mask_or_indices],
         support_weights=samples.support_weights[mask_or_indices],
+        normals=None if samples.normals is None else samples.normals[mask_or_indices],
         atom_weights=None,
         blocks=None,
         probe_centers=None if samples.probe_centers is None else samples.probe_centers[mask_or_indices],
@@ -649,6 +656,11 @@ def _concat_tiled_samples(
         [_pad_columns(sample.support_weights, max_support, fill_value=0.0) for sample in nonempty],
         dim=0,
     )
+    normals = (
+        torch.cat([sample.normals for sample in nonempty if sample.normals is not None], dim=0)
+        if all(sample.normals is not None for sample in nonempty)
+        else None
+    )
     probe_centers = torch.cat(
         [
             sample.probe_centers
@@ -665,6 +677,7 @@ def _concat_tiled_samples(
         support_indices=support_indices,
         support_mask=support_mask,
         support_weights=support_weights,
+        normals=normals,
         probe_centers=probe_centers,
     )
 
@@ -687,6 +700,7 @@ def _with_atom_weights(
         support_indices=samples.support_indices,
         support_mask=samples.support_mask,
         support_weights=samples.support_weights,
+        normals=samples.normals,
         atom_weights=atom_weights,
         blocks=samples.blocks,
         probe_centers=samples.probe_centers,
@@ -889,11 +903,12 @@ def sample_tiled_analytic_points(
     dedup_tolerance: float = _DEFAULT_DEDUP_TOLERANCE,
     exact_accessibility: bool = False,
     include_atom_features: bool = False,
+    include_normals: bool = False,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = _DEFAULT_MAX_GRID_POINTS,
     max_probe_triples: Optional[int] = _DEFAULT_MAX_PROBE_TRIPLES,
     pairwise_element_budget: int = _DEFAULT_PAIRWISE_ELEMENT_BUDGET,
-) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+) -> SamplerOutput:
     """Sample SES points with a tiled, speed-first analytic approximation.
 
     The sampler partitions the molecule into overlapping 3D tiles, samples
@@ -901,6 +916,8 @@ def sample_tiled_analytic_points(
     SES point belongs to the tile core, and then applies global molecule
     filters.  The default settings are intentionally approximate: they target
     fast exterior point clouds rather than exact analytic block coverage.
+    Set ``include_normals=True`` to also return outward SES normals aligned with
+    the sampled points.
     """
 
     samples = _sample_tiled_analytic_samples(
@@ -920,8 +937,9 @@ def sample_tiled_analytic_points(
         max_probe_triples=max_probe_triples,
         pairwise_element_budget=pairwise_element_budget,
     )
+    normals = samples.normals if include_normals else None
     if not include_atom_features:
-        return samples.points
+        return _format_sample_outputs(samples.points, normals=normals)
 
     atom_features = _dense_atom_features(
         samples.support_indices,
@@ -929,7 +947,11 @@ def sample_tiled_analytic_points(
         num_atoms=int(atom_coords.shape[0]),
         dtype=samples.points.dtype,
     )
-    return samples.points, atom_features
+    return _format_sample_outputs(
+        samples.points,
+        atom_features=atom_features,
+        normals=normals,
+    )
 
 
 __all__ = ["sample_tiled_analytic_points"]

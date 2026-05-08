@@ -27,6 +27,7 @@ from typing import Optional, Union
 
 import torch
 
+from ._outputs import SamplerOutput, _format_sample_outputs
 from .projection import (
     _atom_cell_query_keys,
     _build_atom_cell_table,
@@ -229,6 +230,7 @@ class AnalyticSamples:
         support_mask: Boolean validity mask for ``support_indices``.
         support_weights: Per-sample weights over support atoms.  Valid weights
             are normalized to sum to one.
+        normals: Optional outward SES normals aligned with ``points``.
         atom_weights: Optional dense ``(m, n_atoms)`` version of the sparse
             support weights.  This is convenient for tests and small molecules,
             but may be expensive for large systems.
@@ -244,6 +246,7 @@ class AnalyticSamples:
     support_indices: torch.Tensor
     support_mask: torch.Tensor
     support_weights: torch.Tensor
+    normals: Optional[torch.Tensor] = None
     atom_weights: Optional[torch.Tensor] = None
     blocks: Optional[AnalyticBlocks] = None
     probe_centers: Optional[torch.Tensor] = None
@@ -692,6 +695,7 @@ def _sample_atom_blocks(
         + context.atom_radii[owners].unsqueeze(-1) * directions
     )
     points = points[exterior]
+    normals = directions[exterior]
     owners = owners[exterior]
     owner_rows = owner_rows[exterior]
     support_indices = owners.unsqueeze(-1)
@@ -713,6 +717,7 @@ def _sample_atom_blocks(
         support_indices=support_indices,
         support_mask=support_mask,
         support_weights=support_weights,
+        normals=normals,
     )
 
 
@@ -775,7 +780,9 @@ def _sample_pair_blocks(
     with torch.no_grad():
         exterior = context.centers_exterior(probe_centers)
 
+    normals = (probe_centers - points) / float(context.probe_radius)
     points = points[exterior]
+    normals = normals[exterior]
     selected_pairs = selected_pairs[exterior]
     pair_rows = pair_rows[exterior]
     first_weights = first_weights[exterior]
@@ -798,6 +805,7 @@ def _sample_pair_blocks(
         support_indices=selected_pairs,
         support_mask=support_mask,
         support_weights=support_weights,
+        normals=normals,
     )
 
 
@@ -917,6 +925,7 @@ def _sample_probe_blocks(
         finite = torch.isfinite(points).all(dim=-1)
         valid = center_valid[sample_block_rows] & finite
     points = points[valid]
+    normals = probe_dirs[valid]
     sample_block_rows = sample_block_rows[valid]
     selected_support_indices = selected_support_indices[valid]
     selected_support_mask = selected_support_mask[valid]
@@ -939,6 +948,7 @@ def _sample_probe_blocks(
         support_indices=selected_support_indices,
         support_mask=selected_support_mask,
         support_weights=selected_weights,
+        normals=normals,
     )
 
 
@@ -1059,6 +1069,7 @@ def sample_analytic_points(
     oversample_factor: float = 1.25,
     probe_density_scale: float = 1.0,
     include_atom_features: bool = False,
+    include_normals: bool = False,
     blocks: Optional[AnalyticBlocks] = None,
     atom_filter_samples: int = 256,
     pair_filter_samples: int = 24,
@@ -1068,7 +1079,7 @@ def sample_analytic_points(
     max_probe_triples: Optional[int] = _DEFAULT_MAX_PROBE_TRIPLES,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = _DEFAULT_MAX_GRID_POINTS,
-) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+) -> SamplerOutput:
     """Sample visible SES points with the analytic block interface.
 
     This is the package-level analytic scenario: callers receive a flat point
@@ -1076,6 +1087,8 @@ def sample_analytic_points(
     ``include_atom_features=True`` to also receive a dense multi-hot feature
     tensor with shape ``(num_points, num_atoms)``.  A value of one means the
     corresponding atom supports that analytic SES sample.
+    Set ``include_normals=True`` to receive outward SES normals with shape
+    ``(num_points, 3)``.
 
     Args:
         atom_coords: Atom coordinates, shape ``(n, 3)``.
@@ -1088,6 +1101,8 @@ def sample_analytic_points(
             counts.
         include_atom_features: If true, also return dense atom-assignment
             features aligned with the returned point rows.
+        include_normals: If true, also return outward SES normals aligned with
+            the returned point rows.
         blocks: Optional precomputed blocks from :func:`build_analytic_blocks`.
         atom_filter_samples: Contact-patch discovery samples per atom when
             ``blocks`` is not supplied.
@@ -1103,8 +1118,9 @@ def sample_analytic_points(
         max_grid_points: Maximum flood-fill grid size for exterior checks.
 
     Returns:
-        ``points`` when ``include_atom_features`` is false, otherwise
-        ``(points, atom_features)``.
+        ``points`` by default, ``(points, normals)`` when only normals are
+        requested, ``(points, atom_features)`` when only features are requested,
+        and ``(points, atom_features, normals)`` when both are requested.
     """
 
     samples = _sample_analytic_samples(
@@ -1125,8 +1141,9 @@ def sample_analytic_points(
         grid_spacing=grid_spacing,
         max_grid_points=max_grid_points,
     )
+    normals = samples.normals if include_normals else None
     if not include_atom_features:
-        return samples.points
+        return _format_sample_outputs(samples.points, normals=normals)
 
     atom_features = _dense_atom_features(
         samples.support_indices,
@@ -1134,7 +1151,11 @@ def sample_analytic_points(
         num_atoms=int(atom_coords.shape[0]),
         dtype=samples.points.dtype,
     )
-    return samples.points, atom_features
+    return _format_sample_outputs(
+        samples.points,
+        atom_features=atom_features,
+        normals=normals,
+    )
 
 
 def _prepare_atom_inputs(
@@ -2881,6 +2902,7 @@ def _empty_samples(context: ExteriorContext, max_support: int) -> AnalyticSample
         support_indices=torch.empty((0, max_support), dtype=torch.long, device=context.device),
         support_mask=torch.empty((0, max_support), dtype=torch.bool, device=context.device),
         support_weights=torch.empty((0, max_support), dtype=context.dtype, device=context.device),
+        normals=torch.empty((0, 3), dtype=context.dtype, device=context.device),
     )
 
 
@@ -2909,6 +2931,7 @@ def _concat_samples(
             support_indices=empty.support_indices,
             support_mask=empty.support_mask,
             support_weights=empty.support_weights,
+            normals=empty.normals,
             atom_weights=atom_weights,
             blocks=blocks,
         )
@@ -2928,6 +2951,11 @@ def _concat_samples(
         [_pad_columns(sample.support_weights, max_support, fill_value=0.0) for sample in nonempty],
         dim=0,
     )
+    normals = (
+        torch.cat([sample.normals for sample in nonempty if sample.normals is not None], dim=0)
+        if all(sample.normals is not None for sample in nonempty)
+        else None
+    )
     atom_weights = (
         _dense_atom_weights(
             support_indices,
@@ -2945,6 +2973,7 @@ def _concat_samples(
         support_indices=support_indices,
         support_mask=support_mask,
         support_weights=support_weights,
+        normals=normals,
         atom_weights=atom_weights,
         blocks=blocks,
     )

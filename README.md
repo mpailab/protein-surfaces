@@ -3,15 +3,21 @@ Machine learning solutions for protein-surfaces analysis
 
 ## SES point sampling
 
-The `src/ses` package provides three interfaces for scattering points on a
-solvent-excluded surface (SES). All three accept atom coordinates, atom radii
+The `src/ses` package provides four interfaces for scattering points on a
+solvent-excluded surface (SES). All four accept atom coordinates, atom radii
 and a solvent probe radius. They return a flat tensor of SES point coordinates,
-and can optionally return atom-binding features for every point.
+and can optionally return atom-binding features and outward normals for every
+point.
 
 ```python
 import torch
 
-from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
+from ses import (
+    sample_analytic_points,
+    sample_projected_points,
+    sample_sdf_points,
+    sample_tiled_analytic_points,
+)
 
 atom_coords = torch.tensor(
     [
@@ -30,16 +36,18 @@ projects visible points onto the SES. It is the simpler interface when density
 is controlled by a fixed number of starting points per atom.
 
 ```python
-projected_points, projected_features = sample_projected_points(
+projected_points, projected_features, projected_normals = sample_projected_points(
     atom_coords,
     atom_radii,
     m=128,
     probe_radius=probe_radius,
     include_atom_features=True,
+    include_normals=True,
 )
 
 assert projected_points.shape[1] == 3
 assert projected_features.shape == (projected_points.shape[0], atom_coords.shape[0])
+assert projected_normals.shape == projected_points.shape
 ```
 
 `sample_analytic_points` samples analytic SES blocks: atom contact patches,
@@ -83,6 +91,10 @@ one-hot because every point originates from one owner atom. Analytic features
 are multi-hot because pair and reentrant patches can be supported by multiple
 atoms. SDF features are binary supports derived from the smooth SDF ownership
 weights.
+
+Pass `include_normals=True` to any sampler to append a `(num_points, 3)` unit
+normal tensor. When atom features are also requested, outputs are ordered as
+`(points, atom_features, normals)`.
 
 See `src/ses/README.md` and `src/ses/example.py` for the full interface
 description and larger examples.

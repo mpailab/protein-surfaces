@@ -102,6 +102,14 @@ def test_sample_analytic_points_returns_support_metadata() -> None:
     assert samples.support_indices.shape == samples.support_weights.shape
     assert samples.support_mask.shape == samples.support_indices.shape
     assert samples.support_indices.shape[0] == samples.points.shape[0]
+    assert samples.normals is not None
+    assert samples.normals.shape == samples.points.shape
+    assert torch.allclose(
+        torch.linalg.norm(samples.normals, dim=-1),
+        torch.ones(samples.points.shape[0], dtype=samples.points.dtype),
+        atol=1e-5,
+        rtol=1e-5,
+    )
     assert samples.atom_weights is not None
     assert samples.atom_weights.shape == (samples.points.shape[0], coords.shape[0])
     assert torch.allclose(

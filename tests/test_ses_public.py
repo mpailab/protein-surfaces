@@ -60,6 +60,20 @@ def _assert_points_backprop_to_atom_inputs(
     assert float(radii.grad.abs().sum()) > 0
 
 
+def _assert_unit_normals(points: torch.Tensor, normals: torch.Tensor) -> None:
+    assert normals.shape == points.shape
+    assert normals.dtype == points.dtype
+    assert normals.device == points.device
+    assert torch.isfinite(normals).all()
+    if normals.shape[0] > 0:
+        assert torch.allclose(
+            torch.linalg.norm(normals, dim=-1),
+            torch.ones(normals.shape[0], dtype=normals.dtype, device=normals.device),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+
 def _assert_public_samplers_preserve_device(device: torch.device) -> None:
     projected_coords, projected_radii = (
         tensor.to(device=device) for tensor in _two_separated_atoms()
@@ -219,6 +233,34 @@ def test_projected_sampler_returns_flat_points_and_one_hot_atom_features() -> No
     assert torch.all(atom_features.sum(dim=0) > 0)
 
 
+def test_projected_sampler_can_return_normals() -> None:
+    coords, radii = _two_separated_atoms()
+
+    points, normals = sample_projected_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        include_normals=True,
+    )
+    feature_points, atom_features, feature_normals = sample_projected_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        include_atom_features=True,
+        include_normals=True,
+    )
+
+    assert torch.equal(points, feature_points)
+    assert torch.equal(normals, feature_normals)
+    _assert_unit_normals(points, normals)
+    owner_indices = atom_features.argmax(dim=1)
+    expected = points - coords[owner_indices]
+    expected = expected / torch.linalg.norm(expected, dim=-1, keepdim=True)
+    assert torch.allclose(normals, expected, atol=1e-12, rtol=1e-12)
+
+
 def test_projected_sampler_preserves_gradients_to_atom_inputs() -> None:
     coords, radii = _two_separated_atoms()
     coords.requires_grad_(True)
@@ -259,6 +301,37 @@ def test_analytic_sampler_returns_flat_points_and_multi_hot_atom_features() -> N
     assert torch.all((atom_features == 0) | (atom_features == 1))
     assert torch.all(atom_features.sum(dim=1) >= 1)
     assert bool((atom_features.sum(dim=1) > 1).any().item())
+
+
+def test_analytic_sampler_can_return_normals() -> None:
+    coords, radii = _three_atom_cavity()
+
+    points, normals = sample_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=5.0,
+        atom_filter_samples=16,
+        pair_filter_samples=6,
+        include_normals=True,
+        max_grid_points=100_000,
+    )
+    feature_points, atom_features, feature_normals = sample_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=5.0,
+        atom_filter_samples=16,
+        pair_filter_samples=6,
+        include_atom_features=True,
+        include_normals=True,
+        max_grid_points=100_000,
+    )
+
+    assert torch.equal(points, feature_points)
+    assert atom_features.shape == (points.shape[0], coords.shape[0])
+    assert torch.equal(normals, feature_normals)
+    _assert_unit_normals(points, normals)
 
 
 def test_analytic_sampler_preserves_gradients_to_atom_inputs() -> None:
@@ -307,6 +380,37 @@ def test_sdf_sampler_returns_flat_points_and_atom_features() -> None:
     assert torch.all((atom_features == 0) | (atom_features == 1))
     assert torch.all(atom_features.sum(dim=1) >= 1)
     assert bool((atom_features.sum(dim=1) > 1).any().item())
+
+
+def test_sdf_sampler_can_return_normals() -> None:
+    coords, radii = _two_separated_atoms()
+
+    points, normals = sample_sdf_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        smoothness=0.05,
+        level_tolerance=1e-6,
+        include_normals=True,
+        max_grid_points=100_000,
+    )
+    feature_points, atom_features, feature_normals = sample_sdf_points(
+        coords,
+        radii,
+        m=8,
+        probe_radius=0.8,
+        smoothness=0.05,
+        level_tolerance=1e-6,
+        include_atom_features=True,
+        include_normals=True,
+        max_grid_points=100_000,
+    )
+
+    assert torch.equal(points, feature_points)
+    assert atom_features.shape == (points.shape[0], coords.shape[0])
+    assert torch.equal(normals, feature_normals)
+    _assert_unit_normals(points, normals)
 
 
 def test_sdf_sampler_preserves_gradients_to_atom_inputs() -> None:
@@ -358,6 +462,37 @@ def test_tiled_analytic_sampler_returns_flat_points_and_atom_features() -> None:
     assert torch.all(atom_features.sum(dim=1) >= 1)
 
 
+def test_tiled_analytic_sampler_can_return_normals() -> None:
+    coords, radii = _three_atom_cavity()
+
+    points, normals = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=4.0,
+        tile_size=4.0,
+        tile_overlap=2.0,
+        include_normals=True,
+        max_grid_points=100_000,
+    )
+    feature_points, atom_features, feature_normals = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        point_area=4.0,
+        tile_size=4.0,
+        tile_overlap=2.0,
+        include_atom_features=True,
+        include_normals=True,
+        max_grid_points=100_000,
+    )
+
+    assert torch.equal(points, feature_points)
+    assert atom_features.shape == (points.shape[0], coords.shape[0])
+    assert torch.equal(normals, feature_normals)
+    _assert_unit_normals(points, normals)
+
+
 def test_tiled_analytic_sampler_preserves_gradients_to_atom_inputs() -> None:
     coords, radii = _three_atom_cavity()
     coords.requires_grad_(True)
@@ -406,6 +541,40 @@ def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None
         1.4,
         include_atom_features=True,
     )
+    (
+        projected_normal_points,
+        projected_normal_features,
+        projected_normals,
+    ) = sample_projected_points(
+        coords,
+        radii,
+        m=4,
+        probe_radius=1.4,
+        include_atom_features=True,
+        include_normals=True,
+    )
+    analytic_normal_points, analytic_normal_features, analytic_normals = sample_analytic_points(
+        coords,
+        radii,
+        1.4,
+        include_atom_features=True,
+        include_normals=True,
+    )
+    sdf_normal_points, sdf_normal_features, sdf_normals = sample_sdf_points(
+        coords,
+        radii,
+        m=4,
+        probe_radius=1.4,
+        include_atom_features=True,
+        include_normals=True,
+    )
+    tiled_normal_points, tiled_normal_features, tiled_normals = sample_tiled_analytic_points(
+        coords,
+        radii,
+        1.4,
+        include_atom_features=True,
+        include_normals=True,
+    )
 
     assert projected_points.shape == (0, 3)
     assert projected_features.shape == (0, 0)
@@ -415,6 +584,18 @@ def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None
     assert sdf_features.shape == (0, 0)
     assert tiled_points.shape == (0, 3)
     assert tiled_features.shape == (0, 0)
+    assert projected_normal_points.shape == (0, 3)
+    assert projected_normal_features.shape == (0, 0)
+    assert projected_normals.shape == (0, 3)
+    assert analytic_normal_points.shape == (0, 3)
+    assert analytic_normal_features.shape == (0, 0)
+    assert analytic_normals.shape == (0, 3)
+    assert sdf_normal_points.shape == (0, 3)
+    assert sdf_normal_features.shape == (0, 0)
+    assert sdf_normals.shape == (0, 3)
+    assert tiled_normal_points.shape == (0, 3)
+    assert tiled_normal_features.shape == (0, 0)
+    assert tiled_normals.shape == (0, 3)
 
 
 def test_examples_decode_atom_feature_bindings() -> None:

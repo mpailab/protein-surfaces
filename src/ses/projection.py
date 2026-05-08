@@ -13,6 +13,8 @@ from typing import NamedTuple, Optional, Union
 
 import torch
 
+from ._outputs import SamplerOutput, _format_sample_outputs
+
 
 _PAIRWISE_ELEMENT_BUDGET = 8_000_000
 _GPU_PAIRWISE_ELEMENT_BUDGET = 64_000_000
@@ -186,8 +188,12 @@ def _sample_projected_grid(
     atom_radii: torch.Tensor,  # radii of atoms, shape (n, 1), (n,), or n elements
     m: int,                    # number of points sampled on each atom sphere
     probe_radius: float,       # radius of the probe sphere
-) -> tuple[torch.Tensor,       # projected SES points, shape (m, n, 3)
-           torch.Tensor]:      # validity mask, shape (m, n)
+    *,
+    include_normals: bool = False,
+) -> Union[
+    tuple[torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
     """
     Sample atom-sphere points and project them onto a structured SES grid.
 
@@ -196,11 +202,13 @@ def _sample_projected_grid(
         atom_radii: Atom radii, shape (n, 1), (n,), or any shape with n elements.
         m: Number of points sampled on each atom sphere.
         probe_radius: Probe sphere radius, scalar.
+        include_normals: If true, also return SES normals with shape ``(m, n, 3)``.
 
     Returns:
         projected_points_on_ses: Projected SES points, shape (m, n, 3).
         valid_point_mask: Whether each projected point has an externally
             accessible probe center, shape (m, n).
+        normals: Optional outward SES normals aligned with ``projected_points_on_ses``.
     """
     points = sample_atom_points(atom_coords, atom_radii, m)
     return project_points(
@@ -208,6 +216,7 @@ def _sample_projected_grid(
         atom_coords=atom_coords,
         atom_radii=atom_radii,
         probe_radius=probe_radius,
+        include_normals=include_normals,
     )
 
 
@@ -218,7 +227,8 @@ def sample_projected_points(
     probe_radius: float,
     *,
     include_atom_features: bool = False,
-) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    include_normals: bool = False,
+) -> SamplerOutput:
     """Sample visible SES points with the projection-based interface.
 
     This is the package-level projection scenario: callers receive a flat point
@@ -226,6 +236,8 @@ def sample_projected_points(
     ``include_atom_features=True`` to also receive a dense one-hot feature
     tensor with shape ``(num_points, num_atoms)``.  A value of one means the SES
     point came from the corresponding atom's sampled sphere before projection.
+    Set ``include_normals=True`` to receive outward SES normals with shape
+    ``(num_points, 3)``.
 
     Args:
         atom_coords: Atom center coordinates, shape ``(n, 3)``.
@@ -234,24 +246,34 @@ def sample_projected_points(
         probe_radius: Solvent probe radius.
         include_atom_features: If true, also return dense atom-assignment
             features aligned with the returned point rows.
+        include_normals: If true, also return outward SES normals aligned with
+            the returned point rows.
 
     Returns:
-        ``points`` when ``include_atom_features`` is false, otherwise
-        ``(points, atom_features)``.
+        ``points`` by default, ``(points, normals)`` when only normals are
+        requested, ``(points, atom_features)`` when only features are requested,
+        and ``(points, atom_features, normals)`` when both are requested.
     """
 
-    projected_points, valid_mask = _sample_projected_grid(
+    grid_outputs = _sample_projected_grid(
         atom_coords,
         atom_radii,
         m,
         probe_radius,
+        include_normals=include_normals,
     )
+    if include_normals:
+        projected_points, valid_mask, projected_normals = grid_outputs
+    else:
+        projected_points, valid_mask = grid_outputs
+        projected_normals = None
     finite_mask = torch.isfinite(projected_points).all(dim=-1)
     visible_mask = valid_mask & finite_mask
     points = projected_points[visible_mask]
+    normals = projected_normals[visible_mask] if projected_normals is not None else None
 
     if not include_atom_features:
-        return points
+        return _format_sample_outputs(points, normals=normals)
 
     num_atoms = projected_points.shape[1]
     owner_indices = (
@@ -266,7 +288,7 @@ def sample_projected_points(
     )
     if owner_indices.numel() > 0:
         atom_features.scatter_(1, owner_indices.unsqueeze(1), 1)
-    return points, atom_features
+    return _format_sample_outputs(points, atom_features=atom_features, normals=normals)
 
 
 def _select_suitable_atom_indices(
@@ -2543,8 +2565,12 @@ def project_points(
     atom_coords: torch.Tensor, # coordinates of atom centers, shape (n, 3)
     atom_radii: torch.Tensor,  # radii of atoms, shape (n,)
     probe_radius: float,       # radius of the probe sphere
-) -> tuple[torch.Tensor,       # projected points, shape (m, n, 3)
-           torch.Tensor]:      # validity mask, shape (m, n)
+    *,
+    include_normals: bool = False,
+) -> Union[
+    tuple[torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
     """
     Project sampled points onto the solvent-excluded surface.
 
@@ -2553,11 +2579,14 @@ def project_points(
         atom_coords: Atom center coordinates, shape (n, 3).
         atom_radii: Atom radii, shape (n,) or any shape with n elements.
         probe_radius: Probe sphere radius, scalar.
+        include_normals: If true, also return outward SES normals with shape
+            ``(m, n, 3)``.
 
     Returns:
         projected_points_on_ses: Projected SES points, shape (m, n, 3).
         valid_point_mask: Whether each projected point has an externally
             accessible probe center, shape (m, n).
+        normals: Optional outward SES normals aligned with ``projected_points_on_ses``.
     """
     prepared = _prepare_projection_inputs(
         points,
@@ -2573,6 +2602,8 @@ def project_points(
 
     if num_samples == 0 or num_atoms == 0:
         empty_mask = torch.empty(points.shape[:2], dtype=torch.bool, device=common_device)
+        if include_normals:
+            return points, empty_mask, torch.empty_like(points)
         return points, empty_mask
 
     # Compute the probe centers and validity mask for the sampled points.
@@ -2593,12 +2624,22 @@ def project_points(
     # Finally, project the original points onto the probe spheres.
     point_probe_center_diffs = points - probe_centers
     point_probe_center_dists = torch.linalg.norm(point_probe_center_diffs, dim=-1)
+    eps = torch.finfo(points.dtype).eps
+    fallback_normals = torch.zeros_like(point_probe_center_diffs)
+    fallback_normals[..., 0] = 1
+    normals = torch.where(
+        point_probe_center_dists.unsqueeze(-1) > eps,
+        -point_probe_center_diffs / point_probe_center_dists.clamp_min(eps).unsqueeze(-1),
+        fallback_normals,
+    )
     projected_points_on_ses = (
         probe_centers
         + point_probe_center_diffs
         * (probe_radius / point_probe_center_dists).unsqueeze(-1)
     )
 
+    if include_normals:
+        return projected_points_on_ses, valid_point_mask, normals
     return projected_points_on_ses, valid_point_mask
 
 

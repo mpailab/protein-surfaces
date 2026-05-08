@@ -6,19 +6,25 @@ solvent probe rolling over atom van der Waals spheres. The package is written
 around PyTorch tensors so sampled points can be used directly in downstream
 geometry, visualization and machine-learning pipelines.
 
-The package-level public API intentionally exposes three high-level samplers:
+The package-level public API intentionally exposes four high-level samplers:
 
 ```python
-from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
+from ses import (
+    sample_analytic_points,
+    sample_projected_points,
+    sample_sdf_points,
+    sample_tiled_analytic_points,
+)
 ```
 
-All three interfaces share the same basic input and output convention:
+All four interfaces share the same basic input and output convention:
 
 - `atom_coords`: tensor with shape `(num_atoms, 3)`.
 - `atom_radii`: tensor with one radius per atom.
 - `probe_radius`: positive solvent probe radius.
 - `points`: returned tensor with shape `(num_points, 3)`.
 - `atom_features`: optional dense tensor with shape `(num_points, num_atoms)`.
+- `normals`: optional outward SES normal tensor with shape `(num_points, 3)`.
 
 All coordinates and radii are expected to use the same length unit. The examples
 below use Angstroms.
@@ -55,6 +61,24 @@ smooth ownership weight passes the feature threshold.
 ```python
 active_atom_indices = atom_features[row].nonzero(as_tuple=False).reshape(-1)
 ```
+
+## Surface Normals
+
+Pass `include_normals=True` when downstream code needs a unit normal for every
+returned SES point.
+
+```python
+points, normals = sample_analytic_points(
+    atom_coords,
+    atom_radii,
+    probe_radius=1.4,
+    point_area=0.5,
+    include_normals=True,
+)
+```
+
+When both optional outputs are requested, the tuple order is
+`(points, atom_features, normals)`.
 
 ## Projection Sampler
 
@@ -339,6 +363,7 @@ the provided `atom_coords` and `atom_radii`.
 | `sample_projected_points` | `m`, points per atom | One-hot owner atom | Quick deterministic SES clouds |
 | `sample_analytic_points` | `point_area`, approximate area per point | Multi-hot support atoms | Area-aware SES sampling and support metadata |
 | `sample_sdf_points` | `m`, level-set seeds per atom | Binary smooth-SDF supports | Smooth level-set SES clouds |
+| `sample_tiled_analytic_points` | `point_area`, approximate area per point | Multi-hot support atoms | Faster approximate analytic clouds for larger molecules |
 
-The examples in `src/ses/example.py` are executable and show the same three
+The examples in `src/ses/example.py` are executable and show the core
 interfaces with comments focused on atom-type binding.

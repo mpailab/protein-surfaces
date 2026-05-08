@@ -9,10 +9,11 @@ obtain SES points.
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 
+from ._outputs import SamplerOutput, _format_sample_outputs
 from .projection import (
     _centers_feasible_against_all_atoms,
     _probe_centers_accessible_from_exterior,
@@ -334,10 +335,11 @@ def sample_sdf_points(
     subsample_spacing: Optional[float] = None,
     feature_threshold: float = 0.1,
     include_atom_features: bool = False,
+    include_normals: bool = False,
     grid_spacing: Optional[float] = None,
     max_grid_points: int = _DEFAULT_MAX_GRID_POINTS,
     pairwise_element_budget: int = _DEFAULT_PAIRWISE_ELEMENT_BUDGET,
-) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+) -> SamplerOutput:
     """Sample visible SES points through a smooth SDF level-set interface.
 
     The sampler works in probe-center space.  It places ``m`` deterministic
@@ -346,6 +348,8 @@ def sample_sdf_points(
     signed distances to those expanded spheres, keeps only exterior-accessible
     probe centers and shifts them inward by ``probe_radius`` along the SDF
     normal.
+    Set ``include_normals=True`` to also return the outward SES normals used for
+    that final shift.
 
     Args:
         atom_coords: Atom center coordinates with shape ``(n, 3)``.
@@ -362,14 +366,17 @@ def sample_sdf_points(
         feature_threshold: Smooth ownership threshold for binary atom-support
             features.  The strongest atom is always kept.
         include_atom_features: If true, return ``(points, atom_features)``.
+        include_normals: If true, also return outward SES normals aligned with
+            the returned point rows.
         grid_spacing: Optional exterior flood-fill grid spacing.
         max_grid_points: Safety cap for exterior flood-fill grids.
         pairwise_element_budget: Approximate maximum point-atom distance matrix
             size used in chunked SDF calculations.
 
     Returns:
-        ``points`` when ``include_atom_features`` is false, otherwise
-        ``(points, atom_features)``.
+        ``points`` by default, ``(points, normals)`` when only normals are
+        requested, ``(points, atom_features)`` when only features are requested,
+        and ``(points, atom_features, normals)`` when both are requested.
     """
 
     if feature_threshold <= 0 or feature_threshold > 1:
@@ -392,14 +399,19 @@ def sample_sdf_points(
     num_atoms = coords.shape[0]
     if m == 0 or num_atoms == 0:
         empty_points = torch.empty((0, 3), dtype=coords.dtype, device=coords.device)
+        empty_normals = torch.empty_like(empty_points) if include_normals else None
         if not include_atom_features:
-            return empty_points
+            return _format_sample_outputs(empty_points, normals=empty_normals)
         empty_features = torch.empty(
             (0, num_atoms),
             dtype=coords.dtype,
             device=coords.device,
         )
-        return empty_points, empty_features
+        return _format_sample_outputs(
+            empty_points,
+            atom_features=empty_features,
+            normals=empty_normals,
+        )
 
     expanded_radii = radii + float(probe_radius)
     initial_centers = sample_atom_points(coords, expanded_radii, m).reshape(-1, 3)
@@ -455,10 +467,12 @@ def sample_sdf_points(
         pairwise_element_budget=pairwise_element_budget,
     )
     points = points[outside_mask]
+    normals = normals[outside_mask]
     centers = centers[outside_mask]
 
+    output_normals = normals if include_normals else None
     if not include_atom_features:
-        return points
+        return _format_sample_outputs(points, normals=output_normals)
 
     atom_features = _sdf_atom_features(
         centers,
@@ -468,7 +482,11 @@ def sample_sdf_points(
         float(feature_threshold),
         pairwise_element_budget=pairwise_element_budget,
     )
-    return points, atom_features
+    return _format_sample_outputs(
+        points,
+        atom_features=atom_features,
+        normals=output_normals,
+    )
 
 
 __all__ = [
