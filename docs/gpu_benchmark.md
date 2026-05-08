@@ -64,6 +64,37 @@ python scripts/benchmark_ses_gpu.py --device cpu --no-require-cuda \
   --data-dir tests/data/pdb --limit 1 --overwrite
 ```
 
+## Existing Container
+
+If the benchmark image or another suitable CUDA container is already running,
+set `SES_BENCH_CONTAINER` to its container name or id. The wrapper will skip
+`docker build` and `docker run`, then execute the benchmark inside that
+container with `docker exec`:
+
+```bash
+SES_BENCH_CONTAINER=ses-gpu-bench \
+scripts/run_gpu_benchmarks.sh --limit 10 --log-every 1
+```
+
+The existing container must already have GPU access, Python dependencies, and
+the repository mounted or copied at `/workspace`. `SES_BENCH_OUTPUT`,
+`SES_BENCH_DATA_DIR`, and `SES_BENCH_SURFACE_DIR` are interpreted inside that
+container workdir when they are relative paths. If the repository is at a
+different path inside the container, set `SES_BENCH_CONTAINER_WORKDIR`:
+
+```bash
+SES_BENCH_CONTAINER=ses-gpu-bench \
+SES_BENCH_CONTAINER_WORKDIR=/work/protein-surfaces \
+scripts/run_gpu_benchmarks.sh --limit 10
+```
+
+If you are already attached to the container shell, run the wrapper directly in
+the current environment:
+
+```bash
+SES_BENCH_RUN_LOCAL=1 scripts/run_gpu_benchmarks.sh --limit 10
+```
+
 ## Resuming
 
 Results are written after every molecule/method pair. If a long run stops, reuse
@@ -216,6 +247,10 @@ practical.
 - `SES_BENCH_OUTPUT`: JSONL output path.
 - `SES_BENCH_DATA_DIR`: PDB dataset directory.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
+- `SES_BENCH_CONTAINER`: run inside an already-running Docker container with `docker exec`.
+- `SES_BENCH_CONTAINER_WORKDIR`: repository path inside that container. Default: `/workspace`.
+- `SES_BENCH_EXEC_USER`: optional user passed to `docker exec --user`.
+- `SES_BENCH_RUN_LOCAL=1`: run the benchmark directly in the current environment.
 - `SES_BENCH_SKIP_BUILD=1`: reuse an already built image.
 - `SES_BENCH_TORCH_INDEX_URL`: PyTorch wheel index, for example CUDA 12.4.
 - `NVIDIA_VISIBLE_DEVICES`: restrict the container to selected GPU ids.

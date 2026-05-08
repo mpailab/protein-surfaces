@@ -45,6 +45,8 @@ import ses.tiled_analytic as ses_tiled_analytic  # noqa: E402
 
 
 SCHEMA_VERSION = 1
+PROGRAM_VERSION = "0.0.1"
+BENCHMARK_DRIVER_VERSION = "0.0.1"
 METHOD_ORDER = ("analytic", "projected", "sdf", "tiled_analytic")
 MB = 1024 * 1024
 _ACTIVE_SECTION_PROFILER: Optional["SectionProfiler"] = None
@@ -469,6 +471,15 @@ def _parse_optional_int(value: str) -> Optional[int]:
     if value.lower() == "none":
         return None
     return int(value)
+
+
+def _parse_program_version(value: str) -> str:
+    parts = value.split(".")
+    if len(parts) != 3 or any(not part.isdigit() for part in parts):
+        raise argparse.ArgumentTypeError(
+            "program version must use semantic form X.Y.Z, for example 0.0.1"
+        )
+    return value
 
 
 def _dtype_from_name(name: str) -> torch.dtype:
@@ -930,6 +941,7 @@ def _select_pdbs(args: argparse.Namespace) -> List[Path]:
 def _load_existing_results(
     output_path: Path,
     variants: Sequence[Dict[str, Any]],
+    program_version: str,
 ) -> Tuple[set, List[Dict[str, Any]]]:
     keys = set()
     results: List[Dict[str, Any]] = []
@@ -954,6 +966,8 @@ def _load_existing_results(
             method = record.get("method")
             method_hash = record.get("method_parameter_hash")
             if (method, method_hash) not in known_hashes:
+                continue
+            if record.get("program_version") != program_version:
                 continue
             key = (
                 record.get("pdb_id"),
@@ -995,6 +1009,8 @@ def _base_result(
     return {
         "event": "benchmark_result",
         "schema_version": SCHEMA_VERSION,
+        "program_version": args.program_version,
+        "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
         "run_id": run_id,
         "created_at_utc": _utc_now(),
         "pdb_id": pdb_path.stem,

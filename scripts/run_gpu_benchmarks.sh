@@ -13,6 +13,10 @@ OUTPUT="${SES_BENCH_OUTPUT:-tmp/gpu_benchmarks/ses_gpu_benchmark_$(date -u +%Y%m
 DATA_DIR="${SES_BENCH_DATA_DIR:-Data/01-benchmark_pdbs}"
 SURFACE_DIR="${SES_BENCH_SURFACE_DIR:-Data/01-benchmark_surfaces}"
 SKIP_BUILD="${SES_BENCH_SKIP_BUILD:-0}"
+CONTAINER="${SES_BENCH_CONTAINER:-}"
+CONTAINER_WORKDIR="${SES_BENCH_CONTAINER_WORKDIR:-/workspace}"
+EXEC_USER="${SES_BENCH_EXEC_USER:-}"
+RUN_LOCAL="${SES_BENCH_RUN_LOCAL:-0}"
 DEFAULT_SWEEP_PRESET="${SES_BENCH_SWEEP_PRESET:-focused}"
 DEFAULT_REPEATS="${SES_BENCH_REPEATS:-3}"
 DEFAULT_TORCH_PROFILE_LIMIT="${SES_BENCH_TORCH_PROFILE_LIMIT:-100}"
@@ -22,12 +26,68 @@ DEFAULT_ARGS=(
   --torch-profile-limit "${DEFAULT_TORCH_PROFILE_LIMIT}"
 )
 
-mkdir -p "$(dirname "${OUTPUT}")"
+print_defaults() {
+  echo "[ses-gpu-bench] Output: ${OUTPUT}"
+  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}"
+}
 
-if [[ ! -d "${DATA_DIR}" ]]; then
-  echo "[ses-gpu-bench] Data directory does not exist: ${DATA_DIR}" >&2
-  exit 1
+ensure_local_paths() {
+  mkdir -p "$(dirname "${OUTPUT}")"
+  if [[ ! -d "${DATA_DIR}" ]]; then
+    echo "[ses-gpu-bench] Data directory does not exist: ${DATA_DIR}" >&2
+    exit 1
+  fi
+}
+
+ensure_container_paths() {
+  local output_dir
+  output_dir="$(dirname "${OUTPUT}")"
+  if ! docker exec -w "${CONTAINER_WORKDIR}" "${CONTAINER}" test -d "${DATA_DIR}" >/dev/null 2>&1; then
+    echo "[ses-gpu-bench] Data directory does not exist in ${CONTAINER}: ${DATA_DIR}" >&2
+    exit 1
+  fi
+  docker exec -w "${CONTAINER_WORKDIR}" "${CONTAINER}" mkdir -p "${output_dir}"
+}
+
+if [[ "${RUN_LOCAL}" == "1" ]]; then
+  ensure_local_paths
+  echo "[ses-gpu-bench] Running benchmark in the current environment"
+  print_defaults
+  PYTHONUNBUFFERED=1 \
+  SES_BENCH_OUTPUT="${OUTPUT}" \
+  SES_BENCH_DATA_DIR="${DATA_DIR}" \
+  SES_BENCH_SURFACE_DIR="${SURFACE_DIR}" \
+    python scripts/benchmark_ses_gpu.py "${DEFAULT_ARGS[@]}" "$@"
+  exit 0
 fi
+
+if [[ -n "${CONTAINER}" ]]; then
+  if [[ "$(docker inspect -f '{{.State.Running}}' "${CONTAINER}" 2>/dev/null || true)" != "true" ]]; then
+    echo "[ses-gpu-bench] Docker container is not running: ${CONTAINER}" >&2
+    exit 1
+  fi
+  ensure_container_paths
+  echo "[ses-gpu-bench] Running benchmark in existing container ${CONTAINER}"
+  print_defaults
+  DOCKER_EXEC_ARGS=(
+    exec
+    -w "${CONTAINER_WORKDIR}"
+    -e "PYTHONUNBUFFERED=1"
+    -e "SES_BENCH_OUTPUT=${OUTPUT}"
+    -e "SES_BENCH_DATA_DIR=${DATA_DIR}"
+    -e "SES_BENCH_SURFACE_DIR=${SURFACE_DIR}"
+    -e "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}"
+  )
+  if [[ -n "${EXEC_USER}" ]]; then
+    DOCKER_EXEC_ARGS+=(--user "${EXEC_USER}")
+  fi
+  docker "${DOCKER_EXEC_ARGS[@]}" \
+    "${CONTAINER}" \
+    python scripts/benchmark_ses_gpu.py "${DEFAULT_ARGS[@]}" "$@"
+  exit 0
+fi
+
+ensure_local_paths
 
 if [[ "${SKIP_BUILD}" != "1" ]]; then
   echo "[ses-gpu-bench] Building ${IMAGE} from ${DOCKERFILE}"
@@ -40,8 +100,7 @@ if [[ "${SKIP_BUILD}" != "1" ]]; then
 fi
 
 echo "[ses-gpu-bench] Running benchmark in ${IMAGE}"
-echo "[ses-gpu-bench] Output: ${OUTPUT}"
-echo "[ses-gpu-bench] Defaults: sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}"
+print_defaults
 
 docker run --rm \
   --gpus all \
