@@ -48,6 +48,10 @@ plus cleaner timing repeats for each molecule/method/variant. Override them
 with normal CLI flags, or set `SES_BENCH_SWEEP_PRESET`, `SES_BENCH_REPEATS`,
 and `SES_BENCH_TORCH_PROFILE_LIMIT` before running the wrapper.
 
+Each run records `program_version`, defaulting to `0.0.1`. For release
+benchmarks, set `SES_BENCH_PROGRAM_VERSION` to the same semantic version as the
+GitHub tag, for example `0.1.0`.
+
 ## Smoke Run
 
 Use a small limit before launching the full dataset:
@@ -93,6 +97,16 @@ the current environment:
 
 ```bash
 SES_BENCH_RUN_LOCAL=1 scripts/run_gpu_benchmarks.sh --limit 10
+```
+
+In existing-container or local-current-environment modes, Python dependencies
+must already be installed. To let the wrapper install `requirements.txt` in
+that environment first, add `SES_BENCH_INSTALL_DEPS=1`:
+
+```bash
+SES_BENCH_RUN_LOCAL=1 \
+SES_BENCH_INSTALL_DEPS=1 \
+scripts/run_gpu_benchmarks.sh --limit 10
 ```
 
 ## Resuming
@@ -247,10 +261,12 @@ practical.
 - `SES_BENCH_OUTPUT`: JSONL output path.
 - `SES_BENCH_DATA_DIR`: PDB dataset directory.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
+- `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.1`.
 - `SES_BENCH_CONTAINER`: run inside an already-running Docker container with `docker exec`.
 - `SES_BENCH_CONTAINER_WORKDIR`: repository path inside that container. Default: `/workspace`.
 - `SES_BENCH_EXEC_USER`: optional user passed to `docker exec --user`.
 - `SES_BENCH_RUN_LOCAL=1`: run the benchmark directly in the current environment.
+- `SES_BENCH_INSTALL_DEPS=1`: install Python dependencies before local or existing-container runs.
 - `SES_BENCH_SKIP_BUILD=1`: reuse an already built image.
 - `SES_BENCH_TORCH_INDEX_URL`: PyTorch wheel index, for example CUDA 12.4.
 - `NVIDIA_VISIBLE_DEVICES`: restrict the container to selected GPU ids.

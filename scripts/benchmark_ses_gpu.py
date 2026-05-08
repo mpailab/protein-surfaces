@@ -865,6 +865,8 @@ def _all_parameters(
     variants: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     return {
+        "program_version": args.program_version,
+        "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
         "probe_radius": args.probe_radius,
         "dtype": args.dtype,
         "device": args.device,
@@ -2093,6 +2095,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("SES_BENCH_SUMMARY_OUTPUT"),
         help="Summary JSON path. Defaults to OUTPUT with .summary.json suffix.",
     )
+    parser.add_argument(
+        "--program-version",
+        type=_parse_program_version,
+        default=os.environ.get("SES_BENCH_PROGRAM_VERSION", PROGRAM_VERSION),
+        help=(
+            "Program version for benchmark comparisons. Use X.Y.Z, matching "
+            "the GitHub release/tag version when available."
+        ),
+    )
     parser.add_argument("--methods", type=_parse_methods, default=list(METHOD_ORDER))
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--offset", type=int, default=0)
@@ -2288,13 +2299,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_id = uuid.uuid4().hex[:12]
     append = bool(args.resume and output_path.exists())
     existing_keys, result_records = (
-        _load_existing_results(output_path, variants) if append else (set(), [])
+        _load_existing_results(output_path, variants, args.program_version)
+        if append
+        else (set(), [])
     )
     writer = JsonlWriter(output_path, append=append)
 
     start_record = {
         "event": "run_start",
         "schema_version": SCHEMA_VERSION,
+        "program_version": args.program_version,
+        "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
         "run_id": run_id,
         "created_at_utc": _utc_now(),
         "argv": list(sys.argv if argv is None else argv),
@@ -2314,6 +2329,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "resume": {
             "enabled": args.resume,
             "matching_existing_results": len(existing_keys),
+            "program_version": args.program_version,
         },
         "output": {
             "jsonl": str(output_path),
@@ -2448,6 +2464,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary = {
             "event": "run_end",
             "schema_version": SCHEMA_VERSION,
+            "program_version": args.program_version,
+            "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
             "run_id": run_id,
             "created_at_utc": _utc_now(),
             "output_jsonl": str(output_path),

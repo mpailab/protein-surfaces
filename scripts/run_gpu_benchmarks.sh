@@ -13,14 +13,17 @@ OUTPUT="${SES_BENCH_OUTPUT:-tmp/gpu_benchmarks/ses_gpu_benchmark_$(date -u +%Y%m
 DATA_DIR="${SES_BENCH_DATA_DIR:-Data/01-benchmark_pdbs}"
 SURFACE_DIR="${SES_BENCH_SURFACE_DIR:-Data/01-benchmark_surfaces}"
 SKIP_BUILD="${SES_BENCH_SKIP_BUILD:-0}"
+INSTALL_DEPS="${SES_BENCH_INSTALL_DEPS:-0}"
 CONTAINER="${SES_BENCH_CONTAINER:-}"
 CONTAINER_WORKDIR="${SES_BENCH_CONTAINER_WORKDIR:-/workspace}"
 EXEC_USER="${SES_BENCH_EXEC_USER:-}"
 RUN_LOCAL="${SES_BENCH_RUN_LOCAL:-0}"
+PROGRAM_VERSION="${SES_BENCH_PROGRAM_VERSION:-0.0.1}"
 DEFAULT_SWEEP_PRESET="${SES_BENCH_SWEEP_PRESET:-focused}"
 DEFAULT_REPEATS="${SES_BENCH_REPEATS:-3}"
 DEFAULT_TORCH_PROFILE_LIMIT="${SES_BENCH_TORCH_PROFILE_LIMIT:-100}"
 DEFAULT_ARGS=(
+  --program-version "${PROGRAM_VERSION}"
   --sweep-preset "${DEFAULT_SWEEP_PRESET}"
   --repeats "${DEFAULT_REPEATS}"
   --torch-profile-limit "${DEFAULT_TORCH_PROFILE_LIMIT}"
@@ -28,7 +31,63 @@ DEFAULT_ARGS=(
 
 print_defaults() {
   echo "[ses-gpu-bench] Output: ${OUTPUT}"
-  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}"
+  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: program_version=${PROGRAM_VERSION}, sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}"
+}
+
+missing_dependency_message() {
+  local where="$1"
+  echo "[ses-gpu-bench] Missing Python dependencies in ${where}." >&2
+  echo "[ses-gpu-bench] Required modules include Bio, numpy, scipy, and torch." >&2
+  echo "[ses-gpu-bench] Re-run with SES_BENCH_INSTALL_DEPS=1 to install requirements.txt there." >&2
+}
+
+check_python_deps() {
+  python -c 'import importlib.util, sys; missing=[name for name in ("Bio", "numpy", "scipy", "torch") if importlib.util.find_spec(name) is None]; print(",".join(missing)); sys.exit(1 if missing else 0)'
+}
+
+install_local_deps() {
+  echo "[ses-gpu-bench] Installing Python dependencies in the current environment"
+  python -m pip install torch --index-url "${TORCH_INDEX_URL}"
+  python -m pip install -r requirements.txt --extra-index-url "${TORCH_INDEX_URL}"
+}
+
+prepare_local_python() {
+  if check_python_deps >/dev/null; then
+    return
+  fi
+  if [[ "${INSTALL_DEPS}" == "1" ]]; then
+    install_local_deps
+    check_python_deps >/dev/null
+    return
+  fi
+  missing_dependency_message "the current environment"
+  exit 1
+}
+
+check_container_python_deps() {
+  docker exec -w "${CONTAINER_WORKDIR}" "${CONTAINER}" \
+    python -c 'import importlib.util, sys; missing=[name for name in ("Bio", "numpy", "scipy", "torch") if importlib.util.find_spec(name) is None]; print(",".join(missing)); sys.exit(1 if missing else 0)'
+}
+
+install_container_deps() {
+  echo "[ses-gpu-bench] Installing Python dependencies in ${CONTAINER}"
+  docker exec -w "${CONTAINER_WORKDIR}" "${CONTAINER}" \
+    python -m pip install torch --index-url "${TORCH_INDEX_URL}"
+  docker exec -w "${CONTAINER_WORKDIR}" "${CONTAINER}" \
+    python -m pip install -r requirements.txt --extra-index-url "${TORCH_INDEX_URL}"
+}
+
+prepare_container_python() {
+  if check_container_python_deps >/dev/null; then
+    return
+  fi
+  if [[ "${INSTALL_DEPS}" == "1" ]]; then
+    install_container_deps
+    check_container_python_deps >/dev/null
+    return
+  fi
+  missing_dependency_message "container ${CONTAINER}"
+  exit 1
 }
 
 ensure_local_paths() {
@@ -53,10 +112,12 @@ if [[ "${RUN_LOCAL}" == "1" ]]; then
   ensure_local_paths
   echo "[ses-gpu-bench] Running benchmark in the current environment"
   print_defaults
+  prepare_local_python
   PYTHONUNBUFFERED=1 \
   SES_BENCH_OUTPUT="${OUTPUT}" \
   SES_BENCH_DATA_DIR="${DATA_DIR}" \
   SES_BENCH_SURFACE_DIR="${SURFACE_DIR}" \
+  SES_BENCH_PROGRAM_VERSION="${PROGRAM_VERSION}" \
     python scripts/benchmark_ses_gpu.py "${DEFAULT_ARGS[@]}" "$@"
   exit 0
 fi
@@ -69,6 +130,7 @@ if [[ -n "${CONTAINER}" ]]; then
   ensure_container_paths
   echo "[ses-gpu-bench] Running benchmark in existing container ${CONTAINER}"
   print_defaults
+  prepare_container_python
   DOCKER_EXEC_ARGS=(
     exec
     -w "${CONTAINER_WORKDIR}"
@@ -76,6 +138,7 @@ if [[ -n "${CONTAINER}" ]]; then
     -e "SES_BENCH_OUTPUT=${OUTPUT}"
     -e "SES_BENCH_DATA_DIR=${DATA_DIR}"
     -e "SES_BENCH_SURFACE_DIR=${SURFACE_DIR}"
+    -e "SES_BENCH_PROGRAM_VERSION=${PROGRAM_VERSION}"
     -e "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}"
   )
   if [[ -n "${EXEC_USER}" ]]; then
@@ -111,6 +174,7 @@ docker run --rm \
   -e "SES_BENCH_OUTPUT=${OUTPUT}" \
   -e "SES_BENCH_DATA_DIR=${DATA_DIR}" \
   -e "SES_BENCH_SURFACE_DIR=${SURFACE_DIR}" \
+  -e "SES_BENCH_PROGRAM_VERSION=${PROGRAM_VERSION}" \
   -e "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}" \
   -v "${REPO_ROOT}:/workspace" \
   -w /workspace \
