@@ -870,6 +870,7 @@ def _all_parameters(
         "probe_radius": args.probe_radius,
         "dtype": args.dtype,
         "device": args.device,
+        "molecule_order": args.molecule_order,
         "loader": {
             "center": args.center,
             "include_hetatm": args.include_hetatm,
@@ -920,9 +921,48 @@ def _all_parameters(
     }
 
 
+def _pdb_atom_is_hydrogen(line: str) -> bool:
+    element = line[76:78].strip().upper() if len(line) >= 78 else ""
+    if element:
+        return element == "H"
+    atom_name = line[12:16].strip().upper() if len(line) >= 16 else ""
+    atom_name = atom_name.lstrip("0123456789")
+    return atom_name.startswith("H")
+
+
+def _estimate_pdb_atom_count(path: Path, args: argparse.Namespace) -> int:
+    count = 0
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("ATOM"):
+                    pass
+                elif line.startswith("HETATM"):
+                    if not args.include_hetatm:
+                        continue
+                else:
+                    continue
+                if not args.include_hydrogens and _pdb_atom_is_hydrogen(line):
+                    continue
+                count += 1
+    except OSError:
+        return -1
+    return count
+
+
 def _select_pdbs(args: argparse.Namespace) -> List[Path]:
     data_dir = Path(args.data_dir)
     pdbs = sorted(data_dir.glob("*.pdb"))
+    if args.molecule_order == "atom_count_desc":
+        pdbs.sort(key=lambda path: (-_estimate_pdb_atom_count(path, args), path.name))
+    elif args.molecule_order == "atom_count_asc":
+        pdbs.sort(key=lambda path: (_estimate_pdb_atom_count(path, args), path.name))
+    elif args.molecule_order == "file_size_desc":
+        pdbs.sort(key=lambda path: (-path.stat().st_size, path.name))
+    elif args.molecule_order == "file_size_asc":
+        pdbs.sort(key=lambda path: (path.stat().st_size, path.name))
+    elif args.molecule_order != "name":
+        raise ValueError(f"unknown molecule order: {args.molecule_order}")
     if args.shard_count < 1:
         raise ValueError("--shard-count must be positive")
     if args.shard_index < 0 or args.shard_index >= args.shard_count:
@@ -2109,6 +2149,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument(
+        "--molecule-order",
+        choices=(
+            "name",
+            "atom_count_desc",
+            "atom_count_asc",
+            "file_size_desc",
+            "file_size_asc",
+        ),
+        default=os.environ.get("SES_BENCH_MOLECULE_ORDER", "name"),
+        help=(
+            "Order PDB files before shard/offset/limit selection. "
+            "Use atom_count_desc to run the largest molecules first."
+        ),
+    )
+    parser.add_argument(
+        "--largest-first",
+        action="store_true",
+        help="Shortcut for --molecule-order atom_count_desc.",
+    )
     parser.add_argument("--max-atoms", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=25)
     parser.add_argument("--resume", action="store_true")
@@ -2252,6 +2312,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if args.largest_first:
+        args.molecule_order = "atom_count_desc"
     if args.surface_dir is None:
         args.surface_dir = _default_surface_dir(args.data_dir)
     methods = args.methods if isinstance(args.methods, list) else _parse_methods(args.methods)
@@ -2324,6 +2386,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "surface_dir": args.surface_dir,
             "limit": args.limit,
             "offset": args.offset,
+            "molecule_order": args.molecule_order,
             "shard_index": args.shard_index,
             "shard_count": args.shard_count,
             "max_atoms": args.max_atoms,

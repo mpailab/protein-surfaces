@@ -65,6 +65,12 @@ Use a small limit before launching the full dataset:
 scripts/run_gpu_benchmarks.sh --limit 10 --log-every 1
 ```
 
+To stress the largest molecules first:
+
+```bash
+scripts/run_gpu_benchmarks.sh --largest-first --limit 10 --log-every 1
+```
+
 CPU-only smoke runs are also possible for validating the benchmark driver inside
 the dev container:
 
@@ -253,6 +259,8 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
 - `--methods`: comma-separated subset, or `all`.
 - `--sweep-preset`: `none`, `focused`, or `broad`.
 - `--repeats`: repeated runs per molecule/method/variant.
+- `--largest-first`: run the largest PDBs first, using an atom-count estimate.
+- `--molecule-order`: `name`, `atom_count_desc`, `atom_count_asc`, `file_size_desc`, or `file_size_asc`.
 - `--point-area`: analytic target area per point. Default: `0.5`.
 - `--projected-m`: projection seeds per atom. Default: `230`.
 - `--sdf-m`: SDF seeds per atom. Default: `34`.
@@ -275,6 +283,7 @@ practical.
 - `SES_BENCH_DATA_DIR`: PDB dataset directory.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
 - `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.1`.
+- `SES_BENCH_MOLECULE_ORDER`: default PDB order, for example `atom_count_desc`.
 - `SES_BENCH_AUTO_RESUME=0`: disable wrapper auto-resume. Auto-resume is enabled by default.
 - `SES_BENCH_CONTAINER`: run inside an already-running Docker container with `docker exec`.
 - `SES_BENCH_CONTAINER_WORKDIR`: repository path inside that container. Default: `/workspace`.
