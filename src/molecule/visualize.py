@@ -14,6 +14,7 @@ from ses.analytic import (
     _dense_atom_features,
     _sample_analytic_samples,
 )
+from ses.graph import build_surface_adjacency
 from ses.projection import sample_atom_points, _sample_projected_grid
 from ses.sdf import sample_sdf_points
 from ses.tiled_analytic import _sample_tiled_analytic_samples
@@ -37,14 +38,92 @@ SDF_SUPPORT_COLORS = {
     3: "#9b5de5",
 }
 
+DEFAULT_SURFACE_EDGE_RADIUS = 0.012
+DEFAULT_SURFACE_EDGE_COLOR = "#202124"
+DEFAULT_SURFACE_EDGE_OPACITY = 0.58
+DEFAULT_SURFACE_NORMAL_LENGTH = 0.25
+DEFAULT_SURFACE_NORMAL_RADIUS = 0.012
+DEFAULT_SURFACE_NORMAL_COLOR = "#111111"
+DEFAULT_SURFACE_NORMAL_OPACITY = 0.68
+DEFAULT_SURFACE_NORMAL_START_OFFSET = 0.035
+DEFAULT_SURFACE_NORMAL_TIP_START = 0.72
+DEFAULT_SURFACE_NORMAL_TIP_RADIUS_RATIO = 2.0
 
-def sample_display_points(molecule, m, probe_radius):
+
+def _adjacency_to_edge_arrays(adjacency):
+    adjacency = adjacency.coalesce()
+    if adjacency._nnz() == 0:
+        return (
+            np.empty((0, 2), dtype=np.int64),
+            np.empty((0,), dtype=np.float64),
+        )
+    indices = adjacency.indices()
+    values = adjacency.values()
+    keep = indices[0] < indices[1]
+    return (
+        indices[:, keep].transpose(0, 1).detach().cpu().numpy(),
+        values[keep].detach().cpu().numpy(),
+    )
+
+
+def _limited_rows(total_count, max_count):
+    if max_count is None or total_count <= max_count:
+        return np.arange(total_count, dtype=np.int64)
+    max_count = max(0, int(max_count))
+    if max_count == 0:
+        return np.empty((0,), dtype=np.int64)
+    return np.linspace(0, total_count - 1, max_count, dtype=np.int64)
+
+
+def _with_optional_normals_and_edges(
+    result,
+    points,
+    normals,
+    *,
+    include_normals,
+    include_edges,
+    adjacency=None,
+):
+    if include_normals:
+        result["normals"] = normals.detach().cpu().numpy()
+    if include_edges:
+        edge_indices, edge_weights = _adjacency_to_edge_arrays(adjacency)
+        result["edge_indices"] = edge_indices
+        result["edge_weights"] = edge_weights
+    return result
+
+
+def sample_display_points(
+    molecule,
+    m,
+    probe_radius,
+    *,
+    include_normals=False,
+    include_edges=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
+):
     coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
     radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
 
+    need_normals = include_normals or include_edges
     atom_points = sample_atom_points(coords, radii, m)
-    ses_points, valid_mask = _sample_projected_grid(coords, radii, m, probe_radius)
+    projected_outputs = _sample_projected_grid(
+        coords,
+        radii,
+        m,
+        probe_radius,
+        include_normals=need_normals,
+    )
+    if need_normals:
+        ses_points, valid_mask, normals = projected_outputs
+    else:
+        ses_points, valid_mask = projected_outputs
+        normals = None
     finite_mask = torch.isfinite(atom_points).all(dim=-1) & torch.isfinite(ses_points).all(dim=-1)
+    if normals is not None:
+        finite_mask = finite_mask & torch.isfinite(normals).all(dim=-1)
     display_mask = valid_mask & finite_mask
 
     raw_owner_indices = (
@@ -56,15 +135,38 @@ def sample_display_points(molecule, m, probe_radius):
         .cpu()
         .numpy()
     )
-    owner_indices = display_mask.nonzero(as_tuple=False)[:, 1].detach().cpu().numpy()
-    return {
+    owner_indices_tensor = display_mask.nonzero(as_tuple=False)[:, 1]
+    points = ses_points[display_mask]
+    graph_normals = normals[display_mask] if normals is not None else None
+    adjacency = None
+    if include_edges:
+        support_indices = owner_indices_tensor.unsqueeze(-1)
+        support_mask = torch.ones_like(support_indices, dtype=torch.bool)
+        adjacency = build_surface_adjacency(
+            points,
+            graph_normals,
+            support_indices=support_indices,
+            support_mask=support_mask,
+            weight_mode=adjacency_weight,
+            neighbors=adjacency_neighbors,
+            candidate_neighbors=adjacency_candidate_neighbors,
+        )
+    result = {
         "raw_atom_points": atom_points.reshape(-1, 3).detach().cpu().numpy(),
         "raw_owner_indices": raw_owner_indices,
         "atom_points": atom_points[display_mask].detach().cpu().numpy(),
-        "ses_points": ses_points[display_mask].detach().cpu().numpy(),
-        "owner_indices": owner_indices,
+        "ses_points": points.detach().cpu().numpy(),
+        "owner_indices": owner_indices_tensor.detach().cpu().numpy(),
         "valid_fraction": display_mask.to(dtype=torch.float64).mean().item(),
     }
+    return _with_optional_normals_and_edges(
+        result,
+        points,
+        graph_normals,
+        include_normals=include_normals,
+        include_edges=include_edges,
+        adjacency=adjacency,
+    )
 
 
 def sample_analytic_display_points(
@@ -79,6 +181,11 @@ def sample_analytic_display_points(
     pair_filter_samples=24,
     max_probe_triples=5_000_000,
     max_grid_points=50_000_000,
+    include_normals=False,
+    include_edges=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
 ):
     """Sample analytic SES points and return NumPy arrays for visualization."""
 
@@ -89,6 +196,7 @@ def sample_analytic_display_points(
 
     coords = torch.as_tensor(molecule["coords"], dtype=dtype, device=device)
     radii = torch.as_tensor(molecule["radii"], dtype=dtype, device=device)
+    need_normals = include_normals or include_edges
     samples = _sample_analytic_samples(
         coords,
         radii,
@@ -96,6 +204,7 @@ def sample_analytic_display_points(
         point_area=point_area,
         probe_density_scale=probe_density_scale,
         include_atom_weights=include_atom_weights,
+        include_normals=need_normals,
         atom_filter_samples=atom_filter_samples,
         pair_filter_samples=pair_filter_samples,
         max_probe_triples=max_probe_triples,
@@ -113,9 +222,24 @@ def sample_analytic_display_points(
     if samples.atom_weights is not None:
         atom_weights = samples.atom_weights.detach().cpu().numpy()
 
-    return {
+    adjacency = None
+    if include_edges:
+        adjacency = build_surface_adjacency(
+            samples.points,
+            samples.normals,
+            support_indices=samples.support_indices,
+            support_mask=samples.support_mask,
+            block_types=samples.block_types,
+            block_indices=samples.block_indices,
+            weight_mode=adjacency_weight,
+            neighbors=adjacency_neighbors,
+            candidate_neighbors=adjacency_candidate_neighbors,
+        )
+
+    result = {
         "ses_points": samples.points.detach().cpu().numpy(),
         "block_types": samples.block_types.detach().cpu().numpy(),
+        "block_indices": samples.block_indices.detach().cpu().numpy(),
         "support_indices": samples.support_indices.detach().cpu().numpy(),
         "support_mask": samples.support_mask.detach().cpu().numpy(),
         "support_weights": samples.support_weights.detach().cpu().numpy(),
@@ -124,6 +248,14 @@ def sample_analytic_display_points(
         "num_blocks": samples.blocks.num_blocks if samples.blocks is not None else 0,
         "device": str(device),
     }
+    return _with_optional_normals_and_edges(
+        result,
+        samples.points,
+        samples.normals,
+        include_normals=include_normals,
+        include_edges=include_edges,
+        adjacency=adjacency,
+    )
 
 
 def sample_sdf_display_points(
@@ -138,6 +270,11 @@ def sample_sdf_display_points(
     device=None,
     dtype=torch.float64,
     max_grid_points=2_000_000,
+    include_normals=False,
+    include_edges=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
 ):
     """Sample SDF level-set SES points and return NumPy arrays for visualization."""
 
@@ -148,7 +285,7 @@ def sample_sdf_display_points(
 
     coords = torch.as_tensor(molecule["coords"], dtype=dtype, device=device)
     radii = torch.as_tensor(molecule["radii"], dtype=dtype, device=device)
-    points, atom_features = sample_sdf_points(
+    outputs = sample_sdf_points(
         coords,
         radii,
         m=m,
@@ -159,8 +296,26 @@ def sample_sdf_display_points(
         subsample_spacing=subsample_spacing,
         feature_threshold=feature_threshold,
         include_atom_features=True,
+        include_normals=include_normals,
+        include_adjacency=include_edges,
+        adjacency_weight=adjacency_weight,
+        adjacency_neighbors=adjacency_neighbors,
+        adjacency_candidate_neighbors=adjacency_candidate_neighbors,
         max_grid_points=max_grid_points,
     )
+    if include_normals and include_edges:
+        points, atom_features, normals, adjacency = outputs
+    elif include_normals:
+        points, atom_features, normals = outputs
+        adjacency = None
+    elif include_edges:
+        points, atom_features, adjacency = outputs
+        normals = None
+    else:
+        points, atom_features = outputs
+        normals = None
+        adjacency = None
+
     support_counts = atom_features.sum(dim=1).to(dtype=torch.long)
     unique_counts, count_counts = support_counts.detach().cpu().unique(return_counts=True)
     support_count_counts = {
@@ -168,13 +323,21 @@ def sample_sdf_display_points(
         for support_count, count in zip(unique_counts, count_counts)
     }
 
-    return {
+    result = {
         "ses_points": points.detach().cpu().numpy(),
         "atom_features": atom_features.detach().cpu().numpy(),
         "support_counts": support_counts.detach().cpu().numpy(),
         "support_count_counts": support_count_counts,
         "device": str(device),
     }
+    return _with_optional_normals_and_edges(
+        result,
+        points,
+        normals,
+        include_normals=include_normals,
+        include_edges=include_edges,
+        adjacency=adjacency,
+    )
 
 
 def sample_tiled_analytic_display_points(
@@ -192,6 +355,11 @@ def sample_tiled_analytic_display_points(
     dtype=torch.float64,
     max_grid_points=500_000,
     max_probe_triples=5_000_000,
+    include_normals=False,
+    include_edges=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
 ):
     """Sample tiled analytic SES points and return NumPy arrays for visualization."""
 
@@ -202,6 +370,7 @@ def sample_tiled_analytic_display_points(
 
     coords = torch.as_tensor(molecule["coords"], dtype=dtype, device=device)
     radii = torch.as_tensor(molecule["radii"], dtype=dtype, device=device)
+    need_normals = include_normals or include_edges
     samples = _sample_tiled_analytic_samples(
         coords,
         radii,
@@ -217,6 +386,7 @@ def sample_tiled_analytic_display_points(
         max_grid_points=max_grid_points,
         max_probe_triples=max_probe_triples,
         include_atom_weights=True,
+        include_normals=need_normals,
     )
     atom_features = _dense_atom_features(
         samples.support_indices,
@@ -231,8 +401,24 @@ def sample_tiled_analytic_display_points(
         for support_count, count in zip(unique_counts, count_counts)
     }
 
-    return {
+    adjacency = None
+    if include_edges:
+        adjacency = build_surface_adjacency(
+            samples.points,
+            samples.normals,
+            support_indices=samples.support_indices,
+            support_mask=samples.support_mask,
+            block_types=samples.block_types,
+            block_indices=samples.block_indices,
+            weight_mode=adjacency_weight,
+            neighbors=adjacency_neighbors,
+            candidate_neighbors=adjacency_candidate_neighbors,
+        )
+
+    result = {
         "ses_points": samples.points.detach().cpu().numpy(),
+        "block_types": samples.block_types.detach().cpu().numpy(),
+        "block_indices": samples.block_indices.detach().cpu().numpy(),
         "atom_features": atom_features.detach().cpu().numpy(),
         "atom_weights": samples.atom_weights.detach().cpu().numpy(),
         "support_indices": samples.support_indices.detach().cpu().numpy(),
@@ -242,6 +428,14 @@ def sample_tiled_analytic_display_points(
         "support_count_counts": support_count_counts,
         "device": str(device),
     }
+    return _with_optional_normals_and_edges(
+        result,
+        samples.points,
+        samples.normals,
+        include_normals=include_normals,
+        include_edges=include_edges,
+        adjacency=adjacency,
+    )
 
 
 def add_sphere(view, center, radius, color, opacity=1.0):
@@ -267,6 +461,29 @@ def add_cylinder(view, start, end, radius, color, opacity=1.0):
     )
 
 
+def add_arrow(
+    view,
+    start,
+    end,
+    radius,
+    color,
+    opacity=1.0,
+    tip_start=DEFAULT_SURFACE_NORMAL_TIP_START,
+    tip_radius_ratio=DEFAULT_SURFACE_NORMAL_TIP_RADIUS_RATIO,
+):
+    view.addArrow(
+        {
+            "start": {"x": float(start[0]), "y": float(start[1]), "z": float(start[2])},
+            "end": {"x": float(end[0]), "y": float(end[1]), "z": float(end[2])},
+            "radius": float(radius),
+            "color": color,
+            "opacity": float(opacity),
+            "mid": float(tip_start),
+            "radiusRatio": float(tip_radius_ratio),
+        }
+    )
+
+
 def add_bonds(view, molecule):
     coords = molecule["coords"]
     elements = molecule["elements"]
@@ -277,6 +494,72 @@ def add_bonds(view, molecule):
                 add_cylinder(view, coords[i], coords[j], radius=0.045, color="#777777", opacity=0.85)
 
 
+def add_surface_edges(
+    view,
+    points,
+    edge_indices,
+    *,
+    radius=DEFAULT_SURFACE_EDGE_RADIUS,
+    color=DEFAULT_SURFACE_EDGE_COLOR,
+    opacity=DEFAULT_SURFACE_EDGE_OPACITY,
+    max_edges=None,
+):
+    if radius <= 0:
+        return
+    points = np.asarray(points)
+    edge_indices = np.asarray(edge_indices, dtype=np.int64)
+    if points.size == 0 or edge_indices.size == 0:
+        return
+    rows = _limited_rows(edge_indices.shape[0], max_edges)
+    for first, second in edge_indices[rows]:
+        if first < 0 or second < 0 or first >= points.shape[0] or second >= points.shape[0]:
+            continue
+        start = points[first]
+        end = points[second]
+        if np.isfinite(start).all() and np.isfinite(end).all():
+            add_cylinder(view, start, end, radius, color, opacity=opacity)
+
+
+def add_surface_normals(
+    view,
+    points,
+    normals,
+    *,
+    length=DEFAULT_SURFACE_NORMAL_LENGTH,
+    radius=DEFAULT_SURFACE_NORMAL_RADIUS,
+    color=DEFAULT_SURFACE_NORMAL_COLOR,
+    opacity=DEFAULT_SURFACE_NORMAL_OPACITY,
+    max_normals=None,
+    start_offset=DEFAULT_SURFACE_NORMAL_START_OFFSET,
+):
+    if length <= 0 or radius <= 0:
+        return
+    points = np.asarray(points)
+    normals = np.asarray(normals)
+    if points.size == 0 or normals.size == 0:
+        return
+    normal_lengths = np.linalg.norm(normals, axis=1)
+    valid = (
+        np.isfinite(points).all(axis=1)
+        & np.isfinite(normals).all(axis=1)
+        & (normal_lengths > 0)
+    )
+    valid_rows = np.nonzero(valid)[0]
+    rows = valid_rows[_limited_rows(valid_rows.shape[0], max_normals)]
+    for row in rows:
+        normal = normals[row] / normal_lengths[row]
+        start = points[row] + min(float(start_offset), 0.8 * float(length)) * normal
+        end = points[row] + float(length) * normal
+        add_arrow(
+            view,
+            start,
+            end,
+            radius,
+            color,
+            opacity=opacity,
+        )
+
+
 def render_py3dmol_points(
     molecule_name="Methionine",
     m=120,
@@ -285,11 +568,34 @@ def render_py3dmol_points(
     ses_point_radius=0.045,
     projection_line_radius=0.012,
     show_unfiltered_atom_points=False,
+    show_edges=False,
+    show_normals=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
+    edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
+    edge_color=DEFAULT_SURFACE_EDGE_COLOR,
+    edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
+    max_edges=None,
+    normal_length=DEFAULT_SURFACE_NORMAL_LENGTH,
+    normal_radius=DEFAULT_SURFACE_NORMAL_RADIUS,
+    normal_color=DEFAULT_SURFACE_NORMAL_COLOR,
+    normal_opacity=DEFAULT_SURFACE_NORMAL_OPACITY,
+    max_normals=None,
     width=760,
     height=580,
 ):
     molecule = get_molecule(molecule_name)
-    sampled = sample_display_points(molecule, m=m, probe_radius=probe_radius)
+    sampled = sample_display_points(
+        molecule,
+        m=m,
+        probe_radius=probe_radius,
+        include_normals=show_normals,
+        include_edges=show_edges,
+        adjacency_weight=adjacency_weight,
+        adjacency_neighbors=adjacency_neighbors,
+        adjacency_candidate_neighbors=adjacency_candidate_neighbors,
+    )
 
     view = py3Dmol.view(width=width, height=height)
     view.setBackgroundColor("white")
@@ -315,9 +621,32 @@ def render_py3dmol_points(
         point_color = ATOM_COLORS[element]
         add_cylinder(view, atom_point, ses_point, projection_line_radius, point_color, opacity=0.42)
 
+    if show_edges:
+        add_surface_edges(
+            view,
+            sampled["ses_points"],
+            sampled["edge_indices"],
+            radius=edge_radius,
+            color=edge_color,
+            opacity=edge_opacity,
+            max_edges=max_edges,
+        )
+
     for point, atom_index in zip(sampled["ses_points"], sampled["owner_indices"]):
         element = molecule["elements"][atom_index]
         add_sphere(view, point, ses_point_radius, ATOM_COLORS[element], opacity=0.74)
+
+    if show_normals:
+        add_surface_normals(
+            view,
+            sampled["ses_points"],
+            sampled["normals"],
+            length=normal_length,
+            radius=normal_radius,
+            color=normal_color,
+            opacity=normal_opacity,
+            max_normals=max_normals,
+        )
 
     view.addLabel(
         f"{molecule_name}: {len(sampled['ses_points'])} valid samples ({sampled['valid_fraction']:.0%})",
@@ -345,6 +674,20 @@ def render_py3dmol_analytic_ses_points(
     probe_density_scale=1.0,
     ses_point_radius=0.045,
     color_by="block_type",
+    show_edges=False,
+    show_normals=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
+    edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
+    edge_color=DEFAULT_SURFACE_EDGE_COLOR,
+    edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
+    max_edges=None,
+    normal_length=DEFAULT_SURFACE_NORMAL_LENGTH,
+    normal_radius=DEFAULT_SURFACE_NORMAL_RADIUS,
+    normal_color=DEFAULT_SURFACE_NORMAL_COLOR,
+    normal_opacity=DEFAULT_SURFACE_NORMAL_OPACITY,
+    max_normals=None,
     width=760,
     height=580,
     device=None,
@@ -366,6 +709,11 @@ def render_py3dmol_analytic_ses_points(
         pair_filter_samples=pair_filter_samples,
         max_probe_triples=max_probe_triples,
         max_grid_points=max_grid_points,
+        include_normals=show_normals,
+        include_edges=show_edges,
+        adjacency_weight=adjacency_weight,
+        adjacency_neighbors=adjacency_neighbors,
+        adjacency_candidate_neighbors=adjacency_candidate_neighbors,
     )
 
     view = py3Dmol.view(width=width, height=height)
@@ -374,6 +722,17 @@ def render_py3dmol_analytic_ses_points(
 
     for element, center, radius in zip(molecule["elements"], molecule["coords"], molecule["radii"]):
         add_sphere(view, center, radius, ATOM_COLORS[element], opacity=0.34)
+
+    if show_edges:
+        add_surface_edges(
+            view,
+            sampled["ses_points"],
+            sampled["edge_indices"],
+            radius=edge_radius,
+            color=edge_color,
+            opacity=edge_opacity,
+            max_edges=max_edges,
+        )
 
     for row, point in enumerate(sampled["ses_points"]):
         block_type = int(sampled["block_types"][row])
@@ -386,6 +745,18 @@ def render_py3dmol_analytic_ses_points(
                 atom_index = int(support_indices[int(np.argmax(support_weights))])
                 color = ATOM_COLORS[molecule["elements"][atom_index]]
         add_sphere(view, point, ses_point_radius, color, opacity=0.76)
+
+    if show_normals:
+        add_surface_normals(
+            view,
+            sampled["ses_points"],
+            sampled["normals"],
+            length=normal_length,
+            radius=normal_radius,
+            color=normal_color,
+            opacity=normal_opacity,
+            max_normals=max_normals,
+        )
 
     counts = ", ".join(
         f"{name}: {count}" for name, count in sampled["block_type_counts"].items()
@@ -423,6 +794,20 @@ def render_py3dmol_sdf_ses_points(
     feature_threshold=0.1,
     ses_point_radius=0.045,
     color_by="support_count",
+    show_edges=False,
+    show_normals=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
+    edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
+    edge_color=DEFAULT_SURFACE_EDGE_COLOR,
+    edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
+    max_edges=None,
+    normal_length=DEFAULT_SURFACE_NORMAL_LENGTH,
+    normal_radius=DEFAULT_SURFACE_NORMAL_RADIUS,
+    normal_color=DEFAULT_SURFACE_NORMAL_COLOR,
+    normal_opacity=DEFAULT_SURFACE_NORMAL_OPACITY,
+    max_normals=None,
     width=760,
     height=580,
     device=None,
@@ -442,6 +827,11 @@ def render_py3dmol_sdf_ses_points(
         feature_threshold=feature_threshold,
         device=device,
         max_grid_points=max_grid_points,
+        include_normals=show_normals,
+        include_edges=show_edges,
+        adjacency_weight=adjacency_weight,
+        adjacency_neighbors=adjacency_neighbors,
+        adjacency_candidate_neighbors=adjacency_candidate_neighbors,
     )
 
     view = py3Dmol.view(width=width, height=height)
@@ -450,6 +840,17 @@ def render_py3dmol_sdf_ses_points(
 
     for element, center, radius in zip(molecule["elements"], molecule["coords"], molecule["radii"]):
         add_sphere(view, center, radius, ATOM_COLORS[element], opacity=0.34)
+
+    if show_edges:
+        add_surface_edges(
+            view,
+            sampled["ses_points"],
+            sampled["edge_indices"],
+            radius=edge_radius,
+            color=edge_color,
+            opacity=edge_opacity,
+            max_edges=max_edges,
+        )
 
     for row, point in enumerate(sampled["ses_points"]):
         support_count = int(sampled["support_counts"][row])
@@ -460,6 +861,18 @@ def render_py3dmol_sdf_ses_points(
                 atom_index = int(active_atoms[0])
                 color = ATOM_COLORS[molecule["elements"][atom_index]]
         add_sphere(view, point, ses_point_radius, color, opacity=0.76)
+
+    if show_normals:
+        add_surface_normals(
+            view,
+            sampled["ses_points"],
+            sampled["normals"],
+            length=normal_length,
+            radius=normal_radius,
+            color=normal_color,
+            opacity=normal_opacity,
+            max_normals=max_normals,
+        )
 
     counts = ", ".join(
         f"support {support_count}: {count}"
@@ -500,6 +913,20 @@ def render_py3dmol_tiled_analytic_ses_points(
     exact_accessibility=False,
     ses_point_radius=0.045,
     color_by="dominant_atom",
+    show_edges=False,
+    show_normals=False,
+    adjacency_weight="euclidean",
+    adjacency_neighbors=8,
+    adjacency_candidate_neighbors=None,
+    edge_radius=DEFAULT_SURFACE_EDGE_RADIUS,
+    edge_color=DEFAULT_SURFACE_EDGE_COLOR,
+    edge_opacity=DEFAULT_SURFACE_EDGE_OPACITY,
+    max_edges=None,
+    normal_length=DEFAULT_SURFACE_NORMAL_LENGTH,
+    normal_radius=DEFAULT_SURFACE_NORMAL_RADIUS,
+    normal_color=DEFAULT_SURFACE_NORMAL_COLOR,
+    normal_opacity=DEFAULT_SURFACE_NORMAL_OPACITY,
+    max_normals=None,
     width=760,
     height=580,
     device=None,
@@ -523,6 +950,11 @@ def render_py3dmol_tiled_analytic_ses_points(
         device=device,
         max_grid_points=max_grid_points,
         max_probe_triples=max_probe_triples,
+        include_normals=show_normals,
+        include_edges=show_edges,
+        adjacency_weight=adjacency_weight,
+        adjacency_neighbors=adjacency_neighbors,
+        adjacency_candidate_neighbors=adjacency_candidate_neighbors,
     )
 
     view = py3Dmol.view(width=width, height=height)
@@ -532,9 +964,23 @@ def render_py3dmol_tiled_analytic_ses_points(
     for element, center, radius in zip(molecule["elements"], molecule["coords"], molecule["radii"]):
         add_sphere(view, center, radius, ATOM_COLORS[element], opacity=0.34)
 
+    if show_edges:
+        add_surface_edges(
+            view,
+            sampled["ses_points"],
+            sampled["edge_indices"],
+            radius=edge_radius,
+            color=edge_color,
+            opacity=edge_opacity,
+            max_edges=max_edges,
+        )
+
     for row, point in enumerate(sampled["ses_points"]):
         support_count = int(sampled["support_counts"][row])
         color = SDF_SUPPORT_COLORS.get(min(support_count, 3), "#555555")
+        if color_by == "block_type":
+            block_type = int(sampled["block_types"][row])
+            color = ANALYTIC_BLOCK_COLORS.get(block_type, "#555555")
         if color_by == "dominant_atom":
             support_mask = sampled["support_mask"][row]
             if support_mask.any():
@@ -543,6 +989,18 @@ def render_py3dmol_tiled_analytic_ses_points(
                 atom_index = int(support_indices[int(np.argmax(support_weights))])
                 color = ATOM_COLORS[molecule["elements"][atom_index]]
         add_sphere(view, point, ses_point_radius, color, opacity=0.76)
+
+    if show_normals:
+        add_surface_normals(
+            view,
+            sampled["ses_points"],
+            sampled["normals"],
+            length=normal_length,
+            radius=normal_radius,
+            color=normal_color,
+            opacity=normal_opacity,
+            max_normals=max_normals,
+        )
 
     counts = ", ".join(
         f"support {support_count}: {count}"
