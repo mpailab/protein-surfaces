@@ -49,6 +49,7 @@ PROGRAM_VERSION = "0.0.1"
 BENCHMARK_DRIVER_VERSION = "0.0.1"
 METHOD_ORDER = ("analytic", "projected", "sdf", "tiled_analytic")
 MB = 1024 * 1024
+TILED_NUMERIC_TILE_SIZE_DEFAULT_OVERLAP = 4.0
 _ACTIVE_SECTION_PROFILER: Optional["SectionProfiler"] = None
 _INSTALLED_PROFILE_WRAPPERS: List[Tuple[Any, str, Any]] = []
 _PROFILE_MODULES = (ses_projection, ses_analytic, ses_sdf, ses_tiled_analytic)
@@ -657,6 +658,12 @@ def _method_params(
         raise ValueError(f"unknown method: {method}")
     if overrides:
         params.update(overrides)
+    if (
+        method == "tiled_analytic"
+        and params.get("tile_size") != "auto"
+        and params.get("tile_overlap") == "auto"
+    ):
+        params["tile_overlap"] = TILED_NUMERIC_TILE_SIZE_DEFAULT_OVERLAP
     return params
 
 
@@ -1499,12 +1506,12 @@ def _should_profile_run(args: argparse.Namespace, run_index: int, repeat_index: 
 def _should_torch_profile(
     args: argparse.Namespace,
     run_index: int,
-    profiles_written: int,
+    profiles_attempted: int,
     repeat_index: int,
 ) -> bool:
     if args.profile_only_first_repeat and repeat_index != 0:
         return False
-    if args.torch_profile_limit and profiles_written < args.torch_profile_limit:
+    if args.torch_profile_limit and profiles_attempted < args.torch_profile_limit:
         return True
     return args.torch_profile_every > 0 and run_index % args.torch_profile_every == 0
 
@@ -2063,11 +2070,18 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     )[:25]
 
     def slim(record: Dict[str, Any]) -> Dict[str, Any]:
+        profiling = record.get("profiling", {})
+        torch_profile = record.get("torch_profile", {})
         return {
             "pdb_id": record.get("pdb_id"),
             "method": record.get("method"),
             "variant_name": record.get("variant_name"),
             "status": record.get("status"),
+            "repeat_index": record.get("repeat_index"),
+            "run_index": record.get("run_index"),
+            "internal_profile_enabled": profiling.get("internal_profile_enabled"),
+            "torch_profile_enabled": profiling.get("torch_profile_enabled"),
+            "torch_profile_trace_path": torch_profile.get("trace_path"),
             "atom_count": record.get("atom_count"),
             "point_count": record.get("point_count"),
             "wall_seconds": record.get("wall_seconds"),
@@ -2094,6 +2108,14 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "variant_summaries": variant_summaries,
         "fastest_variants_by_method": fastest_variants,
         "slowest_ok_results": [slim(record) for record in slowest],
+        "slowest_clean_ok_results": [
+            slim(record)
+            for record in sorted(
+                _clean_timing_records(ok_results),
+                key=lambda record: record.get("wall_seconds") or 0,
+                reverse=True,
+            )[:25]
+        ],
         "highest_gpu_memory_ok_results": [slim(record) for record in highest_memory],
         "errors": [slim(record) for record in error_results[:50]],
     }
@@ -2414,6 +2436,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     attempted = 0
     skipped_resume = 0
+    torch_profiles_attempted = 0
     torch_profiles_written = 0
     try:
         for pdb_index, pdb_path in enumerate(pdbs, start=1):
@@ -2482,7 +2505,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 should_torch_profile = _should_torch_profile(
                     args,
                     run_index,
-                    torch_profiles_written,
+                    torch_profiles_attempted,
                     repeat_index,
                 )
                 record = _run_one_method(
@@ -2504,6 +2527,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     torch_profile=should_torch_profile,
                 )
                 if should_torch_profile:
+                    torch_profiles_attempted += 1
+                if record.get("torch_profile", {}).get("trace_path"):
                     torch_profiles_written += 1
                 writer.write(record)
                 result_records.append(record)
@@ -2538,6 +2563,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "summary_json": str(summary_path),
             "attempted_in_this_run": attempted,
             "skipped_by_resume": skipped_resume,
+            "torch_profiles_attempted": torch_profiles_attempted,
             "torch_profiles_written": torch_profiles_written,
             "summary": _summarize(result_records),
         }

@@ -43,10 +43,13 @@ reference-surface distance metrics, errors, tracebacks, environment metadata,
 and git status.
 
 The wrapper defaults are deliberately diagnostic: `--sweep-preset focused`,
-`--repeats 3`, and `--torch-profile-limit 100`. That gives one profiled repeat
-plus cleaner timing repeats for each molecule/method/variant. Override them
-with normal CLI flags, or set `SES_BENCH_SWEEP_PRESET`, `SES_BENCH_REPEATS`,
-and `SES_BENCH_TORCH_PROFILE_LIMIT` before running the wrapper.
+`--repeats 3`, and `--torch-profile-limit 100`. That gives profiled repeats on
+a limited prefix plus cleaner timing repeats for each molecule/method/variant.
+PyTorch traces can be large and slow to write, so use a lower
+`--torch-profile-limit` for throughput-focused full-dataset runs. Override the
+defaults with normal CLI flags, or set `SES_BENCH_SWEEP_PRESET`,
+`SES_BENCH_REPEATS`, and `SES_BENCH_TORCH_PROFILE_LIMIT` before running the
+wrapper.
 
 Each run records `program_version`, defaulting to `0.0.1`. For release
 benchmarks, set `SES_BENCH_PROGRAM_VERSION` to the same semantic version as the
@@ -230,7 +233,7 @@ scripts/run_gpu_benchmarks.sh --limit 20 --torch-profile-limit 20
 Trace files are written under `tmp/gpu_benchmarks/traces/` and can be opened in
 Chrome trace viewer or Perfetto. Records with `torch_profile` include top CUDA,
 CPU, and memory ops, and are marked because `wall_seconds` includes profiler
-overhead.
+overhead. Prefer the `clean_*` summary metrics for throughput comparisons.
 
 For maximum structure detail on a small diagnostic run, include nested sample
 summaries:
@@ -265,7 +268,7 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
 - `--projected-m`: projection seeds per atom. Default: `230`.
 - `--sdf-m`: SDF seeds per atom. Default: `34`.
 - `--tiled-atom-density-scale`: tiled contact density multiplier. Default: `7.0`.
-- `--tile-size` / `--tile-overlap`: default to `auto` for large molecules.
+- `--tile-size` / `--tile-overlap`: default to `auto`; numeric tile-size sweeps use overlap `4.0` unless overridden.
 - `--reference-sample-size`: reference quality subsample size. Default: `4096`.
 - `--torch-profile-limit`: number of method/variant runs to trace with PyTorch profiler.
 - `--profile-internals-every`: collect internal function profiles every N method/variant runs.
