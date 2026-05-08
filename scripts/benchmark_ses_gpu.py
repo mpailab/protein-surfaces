@@ -2283,7 +2283,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if device.type == "cuda":
         if not torch.cuda.is_available():
             raise SystemExit("CUDA device requested, but torch.cuda.is_available() is false")
+        if device.index is None:
+            device = torch.device("cuda:0")
         torch.cuda.set_device(device)
+        args.device = str(device)
     elif args.require_cuda:
         raise SystemExit("CUDA is required; pass --no-require-cuda for CPU smoke runs")
 
