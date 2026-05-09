@@ -1,0 +1,41 @@
+ARG CUDA_IMAGE=nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM ${CUDA_IMAGE}
+
+ARG PYTHON_VERSION=3.9
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu121
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH=/opt/conda/bin:${PATH}
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        make \
+        procps \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh \
+        -o /tmp/miniforge.sh \
+    && bash /tmp/miniforge.sh -b -p /opt/conda \
+    && rm /tmp/miniforge.sh \
+    && conda install -y "python=${PYTHON_VERSION}" pip \
+    && conda clean -afy
+
+WORKDIR /workspace
+
+COPY requirements.txt /tmp/requirements.txt
+
+RUN python -m pip install --upgrade pip setuptools wheel \
+    && python -m pip install torch --index-url "${TORCH_INDEX_URL}" \
+    && python -m pip install -r /tmp/requirements.txt --extra-index-url "${TORCH_INDEX_URL}" \
+    && python -m pip check
+
+RUN git config --global --add safe.directory /workspace
+
+ENTRYPOINT ["/usr/bin/tini", "--"]

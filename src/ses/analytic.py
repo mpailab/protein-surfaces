@@ -56,7 +56,17 @@ _DEFAULT_GPU_TRIPLE_COMBO_BUDGET = 64_000_000
 # coarse patches and then greedily picks well-spaced directions from that pool.
 _WELL_SPACED_SELECTION_LIMIT = 256
 _WELL_SPACED_CANDIDATE_FACTOR = 12
-_FAST_TRIANGLE_WEIGHT_COUNT_LIMIT = 16
+
+
+def _tensor_int_list(values: torch.Tensor) -> list[int]:
+    """Copy integer-like tensor values to the host with one synchronization."""
+
+    if values.numel() == 0:
+        return []
+    return [
+        int(value)
+        for value in values.detach().to(device="cpu", dtype=torch.long).tolist()
+    ]
 
 
 def _effective_pair_budget(device: torch.device, pair_budget: int = _DEFAULT_PAIR_BUDGET) -> int:
@@ -790,7 +800,10 @@ def _sample_pair_blocks(
     pair_rows = pair_rows[exterior]
     first_weights = first_weights[exterior]
     second_weights = second_weights[exterior]
-    support_weights = torch.stack((first_weights, second_weights), dim=-1)
+    support_weights = torch.stack(
+        (first_weights.detach(), second_weights.detach()),
+        dim=-1,
+    )
     support_weights = support_weights / support_weights.sum(
         dim=-1,
         keepdim=True,
@@ -1289,8 +1302,7 @@ def _packed_fibonacci_directions(
 
     directions = []
     cached_by_count: dict[int, torch.Tensor] = {}
-    for count_tensor in counts:
-        count = int(count_tensor.item())
+    for count in _tensor_int_list(counts):
         if count <= 0:
             continue
         cached = cached_by_count.get(count)
@@ -1428,11 +1440,12 @@ def _candidate_pair_indices_grid(context: ExteriorContext) -> Optional[torch.Ten
             positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
         ]
         valid = has_atom & (second_indices > first_indices.view(-1, 1, 1))
-        if not bool(valid.any().item()):
+        valid_rows, valid_cells, valid_slots = valid.nonzero(as_tuple=True)
+        if valid_rows.numel() == 0:
             continue
 
-        first_valid = first_indices.view(-1, 1, 1).expand_as(second_indices)[valid]
-        second_valid = second_indices[valid]
+        first_valid = first_indices[valid_rows]
+        second_valid = second_indices[valid_rows, valid_cells, valid_slots]
         diffs = context.atom_coords[first_valid] - context.atom_coords[second_valid]
         dist_sq = diffs.square().sum(dim=-1)
         first_radii = context.expanded_radii[first_valid]
@@ -1627,8 +1640,7 @@ def _packed_pair_parameters(
         device=device,
     )
     grouped_rows: dict[int, list[int]] = {}
-    for row, count_tensor in enumerate(counts):
-        count = int(count_tensor.item())
+    for row, count in enumerate(_tensor_int_list(counts)):
         if count > 0:
             grouped_rows.setdefault(count, []).append(row)
 
@@ -1995,8 +2007,30 @@ def _probe_center_supports(
     too many, the closest non-seed supports are kept.
     """
 
-    support_rows = []
-    mask_rows = []
+    if centers.shape[0] == 0:
+        return (
+            torch.empty((0, max_support_atoms), dtype=torch.long, device=centers.device),
+            torch.empty((0, max_support_atoms), dtype=torch.bool, device=centers.device),
+        )
+    if atom_coords.shape[0] == 0:
+        return (
+            torch.full(
+                (centers.shape[0], max_support_atoms),
+                -1,
+                dtype=torch.long,
+                device=centers.device,
+            ),
+            torch.zeros(
+                (centers.shape[0], max_support_atoms),
+                dtype=torch.bool,
+                device=centers.device,
+            ),
+        )
+
+    support_chunks = []
+    mask_chunks = []
+    seed_width = min(int(seeds.shape[1]), int(max_support_atoms))
+    extra_capacity = max(0, int(max_support_atoms) - seed_width)
     center_chunks = max(
         1,
         min(
@@ -2012,40 +2046,65 @@ def _probe_center_supports(
         )
         residuals = torch.abs(dists - expanded_radii.unsqueeze(0))
         near = residuals <= tolerance
-        for local_row in range(stop - start):
-            row = start + local_row
-            touched = near[local_row].nonzero(as_tuple=False).reshape(-1)
-            seed = seeds[row]
-            merged = torch.unique(torch.cat((seed, touched))).to(torch.long)
-            if merged.numel() > max_support_atoms:
-                seed_member = (merged.unsqueeze(-1) == seed.unsqueeze(0)).any(dim=-1)
-                nonseed_indices = merged[~seed_member]
-                keep_count = max(0, max_support_atoms - int(seed.numel()))
-                if nonseed_indices.numel() > 0 and keep_count > 0:
-                    nonseed_residuals = residuals[local_row, nonseed_indices]
-                    order = torch.argsort(nonseed_residuals)
-                    keep_nonseed = nonseed_indices[order[:keep_count]]
-                    merged = torch.unique(torch.cat((seed, keep_nonseed))).to(torch.long)
-                else:
-                    merged = torch.unique(seed).to(torch.long)
-            padded = torch.full(
-                (max_support_atoms,),
-                -1,
-                dtype=torch.long,
-                device=centers.device,
-            )
-            mask = torch.zeros((max_support_atoms,), dtype=torch.bool, device=centers.device)
-            count = min(max_support_atoms, int(merged.numel()))
-            padded[:count] = merged[:count]
-            mask[:count] = True
-            support_rows.append(padded)
-            mask_rows.append(mask)
-    if not support_rows:
-        return (
-            torch.empty((0, max_support_atoms), dtype=torch.long, device=centers.device),
-            torch.empty((0, max_support_atoms), dtype=torch.bool, device=centers.device),
+        row_count = stop - start
+        support = torch.full(
+            (row_count, max_support_atoms),
+            -1,
+            dtype=torch.long,
+            device=centers.device,
         )
-    return torch.stack(support_rows, dim=0), torch.stack(mask_rows, dim=0)
+        mask = torch.zeros(
+            (row_count, max_support_atoms),
+            dtype=torch.bool,
+            device=centers.device,
+        )
+
+        seed_chunk = seeds[start:stop].to(device=centers.device, dtype=torch.long)
+        if seed_width > 0:
+            selected_seeds = seed_chunk[:, :seed_width]
+            seed_valid = (selected_seeds >= 0) & (selected_seeds < atom_coords.shape[0])
+            support[:, :seed_width] = torch.where(
+                seed_valid,
+                selected_seeds,
+                torch.full_like(selected_seeds, -1),
+            )
+            mask[:, :seed_width] = seed_valid
+        else:
+            seed_valid = torch.empty((row_count, 0), dtype=torch.bool, device=centers.device)
+
+        seed_membership = torch.zeros(
+            (row_count, atom_coords.shape[0]),
+            dtype=torch.bool,
+            device=centers.device,
+        )
+        safe_seed_chunk = seed_chunk.clamp(0, max(atom_coords.shape[0] - 1, 0))
+        valid_seed_chunk = (seed_chunk >= 0) & (seed_chunk < atom_coords.shape[0])
+        seed_membership.scatter_(1, safe_seed_chunk, valid_seed_chunk)
+
+        if extra_capacity > 0:
+            extra_scores = torch.where(
+                near & ~seed_membership,
+                residuals,
+                torch.full((), float("inf"), dtype=residuals.dtype, device=residuals.device),
+            )
+            extra_count = min(extra_capacity, atom_coords.shape[0])
+            extra_values, extra_indices = torch.topk(
+                extra_scores,
+                k=extra_count,
+                dim=-1,
+                largest=False,
+            )
+            extra_mask = torch.isfinite(extra_values)
+            support[:, seed_width : seed_width + extra_count] = torch.where(
+                extra_mask,
+                extra_indices,
+                torch.full_like(extra_indices, -1),
+            )
+            mask[:, seed_width : seed_width + extra_count] = extra_mask
+
+        support_chunks.append(support)
+        mask_chunks.append(mask)
+    return torch.cat(support_chunks, dim=0), torch.cat(mask_chunks, dim=0)
 
 
 def _empty_probe_blocks(device: torch.device, max_support_atoms: int) -> _ProbeBlocks:
@@ -2223,11 +2282,11 @@ def _packed_simplex_weights(
     max_support = int(support_mask.shape[1])
     row_chunks = []
     weight_chunks = []
-    for row, count_tensor in enumerate(counts):
-        count = int(count_tensor.item())
+    support_counts = _tensor_int_list(support_mask.sum(dim=-1))
+    for row, count in enumerate(_tensor_int_list(counts)):
         if count <= 0:
             continue
-        support_count = int(support_mask[row].sum().item())
+        support_count = support_counts[row]
         weights = _simplex_weight_rows(count, support_count, max_support, dtype, device)
         row_chunks.append(
             torch.full((weights.shape[0],), row, dtype=torch.long, device=device),
@@ -2274,17 +2333,15 @@ def _packed_probe_patch_weights(
     row_chunks = []
     weight_chunks = []
     support_counts = support_mask.sum(dim=-1)
-    fast_triangle_mask = (
-        (support_counts == 3)
-        & (counts > 0)
-        & (counts <= _FAST_TRIANGLE_WEIGHT_COUNT_LIMIT)
-    )
+    fast_triangle_mask = (support_counts == 3) & (counts > 0)
     fast_rows = fast_triangle_mask.nonzero(as_tuple=False).reshape(-1)
     if fast_rows.numel() > 0:
-        fast_counts = counts[fast_rows]
-        for count_tensor in torch.unique(fast_counts):
-            count = int(count_tensor.item())
-            rows = fast_rows[fast_counts == count]
+        grouped_rows: dict[int, list[int]] = {}
+        counts_cpu = _tensor_int_list(counts)
+        for row in _tensor_int_list(fast_rows):
+            grouped_rows.setdefault(counts_cpu[row], []).append(row)
+        for count, rows_for_count in grouped_rows.items():
+            rows = torch.as_tensor(rows_for_count, dtype=torch.long, device=device)
             support_slots = support_mask[rows].nonzero(as_tuple=False)[:, 1].reshape(-1, 3)
             local_weights = _triangle_weight_rows(count, 3, dtype, device)[:, :3]
             if count >= 12:
@@ -2305,10 +2362,9 @@ def _packed_probe_patch_weights(
             weight_chunks.append(packed_weights.reshape(-1, max_support))
 
     slow_rows = ((~fast_triangle_mask) & (counts > 0)).nonzero(as_tuple=False).reshape(-1)
-    for row_tensor in slow_rows:
-        row = int(row_tensor.item())
-        count_tensor = counts[row]
-        count = int(count_tensor.item())
+    counts_cpu = _tensor_int_list(counts)
+    for row in _tensor_int_list(slow_rows):
+        count = counts_cpu[row]
         support_slots = support_mask[row].nonzero(as_tuple=False).reshape(-1)
         support_count = int(support_slots.numel())
         if support_count < 3:
@@ -2379,21 +2435,9 @@ def _polygon_probe_patch_weights(
     elif support_count == 4:
         sample_count = max(sample_count, 2 * boundary_count)
 
-    polygon_weights = _rejection_spherical_polygon_weight_rows(
-        sample_count,
-        ordered_normals,
-        ordered_slots,
-        anchor,
-        anchor_weights,
-        max_support,
-        dtype,
-        device,
-    )
-    if polygon_weights.shape[0] >= sample_count:
-        return polygon_weights[:sample_count]
-
-    # Fallback: triangulate the polygon fan from the anchor and sample each
-    # spherical triangle in proportion to its solid angle.
+    # Triangulate the polygon fan from the anchor and sample each triangle in
+    # proportion to its solid angle.  This avoids the rejection sampler's many
+    # small host/device synchronizations in large GPU benchmark molecules.
     sub_areas = []
     for index in range(boundary_count):
         sub_areas.append(
@@ -2407,24 +2451,33 @@ def _polygon_probe_patch_weights(
     sub_counts = _allocate_counts_by_weights(sample_count, sub_areas_tensor)
 
     polygon_weights = []
-    for index, sub_count_tensor in enumerate(sub_counts):
-        sub_count = int(sub_count_tensor.item())
+    central_count = max(8, min(sample_count, sample_count // 8 + support_count))
+    central_local_weights = _simplex_weight_rows(
+        central_count,
+        support_count,
+        support_count,
+        dtype,
+        device,
+    )
+    central_weights = torch.zeros(
+        (central_local_weights.shape[0], max_support),
+        dtype=dtype,
+        device=device,
+    )
+    central_weights[:, support_slots] = central_local_weights
+    polygon_weights.append(central_weights)
+
+    for index, sub_count in enumerate(_tensor_int_list(sub_counts)):
         if sub_count <= 0:
             continue
-        triangle_normals = torch.stack(
-            (
-                anchor,
-                ordered_normals[index],
-                ordered_normals[(index + 1) % boundary_count],
-            ),
-            dim=0,
-        )
-        triangle_weights = _spherical_triangle_weight_rows(
+        triangle_weights = _triangle_weight_rows(
             sub_count,
-            triangle_normals,
+            3,
             dtype,
             device,
-        )
+        )[:, :3]
+        if sub_count >= 12:
+            triangle_weights = triangle_weights[:sub_count]
         weights = triangle_weights[:, 0:1] * anchor_weights.unsqueeze(0)
         weights[:, ordered_slots[index]] = (
             weights[:, ordered_slots[index]] + triangle_weights[:, 1]
@@ -3065,9 +3118,14 @@ def _dense_atom_weights(
     if support_indices.numel() == 0 or num_atoms == 0:
         return dense
     safe_indices = support_indices.clamp_min(0)
-    weighted = torch.where(support_mask, support_weights, torch.zeros_like(support_weights))
-    dense.scatter_add_(1, safe_indices, weighted)
-    return dense
+    with torch.no_grad():
+        weighted = torch.where(
+            support_mask,
+            support_weights.detach(),
+            torch.zeros_like(support_weights),
+        )
+        dense.scatter_add_(1, safe_indices, weighted)
+        return dense
 
 
 def _dense_atom_features(

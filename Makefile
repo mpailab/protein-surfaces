@@ -1,4 +1,4 @@
-.PHONY: setup run lint test verify
+.PHONY: setup run lint test verify benchmark-gpu
 
 setup:
 	bash .devcontainer/post-create.sh
@@ -10,3 +10,6 @@ test:
 	pytest -q
 
 verify: lint test
+
+benchmark-gpu:
+	bash scripts/run_gpu_benchmarks.sh

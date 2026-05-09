@@ -46,6 +46,7 @@ _DEFAULT_ATOM_DENSITY_SCALE = 1.55
 _DEFAULT_PAIR_DENSITY_SCALE = 1.55
 _DEFAULT_PROBE_DENSITY_SCALE = 1.55
 _DEFAULT_PAIRWISE_ELEMENT_BUDGET = 8_000_000
+_DEFAULT_GPU_PAIRWISE_ELEMENT_BUDGET = 64_000_000
 _DEFAULT_MAX_GRID_POINTS = 500_000
 _DEFAULT_MAX_PROBE_TRIPLES = 5_000_000
 _AUTO_TILE_ATOM_THRESHOLD = 2_000
@@ -72,6 +73,15 @@ def _validate_scale(name: str, value: float, *, allow_zero: bool = False) -> flo
     elif scale <= 0:
         raise ValueError(f"{name} must be positive")
     return scale
+
+
+def _effective_pairwise_element_budget(
+    device: torch.device,
+    pairwise_element_budget: int,
+) -> int:
+    if torch.device(device).type == "cuda":
+        return max(int(pairwise_element_budget), _DEFAULT_GPU_PAIRWISE_ELEMENT_BUDGET)
+    return int(pairwise_element_budget)
 
 
 def _build_tile_grid(
@@ -297,7 +307,10 @@ def _sample_pair_candidates(
     )
     normals = (probe_centers - points) / float(probe_radius) if include_normals else None
     selected_pairs = local_indices[selected_local_pairs]
-    support_weights = torch.stack((first_weights, second_weights), dim=-1)
+    support_weights = torch.stack(
+        (first_weights.detach(), second_weights.detach()),
+        dim=-1,
+    )
     support_weights = support_weights / support_weights.sum(
         dim=-1,
         keepdim=True,
@@ -415,7 +428,11 @@ def _points_outside_atoms(
     if grid_mask is not None:
         return grid_mask
 
-    rows = max(1, min(points.shape[0], int(pairwise_element_budget) // atom_coords.shape[0]))
+    effective_pairwise_budget = _effective_pairwise_element_budget(
+        points.device,
+        pairwise_element_budget,
+    )
+    rows = max(1, min(points.shape[0], effective_pairwise_budget // atom_coords.shape[0]))
     masks = []
     radii_sq = atom_radii.square().unsqueeze(0)
     for start in range(0, points.shape[0], rows):
@@ -463,7 +480,11 @@ def _points_outside_atoms_grid(
     outside = torch.ones(points.shape[0], dtype=torch.bool, device=points.device)
     rows_per_block = max(
         1,
-        min(points.shape[0], int(pairwise_element_budget) // max(1, query_slots)),
+        min(
+            points.shape[0],
+            _effective_pairwise_element_budget(points.device, pairwise_element_budget)
+            // max(1, query_slots),
+        ),
     )
     slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=points.device)
     radii_sq = atom_radii.square()
@@ -484,24 +505,21 @@ def _points_outside_atoms_grid(
 
         positions = starts_in_table.unsqueeze(-1) + slot_offsets.view(1, 1, -1)
         has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
-        if not bool(has_atom.any().item()):
-            continue
-
         point_rows, cell_rows, slot_rows = has_atom.nonzero(as_tuple=True)
-        atom_indices = table.sorted_atom_indices[
-            positions[point_rows, cell_rows, slot_rows]
-        ]
-        sq_dists = (
-            block_points[point_rows] - atom_coords[atom_indices]
-        ).square().sum(dim=-1)
-        local_radii_sq = radii_sq[atom_indices]
-        tol = (
-            256
-            * torch.finfo(points.dtype).eps
-            * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
-        )
-        blocked = sq_dists < local_radii_sq - tol
-        if bool(blocked.any().item()):
+        if point_rows.numel() > 0:
+            atom_indices = table.sorted_atom_indices[
+                positions[point_rows, cell_rows, slot_rows]
+            ]
+            sq_dists = (
+                block_points[point_rows] - atom_coords[atom_indices]
+            ).square().sum(dim=-1)
+            local_radii_sq = radii_sq[atom_indices]
+            tol = (
+                256
+                * torch.finfo(points.dtype).eps
+                * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
+            )
+            blocked = sq_dists < local_radii_sq - tol
             block_outside = outside[start:stop]
             block_outside[point_rows[blocked]] = False
             outside[start:stop] = block_outside
@@ -566,13 +584,10 @@ def _filter_samples(
     with torch.no_grad():
         finite = torch.isfinite(samples.points).all(dim=-1) & torch.isfinite(probe_centers).all(dim=-1)
         valid = finite.clone()
-        if bool(valid.any().item()):
-            needs_center_filter = valid
-            if trust_probe_blocks:
-                needs_center_filter = needs_center_filter & (samples.block_types != PROBE_BLOCK_TYPE)
-            candidate_indices = needs_center_filter.nonzero(as_tuple=False).reshape(-1)
-        else:
-            candidate_indices = torch.empty((0,), dtype=torch.long, device=samples.points.device)
+        needs_center_filter = valid
+        if trust_probe_blocks:
+            needs_center_filter = needs_center_filter & (samples.block_types != PROBE_BLOCK_TYPE)
+        candidate_indices = needs_center_filter.nonzero(as_tuple=False).reshape(-1)
         if candidate_indices.numel() > 0:
             feasible = _centers_feasible_against_all_atoms(
                 probe_centers[candidate_indices],
@@ -581,23 +596,21 @@ def _filter_samples(
             )
             valid[candidate_indices] = feasible
 
-        if check_points_outside_atoms and bool(valid.any().item()):
+        if check_points_outside_atoms:
             candidate_indices = valid.nonzero(as_tuple=False).reshape(-1)
-            outside = _points_outside_atoms(
-                samples.points[candidate_indices],
-                atom_coords,
-                atom_radii,
-                pairwise_element_budget=pairwise_element_budget,
-            )
-            valid[candidate_indices] = outside
+            if candidate_indices.numel() > 0:
+                outside = _points_outside_atoms(
+                    samples.points[candidate_indices],
+                    atom_coords,
+                    atom_radii,
+                    pairwise_element_budget=pairwise_element_budget,
+                )
+                valid[candidate_indices] = outside
 
-        if bool(valid.any().item()):
-            needs_accessibility = valid
-            if trust_probe_blocks:
-                needs_accessibility = needs_accessibility & (samples.block_types != PROBE_BLOCK_TYPE)
-            candidate_indices = needs_accessibility.nonzero(as_tuple=False).reshape(-1)
-        else:
-            candidate_indices = torch.empty((0,), dtype=torch.long, device=samples.points.device)
+        needs_accessibility = valid
+        if trust_probe_blocks:
+            needs_accessibility = needs_accessibility & (samples.block_types != PROBE_BLOCK_TYPE)
+        candidate_indices = needs_accessibility.nonzero(as_tuple=False).reshape(-1)
         if candidate_indices.numel() > 0:
             if exact_accessibility:
                 accessible = _probe_centers_accessible_from_exterior(
@@ -764,6 +777,10 @@ def _sample_tiled_analytic_samples(
         grid_spacing=grid_spacing,
         max_grid_points=max_grid_points,
     )
+    pairwise_element_budget = _effective_pairwise_element_budget(
+        context.device,
+        int(pairwise_element_budget),
+    )
     if context.num_atoms == 0:
         empty = _empty_samples(context, max_support=3)
         if not include_atom_weights:
@@ -779,19 +796,20 @@ def _sample_tiled_analytic_samples(
         tile_overlap,
     )
 
-    grid = _build_tile_grid(
-        context.atom_coords,
-        context.atom_radii,
-        context.probe_radius,
-        tile_size=resolved_tile_size,
-        tile_overlap=resolved_tile_overlap,
-    )
-    atom_tile_mask = _tile_atom_intersection_mask(
-        context.atom_coords,
-        context.atom_radii,
-        context.probe_radius,
-        grid,
-    )
+    with torch.no_grad():
+        grid = _build_tile_grid(
+            context.atom_coords.detach(),
+            context.atom_radii.detach(),
+            context.probe_radius,
+            tile_size=resolved_tile_size,
+            tile_overlap=resolved_tile_overlap,
+        )
+        atom_tile_mask = _tile_atom_intersection_mask(
+            context.atom_coords.detach(),
+            context.atom_radii.detach(),
+            context.probe_radius,
+            grid,
+        )
 
     atom_indices = torch.arange(context.num_atoms, dtype=torch.long, device=context.device)
     contact = _sample_contact_candidates(

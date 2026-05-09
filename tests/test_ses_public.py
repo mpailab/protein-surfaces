@@ -778,6 +778,70 @@ def test_tiled_analytic_sampler_preserves_gradients_to_atom_inputs() -> None:
     _assert_points_backprop_to_atom_inputs(points, coords, radii)
 
 
+def test_public_feature_outputs_preserve_point_gradients_to_atom_inputs() -> None:
+    sampler_cases = [
+        (
+            _two_separated_atoms,
+            lambda coords, radii: sample_projected_points(
+                coords,
+                radii,
+                m=8,
+                probe_radius=0.8,
+                include_atom_features=True,
+            ),
+        ),
+        (
+            _three_atom_cavity,
+            lambda coords, radii: sample_analytic_points(
+                coords,
+                radii,
+                1.4,
+                point_area=6.0,
+                atom_filter_samples=16,
+                pair_filter_samples=6,
+                include_atom_features=True,
+                max_grid_points=100_000,
+            ),
+        ),
+        (
+            _two_separated_atoms,
+            lambda coords, radii: sample_sdf_points(
+                coords,
+                radii,
+                m=8,
+                probe_radius=0.8,
+                smoothness=0.05,
+                level_tolerance=1e-6,
+                include_atom_features=True,
+                max_grid_points=100_000,
+            ),
+        ),
+        (
+            _three_atom_cavity,
+            lambda coords, radii: sample_tiled_analytic_points(
+                coords,
+                radii,
+                1.4,
+                point_area=4.0,
+                tile_size=4.0,
+                tile_overlap=2.0,
+                include_atom_features=True,
+                max_grid_points=100_000,
+            ),
+        ),
+    ]
+
+    for molecule_factory, sampler in sampler_cases:
+        coords, radii = molecule_factory()
+        coords.requires_grad_(True)
+        radii.requires_grad_(True)
+        points, atom_features = sampler(coords, radii)
+
+        assert atom_features.shape == (points.shape[0], coords.shape[0])
+        assert not atom_features.requires_grad
+        _assert_points_backprop_to_atom_inputs(points, coords, radii)
+
+
 def test_public_samplers_return_empty_feature_matrices_for_empty_atoms() -> None:
     coords = torch.empty((0, 3), dtype=torch.float64)
     radii = torch.empty((0,), dtype=torch.float64)
