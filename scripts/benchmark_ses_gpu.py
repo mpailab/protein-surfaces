@@ -44,31 +44,60 @@ import ses.sdf as ses_sdf  # noqa: E402
 import ses.tiled_analytic as ses_tiled_analytic  # noqa: E402
 
 
-SCHEMA_VERSION = 1
-PROGRAM_VERSION = "0.0.1"
-BENCHMARK_DRIVER_VERSION = "0.0.1"
+SCHEMA_VERSION = 2
+PROGRAM_VERSION = "0.0.2"
+BENCHMARK_DRIVER_VERSION = "0.0.2"
 METHOD_ORDER = ("analytic", "projected", "sdf", "tiled_analytic")
+INTERFACE_MODE_ORDER = ("points", "normals", "adjacency", "normals_adjacency")
 MB = 1024 * 1024
 TILED_NUMERIC_TILE_SIZE_DEFAULT_OVERLAP = 4.0
+POINT_AREA_DEFAULT = 0.5
+ANALYTIC_OVERSAMPLE_FACTOR_DEFAULT = 1.0
+PROJECTED_M_DEFAULT = 192
+SDF_M_DEFAULT = 26
+TILED_DENSITY_SCALE_DEFAULT = 1.55
 _ACTIVE_SECTION_PROFILER: Optional["SectionProfiler"] = None
 _INSTALLED_PROFILE_WRAPPERS: List[Tuple[Any, str, Any]] = []
 _PROFILE_MODULES = (ses_projection, ses_analytic, ses_sdf, ses_tiled_analytic)
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
+    if tensor.layout == torch.sparse_coo:
+        return _sparse_tensor_storage_nbytes(tensor)
     return int(tensor.numel() * tensor.element_size())
 
 
+def _sparse_tensor_storage_nbytes(tensor: torch.Tensor) -> int:
+    indices = tensor._indices()
+    values = tensor._values()
+    return int(indices.numel() * indices.element_size() + values.numel() * values.element_size())
+
+
 def _tensor_meta(tensor: torch.Tensor) -> Dict[str, Any]:
-    return {
+    meta = {
         "kind": "tensor",
         "shape": list(tensor.shape),
         "dtype": str(tensor.dtype).replace("torch.", ""),
         "device": str(tensor.device),
+        "layout": str(tensor.layout).replace("torch.", ""),
         "numel": int(tensor.numel()),
         "bytes": _tensor_nbytes(tensor),
         "requires_grad": bool(tensor.requires_grad),
     }
+    if tensor.layout == torch.sparse_coo:
+        indices = tensor._indices()
+        values = tensor._values()
+        meta.update(
+            {
+                "nnz": int(values.numel()),
+                "is_coalesced": bool(tensor.is_coalesced()),
+                "indices_shape": list(indices.shape),
+                "values_shape": list(values.shape),
+                "indices_bytes": int(indices.numel() * indices.element_size()),
+                "values_bytes": int(values.numel() * values.element_size()),
+            }
+        )
+    return meta
 
 
 def _summarize_object(
@@ -304,6 +333,8 @@ class SectionProfiler:
                 "cuda_event_ms_total": 0.0,
                 "cuda_event_ms_max": 0.0,
                 "cuda_event_calls": 0,
+                "max_input_tensor_count": 0,
+                "max_output_tensor_count": 0,
                 "max_input_tensor_bytes": 0,
                 "max_output_tensor_bytes": 0,
                 "max_input_tensor": None,
@@ -324,6 +355,16 @@ class SectionProfiler:
 
         input_bytes = int(input_stats.get("tensor_bytes", 0))
         output_bytes = int(output_stats.get("tensor_bytes", 0))
+        input_count = int(input_stats.get("tensor_count", 0))
+        output_count = int(output_stats.get("tensor_count", 0))
+        stats["max_input_tensor_count"] = max(
+            stats["max_input_tensor_count"],
+            input_count,
+        )
+        stats["max_output_tensor_count"] = max(
+            stats["max_output_tensor_count"],
+            output_count,
+        )
         if input_bytes > stats["max_input_tensor_bytes"]:
             stats["max_input_tensor_bytes"] = input_bytes
             stats["max_input_tensor"] = input_stats.get("max_tensor")
@@ -339,6 +380,8 @@ class SectionProfiler:
             "depth": depth,
             "wall_seconds": wall_seconds,
             "cuda_event_ms": cuda_event_ms,
+            "input_tensor_count": input_count,
+            "output_tensor_count": output_count,
             "input_tensor_bytes": input_bytes,
             "output_tensor_bytes": output_bytes,
             "max_input_tensor": input_stats.get("max_tensor"),
@@ -431,6 +474,38 @@ def _parse_methods(value: str) -> List[str]:
     if not methods:
         raise argparse.ArgumentTypeError("at least one method is required")
     return methods
+
+
+def _parse_interface_modes(value: str) -> List[str]:
+    normalized = value.strip().lower()
+    if normalized == "all":
+        return list(INTERFACE_MODE_ORDER)
+    aliases = {
+        "points_only": "points",
+        "normal": "normals",
+        "normals_only": "normals",
+        "graph": "adjacency",
+        "edges": "adjacency",
+        "adjacency_only": "adjacency",
+        "all_outputs": "normals_adjacency",
+        "normals+adjacency": "normals_adjacency",
+        "normals,adjacency": "normals_adjacency",
+    }
+    modes: List[str] = []
+    for item in value.split(","):
+        mode = aliases.get(item.strip().lower(), item.strip().lower())
+        if not mode:
+            continue
+        if mode not in INTERFACE_MODE_ORDER:
+            allowed = ", ".join(INTERFACE_MODE_ORDER)
+            raise argparse.ArgumentTypeError(
+                f"unknown interface mode {mode!r}; expected one of: {allowed}, all"
+            )
+        if mode not in modes:
+            modes.append(mode)
+    if not modes:
+        raise argparse.ArgumentTypeError("at least one interface mode is required")
+    return modes
 
 
 def _parse_csv_values(value: Optional[str], caster: Any) -> Optional[List[Any]]:
@@ -641,7 +716,11 @@ def _method_params(
         }
     elif method == "tiled_analytic":
         params = {
-            "point_area": args.tiled_point_area or args.point_area,
+            "point_area": (
+                args.tiled_point_area
+                if args.tiled_point_area is not None
+                else args.point_area
+            ),
             "tile_size": args.tile_size,
             "tile_overlap": args.tile_overlap,
             "atom_density_scale": args.tiled_atom_density_scale,
@@ -667,10 +746,31 @@ def _method_params(
     return params
 
 
+def _interface_params(args: argparse.Namespace, mode: str) -> Dict[str, Any]:
+    include_normals = mode in {"normals", "normals_adjacency"}
+    include_adjacency = mode in {"adjacency", "normals_adjacency"}
+    params: Dict[str, Any] = {
+        "mode": mode,
+        "include_normals": include_normals,
+        "include_adjacency": include_adjacency,
+    }
+    if include_adjacency:
+        params.update(
+            {
+                "adjacency_weight": args.adjacency_weight,
+                "adjacency_neighbors": args.adjacency_neighbors,
+                "adjacency_candidate_neighbors": args.adjacency_candidate_neighbors,
+                "adjacency_prune_redundant": args.adjacency_prune_redundant,
+            }
+        )
+    return params
+
+
 def _common_hash_payload(
     args: argparse.Namespace,
     method: str,
     method_params: Dict[str, Any],
+    interface_params: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -685,6 +785,7 @@ def _common_hash_payload(
             "unknown_elements": args.unknown_elements,
         },
         "method_params": method_params,
+        "interface_params": interface_params,
     }
 
 
@@ -702,7 +803,11 @@ def _dedupe_variants(variants: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     seen = set()
     deduped = []
     for variant in variants:
-        key = (variant["method"], json.dumps(variant["method_params"], sort_keys=True))
+        key = (
+            variant["method"],
+            json.dumps(variant["method_params"], sort_keys=True),
+            json.dumps(variant["interface_params"], sort_keys=True),
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -768,7 +873,7 @@ def _preset_values(method: str, base: Dict[str, Any], preset: str) -> Dict[str, 
     if method == "analytic":
         focused = {
             "point_area": [0.25, base["point_area"], 1.0],
-            "oversample_factor": [1.0, base["oversample_factor"], 1.5],
+            "oversample_factor": [base["oversample_factor"], 1.25, 1.5],
             "atom_filter_samples": [32, base["atom_filter_samples"], 128],
             "pair_filter_samples": [8, base["pair_filter_samples"], 24],
         }
@@ -779,16 +884,16 @@ def _preset_values(method: str, base: Dict[str, Any], preset: str) -> Dict[str, 
             "pair_filter_samples": [8, 12, 24],
         }
     elif method == "projected":
-        focused = {"m": [96, 160, base["m"], 320]}
-        broad = {"m": [64, 96, 128, 160, 230, 320, 448]}
+        focused = {"m": [96, 160, base["m"], 230, 320]}
+        broad = {"m": [64, 96, 128, 160, 192, 230, 320, 448]}
     elif method == "sdf":
         focused = {
-            "m": [16, base["m"], 64],
+            "m": [16, base["m"], 34, 64],
             "smoothness": [0.15, base["smoothness"], 0.3],
             "iterations": [4, base["iterations"], 8],
         }
         broad = {
-            "m": [12, 16, 24, 34, 48, 64],
+            "m": [12, 16, 24, 26, 34, 48, 64],
             "smoothness": [0.1, 0.15, 0.2, 0.3, 0.45],
             "iterations": [3, 4, 6, 8],
         }
@@ -796,16 +901,16 @@ def _preset_values(method: str, base: Dict[str, Any], preset: str) -> Dict[str, 
         focused = {
             "tile_size": ["auto", 24.0, 48.0, 64.0],
             "tile_overlap": ["auto", 3.0, 4.0, 6.0],
-            "atom_density_scale": [4.0, base["atom_density_scale"], 10.0],
-            "pair_density_scale": [0.0, 0.75, 1.55],
-            "probe_density_scale": [0.0, 0.75, 1.55],
+            "atom_density_scale": [1.0, base["atom_density_scale"], 4.0, 7.0],
+            "pair_density_scale": [0.0, 0.75, base["pair_density_scale"]],
+            "probe_density_scale": [0.0, 0.75, base["probe_density_scale"]],
         }
         broad = {
             "tile_size": ["auto", 24.0, 32.0, 48.0, 64.0],
             "tile_overlap": ["auto", 3.0, 4.0, 6.0],
-            "atom_density_scale": [3.5, 5.0, 7.0, 9.0, 12.0],
-            "pair_density_scale": [0.0, 0.75, 1.55],
-            "probe_density_scale": [0.0, 0.75, 1.55],
+            "atom_density_scale": [1.0, 1.55, 3.0, 5.0, 7.0],
+            "pair_density_scale": [0.0, 0.75, 1.55, 2.0],
+            "probe_density_scale": [0.0, 0.75, 1.55, 2.0],
         }
     else:
         raise ValueError(f"unknown method: {method}")
@@ -839,29 +944,57 @@ def _build_variants(
     methods: Sequence[str],
 ) -> List[Dict[str, Any]]:
     variants: List[Dict[str, Any]] = []
+    interface_modes = (
+        args.interfaces
+        if isinstance(args.interfaces, list)
+        else _parse_interface_modes(args.interfaces)
+    )
     for method in methods:
         default_params = _method_params(args, method)
-        method_variants = [
+        method_param_variants = [
             {
                 "method": method,
-                "variant_name": "default",
+                "method_variant_name": "default",
                 "overrides": {},
                 "method_params": default_params,
             }
         ]
         for overrides in _sweep_overrides(args, method, default_params):
             params = _method_params(args, method, overrides)
-            method_variants.append(
+            method_param_variants.append(
                 {
                     "method": method,
-                    "variant_name": _variant_name(overrides),
+                    "method_variant_name": _variant_name(overrides),
                     "overrides": overrides,
                     "method_params": params,
                 }
             )
-        for variant in _dedupe_variants(method_variants):
+        interface_variants: List[Dict[str, Any]] = []
+        for method_variant in method_param_variants:
+            for interface_mode in interface_modes:
+                interface_params = _interface_params(args, interface_mode)
+                method_variant_name = method_variant["method_variant_name"]
+                variant_name = (
+                    method_variant_name
+                    if interface_mode == "points"
+                    else f"{method_variant_name}__interface={interface_mode}"
+                )
+                interface_variants.append(
+                    {
+                        **method_variant,
+                        "variant_name": variant_name,
+                        "interface_mode": interface_mode,
+                        "interface_params": interface_params,
+                    }
+                )
+        for variant in _dedupe_variants(interface_variants):
             variant["hash"] = _stable_hash(
-                _common_hash_payload(args, method, variant["method_params"])
+                _common_hash_payload(
+                    args,
+                    method,
+                    variant["method_params"],
+                    variant["interface_params"],
+                )
             )
             variants.append(variant)
     return variants
@@ -898,12 +1031,22 @@ def _all_parameters(
             "sample_size": args.reference_sample_size,
             "distance_budget": args.reference_distance_budget,
         },
+        "interfaces": {
+            "modes": args.interfaces,
+            "adjacency_weight": args.adjacency_weight,
+            "adjacency_neighbors": args.adjacency_neighbors,
+            "adjacency_candidate_neighbors": args.adjacency_candidate_neighbors,
+            "adjacency_prune_redundant": args.adjacency_prune_redundant,
+        },
         "variants": [
             {
                 "method": variant["method"],
                 "variant_name": variant["variant_name"],
+                "method_variant_name": variant.get("method_variant_name"),
+                "interface_mode": variant["interface_mode"],
                 "hash": variant["hash"],
                 "params": variant["method_params"],
+                "interface_params": variant["interface_params"],
             }
             for variant in variants
         ],
@@ -918,12 +1061,18 @@ def _all_parameters(
             "torch_profile_limit": args.torch_profile_limit,
             "torch_profile_every": args.torch_profile_every,
             "torch_profile_dir": args.torch_profile_dir,
+            "torch_profile_record_shapes": args.torch_profile_record_shapes,
+            "torch_profile_memory": args.torch_profile_memory,
+            "torch_profile_export_traces": args.torch_profile_export_traces,
         },
         "calibration_note": (
-            "Defaults follow the existing CPU calibration for point_area=0.5: "
-            "projected m=230, SDF m=34, and tiled analytic atom density scale=7 "
-            "with pair/probe tiled patches disabled for speed. Sweep presets and "
-            "*-values flags can vary these settings for throughput/quality tuning."
+            "Defaults are recalibrated from the 0.0.1 GPU focused sweep. "
+            "The tiled analytic benchmark default is point_area=0.5 with "
+            "atom/pair/probe density scales all set to 1.55. The other method "
+            "defaults target a similar median point density: analytic "
+            "oversample_factor=1.0, projected m=192, and SDF m=26. Sweep presets "
+            "and *-values flags can vary these settings for throughput/quality "
+            "tuning."
         ),
     }
 
@@ -1066,6 +1215,9 @@ def _base_result(
         "path": str(pdb_path),
         "method": method,
         "variant_name": variant["variant_name"],
+        "method_variant_name": variant.get("method_variant_name", variant["variant_name"]),
+        "interface_mode": variant["interface_mode"],
+        "interface_params": variant["interface_params"],
         "method_parameter_hash": variant["hash"],
         "method_params": variant["method_params"],
         "method_overrides": variant["overrides"],
@@ -1081,7 +1233,20 @@ def _call_method(
     radii: torch.Tensor,
     args: argparse.Namespace,
     method_params: Dict[str, Any],
-) -> torch.Tensor:
+    interface_params: Dict[str, Any],
+) -> Any:
+    adjacency_kwargs = {}
+    if interface_params["include_adjacency"]:
+        adjacency_kwargs = {
+            "adjacency_weight": interface_params["adjacency_weight"],
+            "adjacency_neighbors": interface_params["adjacency_neighbors"],
+            "adjacency_candidate_neighbors": interface_params[
+                "adjacency_candidate_neighbors"
+            ],
+            "adjacency_prune_redundant": interface_params[
+                "adjacency_prune_redundant"
+            ],
+        }
     if method == "analytic":
         return ses_analytic.sample_analytic_points(
             coords,
@@ -1091,6 +1256,9 @@ def _call_method(
             oversample_factor=method_params["oversample_factor"],
             probe_density_scale=method_params["probe_density_scale"],
             include_atom_features=False,
+            include_normals=interface_params["include_normals"],
+            include_adjacency=interface_params["include_adjacency"],
+            **adjacency_kwargs,
             atom_filter_samples=method_params["atom_filter_samples"],
             pair_filter_samples=method_params["pair_filter_samples"],
             max_probe_support_atoms=method_params["max_probe_support_atoms"],
@@ -1107,6 +1275,9 @@ def _call_method(
             method_params["m"],
             args.probe_radius,
             include_atom_features=False,
+            include_normals=interface_params["include_normals"],
+            include_adjacency=interface_params["include_adjacency"],
+            **adjacency_kwargs,
         )
     if method == "sdf":
         return ses_sdf.sample_sdf_points(
@@ -1120,6 +1291,9 @@ def _call_method(
             subsample_spacing=method_params["subsample_spacing"],
             feature_threshold=method_params["feature_threshold"],
             include_atom_features=False,
+            include_normals=interface_params["include_normals"],
+            include_adjacency=interface_params["include_adjacency"],
+            **adjacency_kwargs,
             grid_spacing=method_params["grid_spacing"],
             max_grid_points=method_params["max_grid_points"],
             pairwise_element_budget=method_params["pairwise_element_budget"],
@@ -1138,12 +1312,130 @@ def _call_method(
             dedup_tolerance=method_params["dedup_tolerance"],
             exact_accessibility=method_params["exact_accessibility"],
             include_atom_features=False,
+            include_normals=interface_params["include_normals"],
+            include_adjacency=interface_params["include_adjacency"],
+            **adjacency_kwargs,
             grid_spacing=method_params["grid_spacing"],
             max_grid_points=method_params["max_grid_points"],
             max_probe_triples=method_params["max_probe_triples"],
             pairwise_element_budget=method_params["pairwise_element_budget"],
         )
     raise ValueError(f"unknown method: {method}")
+
+
+def _split_sampler_output(
+    output: Any,
+    interface_params: Dict[str, Any],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if isinstance(output, torch.Tensor):
+        parts: List[torch.Tensor] = [output]
+    elif isinstance(output, tuple):
+        parts = list(output)
+    else:
+        raise TypeError(f"sampler returned unsupported output type: {type(output).__name__}")
+    if not parts or not isinstance(parts[0], torch.Tensor):
+        raise TypeError("sampler output must start with a points tensor")
+
+    points = parts[0]
+    extras = parts[1:]
+    normals = None
+    adjacency = None
+    if interface_params["include_normals"]:
+        if not extras or not isinstance(extras[0], torch.Tensor):
+            raise TypeError("sampler output is missing requested normals tensor")
+        normals = extras.pop(0)
+    if interface_params["include_adjacency"]:
+        if not extras or not isinstance(extras[0], torch.Tensor):
+            raise TypeError("sampler output is missing requested adjacency tensor")
+        adjacency = extras.pop(0)
+    if extras:
+        raise TypeError("sampler returned unexpected extra tensors")
+    return points, normals, adjacency
+
+
+def _sparse_output_stats(adjacency: torch.Tensor, point_count: int) -> Dict[str, Any]:
+    if adjacency.layout != torch.sparse_coo:
+        raise TypeError("adjacency output must be a sparse COO tensor")
+    sparse = adjacency if adjacency.is_coalesced() else adjacency.coalesce()
+    indices = sparse.indices()
+    values = sparse.values()
+    nnz = int(values.numel())
+    index_bytes = int(indices.numel() * indices.element_size())
+    value_bytes = int(values.numel() * values.element_size())
+    finite_values = bool(torch.isfinite(values).all().item()) if nnz else True
+    return {
+        "adjacency_present": True,
+        "adjacency_layout": str(adjacency.layout).replace("torch.", ""),
+        "adjacency_shape": list(adjacency.shape),
+        "adjacency_is_coalesced": bool(adjacency.is_coalesced()),
+        "adjacency_nnz": nnz,
+        "adjacency_density": (
+            float(nnz) / float(point_count * point_count) if point_count else None
+        ),
+        "adjacency_mean_degree": float(nnz) / float(point_count) if point_count else None,
+        "adjacency_index_bytes": index_bytes,
+        "adjacency_value_bytes": value_bytes,
+        "adjacency_tensor_bytes": index_bytes + value_bytes,
+        "finite_adjacency_values": finite_values,
+    }
+
+
+def _output_stats(
+    points: torch.Tensor,
+    normals: Optional[torch.Tensor],
+    adjacency: Optional[torch.Tensor],
+) -> Dict[str, Any]:
+    point_count = int(points.shape[0])
+    stats: Dict[str, Any] = {
+        "output_tensor_count": 1,
+        "output_tensor_bytes": _tensor_nbytes(points),
+        "points_tensor_bytes": _tensor_nbytes(points),
+        "normals_present": normals is not None,
+        "normals_tensor_bytes": 0,
+        "finite_normals": None,
+        "normal_unit_mean_abs_error": None,
+        "normal_unit_max_abs_error": None,
+        "adjacency_present": adjacency is not None,
+        "adjacency_layout": None,
+        "adjacency_shape": None,
+        "adjacency_is_coalesced": None,
+        "adjacency_nnz": None,
+        "adjacency_density": None,
+        "adjacency_mean_degree": None,
+        "adjacency_index_bytes": None,
+        "adjacency_value_bytes": None,
+        "adjacency_tensor_bytes": 0,
+        "finite_adjacency_values": None,
+    }
+    if normals is not None:
+        normal_lengths = torch.linalg.norm(normals, dim=-1) if normals.numel() else None
+        normal_errors = (
+            (normal_lengths - 1).abs()
+            if normal_lengths is not None and normal_lengths.numel()
+            else None
+        )
+        stats.update(
+            {
+                "output_tensor_count": stats["output_tensor_count"] + 1,
+                "normals_tensor_bytes": _tensor_nbytes(normals),
+                "finite_normals": (
+                    bool(torch.isfinite(normals).all().item()) if normals.numel() else True
+                ),
+                "normal_unit_mean_abs_error": (
+                    float(normal_errors.mean().item()) if normal_errors is not None else None
+                ),
+                "normal_unit_max_abs_error": (
+                    float(normal_errors.max().item()) if normal_errors is not None else None
+                ),
+            }
+        )
+        stats["output_tensor_bytes"] += stats["normals_tensor_bytes"]
+    if adjacency is not None:
+        adjacency_stats = _sparse_output_stats(adjacency, point_count)
+        stats.update(adjacency_stats)
+        stats["output_tensor_count"] += 1
+        stats["output_tensor_bytes"] += adjacency_stats["adjacency_tensor_bytes"]
+    return stats
 
 
 def _cuda_memory(device: torch.device) -> Dict[str, Optional[float]]:
@@ -1537,6 +1829,7 @@ def _run_one_method(
 ) -> Dict[str, Any]:
     method = variant["method"]
     method_params = variant["method_params"]
+    interface_params = variant["interface_params"]
     result = _base_result(
         args=args,
         run_id=run_id,
@@ -1581,7 +1874,10 @@ def _run_one_method(
         end_event = None
 
     wall_start = time.perf_counter()
+    output: Any = None
     points: Optional[torch.Tensor] = None
+    normals: Optional[torch.Tensor] = None
+    adjacency: Optional[torch.Tensor] = None
     cuda_sync_error = None
     section_summary = None
     torch_profile_summary = None
@@ -1619,29 +1915,68 @@ def _run_one_method(
             if torch_profile:
                 with torch.profiler.profile(
                     activities=activities,
-                    record_shapes=True,
-                    profile_memory=True,
                     with_stack=args.torch_profile_with_stack,
+                    record_shapes=args.torch_profile_record_shapes,
+                    profile_memory=args.torch_profile_memory,
                 ) as profiler:
                     if section_profiler is None:
-                        points = _call_method(method, coords, radii, args, method_params)
+                        output = _call_method(
+                            method,
+                            coords,
+                            radii,
+                            args,
+                            method_params,
+                            interface_params,
+                        )
                     else:
                         with section_profiler:
-                            points = _call_method(method, coords, radii, args, method_params)
-                if torch_profile_path is not None:
+                            output = _call_method(
+                                method,
+                                coords,
+                                radii,
+                                args,
+                                method_params,
+                                interface_params,
+                            )
+                trace_file_size_bytes = None
+                if torch_profile_path is not None and args.torch_profile_export_traces:
                     profiler.export_chrome_trace(str(torch_profile_path))
+                    try:
+                        trace_file_size_bytes = torch_profile_path.stat().st_size
+                    except OSError:
+                        trace_file_size_bytes = None
                 torch_profile_summary = {
-                    "trace_path": str(torch_profile_path) if torch_profile_path else None,
+                    "trace_path": (
+                        str(torch_profile_path)
+                        if torch_profile_path is not None and args.torch_profile_export_traces
+                        else None
+                    ),
+                    "trace_file_size_bytes": trace_file_size_bytes,
                     "top_ops": _torch_profiler_top_ops(
                         profiler,
                         limit=args.torch_profile_top_ops,
                     ),
                 }
             elif section_profiler is None:
-                points = _call_method(method, coords, radii, args, method_params)
+                output = _call_method(
+                    method,
+                    coords,
+                    radii,
+                    args,
+                    method_params,
+                    interface_params,
+                )
             else:
                 with section_profiler:
-                    points = _call_method(method, coords, radii, args, method_params)
+                    output = _call_method(
+                        method,
+                        coords,
+                        radii,
+                        args,
+                        method_params,
+                        interface_params,
+                    )
+            points, normals, adjacency = _split_sampler_output(output, interface_params)
         if section_profiler is not None:
             section_summary = section_profiler.summary(limit=args.profile_top_functions)
         if end_event is not None:
@@ -1655,6 +1990,7 @@ def _run_one_method(
 
         memory = _cuda_memory(device)
         finite_points = bool(torch.isfinite(points).all().item()) if points.numel() else True
+        output_stats = _output_stats(points, normals, adjacency)
         quality_metrics = _reference_metrics(
             points,
             reference_vertices,
@@ -1668,7 +2004,6 @@ def _run_one_method(
                 "wall_seconds": wall_seconds,
                 "cuda_event_ms": cuda_event_ms,
                 "point_count": int(points.shape[0]),
-                "points_tensor_bytes": _tensor_nbytes(points),
                 "points_per_atom": (
                     float(points.shape[0]) / atom_count if atom_count else None
                 ),
@@ -1682,6 +2017,7 @@ def _run_one_method(
                 "reference_metrics": quality_metrics,
             }
         )
+        result.update(output_stats)
         cpu_rss_after = _current_rss_mb()
         cpu_peak_after = _peak_rss_mb()
         result.update(
@@ -1738,7 +2074,7 @@ def _run_one_method(
         if torch_profile_summary is not None:
             result["torch_profile"] = torch_profile_summary
     finally:
-        del points
+        del output, points, normals, adjacency
         gc.collect()
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1891,10 +2227,17 @@ def _reference_status_counts(records: Sequence[Dict[str, Any]]) -> Dict[str, int
 def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     by_method: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     by_variant: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    by_interface: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     for record in results:
         method = record.get("method")
         if method:
             by_method[str(method)].append(record)
+            by_interface[
+                (
+                    str(method),
+                    str(record.get("interface_mode", "points")),
+                )
+            ].append(record)
             by_variant[
                 (
                     str(method),
@@ -1946,6 +2289,24 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 record.get("cpu_peak_delta_mb") for record in ok_records
             ),
             "point_count": _numeric_summary(record.get("point_count") for record in ok_records),
+            "output_tensor_bytes": _numeric_summary(
+                record.get("output_tensor_bytes") for record in ok_records
+            ),
+            "normals_tensor_bytes": _numeric_summary(
+                record.get("normals_tensor_bytes") for record in ok_records
+            ),
+            "normal_unit_max_abs_error": _numeric_summary(
+                record.get("normal_unit_max_abs_error") for record in ok_records
+            ),
+            "adjacency_tensor_bytes": _numeric_summary(
+                record.get("adjacency_tensor_bytes") for record in ok_records
+            ),
+            "adjacency_nnz": _numeric_summary(
+                record.get("adjacency_nnz") for record in ok_records
+            ),
+            "adjacency_mean_degree": _numeric_summary(
+                record.get("adjacency_mean_degree") for record in ok_records
+            ),
             "atom_count": _numeric_summary(record.get("atom_count") for record in ok_records),
             "points_per_wall_second": _numeric_summary(
                 record.get("points_per_wall_second") for record in ok_records
@@ -1962,6 +2323,10 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "reference_metric_seconds": _numeric_summary(
                 record.get("seconds") for record in reference_records
             ),
+            "torch_profile_trace_file_size_bytes": _numeric_summary(
+                record.get("torch_profile", {}).get("trace_file_size_bytes")
+                for record in ok_records
+            ),
         }
 
     variant_summaries: List[Dict[str, Any]] = []
@@ -1974,10 +2339,27 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             if record.get("reference_metrics", {}).get("status") == "ok"
         ]
         params = ok_records[0].get("method_params") if ok_records else records[0].get("method_params")
+        interface_mode = (
+            ok_records[0].get("interface_mode")
+            if ok_records
+            else records[0].get("interface_mode", "points")
+        )
+        interface_params = (
+            ok_records[0].get("interface_params")
+            if ok_records
+            else records[0].get("interface_params", {"mode": interface_mode})
+        )
         variant_summaries.append(
             {
                 "method": method,
                 "variant_name": variant_name,
+                "method_variant_name": (
+                    ok_records[0].get("method_variant_name")
+                    if ok_records
+                    else records[0].get("method_variant_name", variant_name)
+                ),
+                "interface_mode": interface_mode,
+                "interface_params": interface_params,
                 "method_parameter_hash": method_hash,
                 "method_params": params,
                 "records": len(records),
@@ -2014,6 +2396,24 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 "point_count": _numeric_summary(
                     record.get("point_count") for record in ok_records
                 ),
+                "output_tensor_bytes": _numeric_summary(
+                    record.get("output_tensor_bytes") for record in ok_records
+                ),
+                "normals_tensor_bytes": _numeric_summary(
+                    record.get("normals_tensor_bytes") for record in ok_records
+                ),
+                "normal_unit_max_abs_error": _numeric_summary(
+                    record.get("normal_unit_max_abs_error") for record in ok_records
+                ),
+                "adjacency_tensor_bytes": _numeric_summary(
+                    record.get("adjacency_tensor_bytes") for record in ok_records
+                ),
+                "adjacency_nnz": _numeric_summary(
+                    record.get("adjacency_nnz") for record in ok_records
+                ),
+                "adjacency_mean_degree": _numeric_summary(
+                    record.get("adjacency_mean_degree") for record in ok_records
+                ),
                 "points_per_wall_second": _numeric_summary(
                     record.get("points_per_wall_second") for record in ok_records
                 ),
@@ -2028,6 +2428,10 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 ),
                 "reference_metric_seconds": _numeric_summary(
                     record.get("seconds") for record in reference_records
+                ),
+                "torch_profile_trace_file_size_bytes": _numeric_summary(
+                    record.get("torch_profile", {}).get("trace_file_size_bytes")
+                    for record in ok_records
                 ),
             }
         )
@@ -2051,6 +2455,67 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             for item in variant_summaries
             if item["method"] == method and item["wall_seconds"]["median"] is not None
         ][:10]
+
+    interface_summaries: List[Dict[str, Any]] = []
+    for (method, interface_mode), records in by_interface.items():
+        ok_records = [record for record in records if record.get("status") == "ok"]
+        clean_records = _clean_timing_records(ok_records)
+        interface_summaries.append(
+            {
+                "method": method,
+                "interface_mode": interface_mode,
+                "records": len(records),
+                "status_counts": dict(Counter(record.get("status") for record in records)),
+                "profiling_counts": _profile_status_counts(ok_records),
+                "wall_seconds": _numeric_summary(
+                    record.get("wall_seconds") for record in ok_records
+                ),
+                "clean_wall_seconds": _numeric_summary(
+                    record.get("wall_seconds") for record in clean_records
+                ),
+                "cuda_event_ms": _numeric_summary(
+                    record.get("cuda_event_ms") for record in ok_records
+                ),
+                "gpu_peak_allocated_mb": _numeric_summary(
+                    record.get("gpu_peak_allocated_mb") for record in ok_records
+                ),
+                "point_count": _numeric_summary(
+                    record.get("point_count") for record in ok_records
+                ),
+                "output_tensor_bytes": _numeric_summary(
+                    record.get("output_tensor_bytes") for record in ok_records
+                ),
+                "normals_tensor_bytes": _numeric_summary(
+                    record.get("normals_tensor_bytes") for record in ok_records
+                ),
+                "normal_unit_max_abs_error": _numeric_summary(
+                    record.get("normal_unit_max_abs_error") for record in ok_records
+                ),
+                "adjacency_tensor_bytes": _numeric_summary(
+                    record.get("adjacency_tensor_bytes") for record in ok_records
+                ),
+                "adjacency_nnz": _numeric_summary(
+                    record.get("adjacency_nnz") for record in ok_records
+                ),
+                "adjacency_mean_degree": _numeric_summary(
+                    record.get("adjacency_mean_degree") for record in ok_records
+                ),
+                "points_per_wall_second": _numeric_summary(
+                    record.get("points_per_wall_second") for record in ok_records
+                ),
+                "clean_points_per_wall_second": _numeric_summary(
+                    record.get("points_per_wall_second") for record in clean_records
+                ),
+            }
+        )
+    interface_summaries.sort(
+        key=lambda item: (
+            item["method"],
+            INTERFACE_MODE_ORDER.index(item["interface_mode"])
+            if item["interface_mode"] in INTERFACE_MODE_ORDER
+            else len(INTERFACE_MODE_ORDER),
+        )
+    )
 
     ok_results = [record for record in results if record.get("status") == "ok"]
     error_results = [
@@ -2076,6 +2541,8 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "pdb_id": record.get("pdb_id"),
             "method": record.get("method"),
             "variant_name": record.get("variant_name"),
+            "method_variant_name": record.get("method_variant_name"),
+            "interface_mode": record.get("interface_mode", "points"),
             "status": record.get("status"),
             "repeat_index": record.get("repeat_index"),
             "run_index": record.get("run_index"),
@@ -2087,6 +2554,11 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "wall_seconds": record.get("wall_seconds"),
             "cuda_event_ms": record.get("cuda_event_ms"),
             "gpu_peak_allocated_mb": record.get("gpu_peak_allocated_mb"),
+            "output_tensor_bytes": record.get("output_tensor_bytes"),
+            "normals_tensor_bytes": record.get("normals_tensor_bytes"),
+            "adjacency_tensor_bytes": record.get("adjacency_tensor_bytes"),
+            "adjacency_nnz": record.get("adjacency_nnz"),
+            "adjacency_mean_degree": record.get("adjacency_mean_degree"),
             "points_per_wall_second": record.get("points_per_wall_second"),
             "reference_symmetric_mean_distance": record.get(
                 "reference_metrics",
@@ -2106,6 +2578,7 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "non_ok_records": len(results) - len(ok_results),
         "method_summaries": method_summaries,
         "variant_summaries": variant_summaries,
+        "interface_summaries": interface_summaries,
         "fastest_variants_by_method": fastest_variants,
         "slowest_ok_results": [slim(record) for record in slowest],
         "slowest_clean_ok_results": [
@@ -2242,6 +2715,30 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--torch-profile-dir", default="tmp/gpu_benchmarks/traces")
     parser.add_argument("--torch-profile-top-ops", type=int, default=30)
     parser.add_argument("--torch-profile-with-stack", action="store_true")
+    parser.add_argument(
+        "--torch-profile-record-shapes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Record operator input shapes in PyTorch profiler traces. Disabled "
+            "by default because full-dataset traces become very large."
+        ),
+    )
+    parser.add_argument(
+        "--torch-profile-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Record PyTorch profiler memory events.",
+    )
+    parser.add_argument(
+        "--torch-profile-export-traces",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Export Chrome trace JSON files for profiled runs. Top-op summaries "
+            "are still written to JSONL when trace export is disabled."
+        ),
+    )
 
     parser.add_argument("--device", default=os.environ.get("SES_BENCH_DEVICE", "cuda"))
     parser.add_argument(
@@ -2270,13 +2767,39 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reference-sample-size", type=int, default=4096)
     parser.add_argument("--reference-distance-budget", type=int, default=16_000_000)
     parser.add_argument("--grid-spacing", type=float, default=None)
-    parser.add_argument("--point-area", type=float, default=0.5)
+    parser.add_argument("--point-area", type=float, default=POINT_AREA_DEFAULT)
     parser.add_argument("--pairwise-element-budget", type=int, default=64_000_000)
 
-    parser.add_argument("--projected-m", type=int, default=230)
+    parser.add_argument(
+        "--interfaces",
+        type=_parse_interface_modes,
+        default=os.environ.get("SES_BENCH_INTERFACES", "points"),
+        help=(
+            "Comma-separated sampler output interfaces to benchmark: points, "
+            "normals, adjacency, normals_adjacency, or all."
+        ),
+    )
+    parser.add_argument(
+        "--adjacency-weight",
+        choices=("euclidean", "geodesic"),
+        default=os.environ.get("SES_BENCH_ADJACENCY_WEIGHT", "euclidean"),
+    )
+    parser.add_argument("--adjacency-neighbors", type=int, default=6)
+    parser.add_argument(
+        "--adjacency-candidate-neighbors",
+        type=_parse_optional_int,
+        default=None,
+    )
+    parser.add_argument(
+        "--adjacency-prune-redundant",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+
+    parser.add_argument("--projected-m", type=int, default=PROJECTED_M_DEFAULT)
     parser.add_argument("--projected-m-values", type=_parse_csv_ints, default=None)
 
-    parser.add_argument("--sdf-m", type=int, default=34)
+    parser.add_argument("--sdf-m", type=int, default=SDF_M_DEFAULT)
     parser.add_argument("--sdf-m-values", type=_parse_csv_ints, default=None)
     parser.add_argument("--sdf-smoothness", type=float, default=0.2)
     parser.add_argument("--sdf-smoothness-values", type=_parse_csv_floats, default=None)
@@ -2292,7 +2815,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--analytic-atom-filter-samples-values", type=_parse_csv_ints, default=None)
     parser.add_argument("--analytic-pair-filter-samples", type=int, default=12)
     parser.add_argument("--analytic-pair-filter-samples-values", type=_parse_csv_ints, default=None)
-    parser.add_argument("--analytic-oversample-factor", type=float, default=1.25)
+    parser.add_argument(
+        "--analytic-oversample-factor",
+        type=float,
+        default=ANALYTIC_OVERSAMPLE_FACTOR_DEFAULT,
+    )
     parser.add_argument("--analytic-oversample-factor-values", type=_parse_csv_floats, default=None)
     parser.add_argument("--analytic-point-area-values", type=_parse_csv_floats, default=None)
     parser.add_argument("--analytic-probe-density-scale", type=float, default=1.0)
@@ -2313,11 +2840,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tile-size-values", type=_parse_csv_float_or_auto, default=None)
     parser.add_argument("--tile-overlap", type=_parse_float_or_auto, default="auto")
     parser.add_argument("--tile-overlap-values", type=_parse_csv_float_or_auto, default=None)
-    parser.add_argument("--tiled-atom-density-scale", type=float, default=7.0)
+    parser.add_argument(
+        "--tiled-atom-density-scale",
+        type=float,
+        default=TILED_DENSITY_SCALE_DEFAULT,
+    )
     parser.add_argument("--tiled-atom-density-scale-values", type=_parse_csv_floats, default=None)
-    parser.add_argument("--tiled-pair-density-scale", type=float, default=0.0)
+    parser.add_argument(
+        "--tiled-pair-density-scale",
+        type=float,
+        default=TILED_DENSITY_SCALE_DEFAULT,
+    )
     parser.add_argument("--tiled-pair-density-scale-values", type=_parse_csv_floats, default=None)
-    parser.add_argument("--tiled-probe-density-scale", type=float, default=0.0)
+    parser.add_argument(
+        "--tiled-probe-density-scale",
+        type=float,
+        default=TILED_DENSITY_SCALE_DEFAULT,
+    )
     parser.add_argument("--tiled-probe-density-scale-values", type=_parse_csv_floats, default=None)
     parser.add_argument("--tiled-dedup-tolerance", type=float, default=0.05)
     parser.add_argument("--tiled-dedup-tolerance-values", type=_parse_csv_floats, default=None)
@@ -2339,8 +2878,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.surface_dir is None:
         args.surface_dir = _default_surface_dir(args.data_dir)
     methods = args.methods if isinstance(args.methods, list) else _parse_methods(args.methods)
+    args.interfaces = (
+        args.interfaces
+        if isinstance(args.interfaces, list)
+        else _parse_interface_modes(args.interfaces)
+    )
     if args.repeats < 1:
         raise SystemExit("--repeats must be positive")
+    if args.adjacency_neighbors < 1:
+        raise SystemExit("--adjacency-neighbors must be positive")
+    if (
+        args.adjacency_candidate_neighbors is not None
+        and args.adjacency_candidate_neighbors < args.adjacency_neighbors
+    ):
+        raise SystemExit(
+            "--adjacency-candidate-neighbors must be at least --adjacency-neighbors"
+        )
     if args.reference_sample_size < 1:
         raise SystemExit("--reference-sample-size must be positive")
     if args.reference_distance_budget < 1:

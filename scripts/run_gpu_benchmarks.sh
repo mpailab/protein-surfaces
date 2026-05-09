@@ -9,7 +9,7 @@ IMAGE="${SES_BENCH_IMAGE:-protein-surfaces-gpu-bench:latest}"
 DOCKERFILE="${SES_BENCH_DOCKERFILE:-Dockerfile.gpu}"
 PYTHON_VERSION="${SES_BENCH_PYTHON_VERSION:-3.9}"
 TORCH_INDEX_URL="${SES_BENCH_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
-PROGRAM_VERSION="${SES_BENCH_PROGRAM_VERSION:-0.0.1}"
+PROGRAM_VERSION="${SES_BENCH_PROGRAM_VERSION:-0.0.2}"
 OUTPUT="${SES_BENCH_OUTPUT:-tmp/gpu_benchmarks/ses_gpu_benchmark_${PROGRAM_VERSION}.jsonl}"
 DATA_DIR="${SES_BENCH_DATA_DIR:-Data/01-benchmark_pdbs}"
 SURFACE_DIR="${SES_BENCH_SURFACE_DIR:-Data/01-benchmark_surfaces}"
@@ -23,11 +23,13 @@ RUN_LOCAL="${SES_BENCH_RUN_LOCAL:-0}"
 DEFAULT_SWEEP_PRESET="${SES_BENCH_SWEEP_PRESET:-focused}"
 DEFAULT_REPEATS="${SES_BENCH_REPEATS:-3}"
 DEFAULT_TORCH_PROFILE_LIMIT="${SES_BENCH_TORCH_PROFILE_LIMIT:-100}"
+DEFAULT_INTERFACES="${SES_BENCH_INTERFACES:-points}"
 DEFAULT_ARGS=(
   --program-version "${PROGRAM_VERSION}"
   --sweep-preset "${DEFAULT_SWEEP_PRESET}"
   --repeats "${DEFAULT_REPEATS}"
   --torch-profile-limit "${DEFAULT_TORCH_PROFILE_LIMIT}"
+  --interfaces "${DEFAULT_INTERFACES}"
 )
 
 USER_ARGS=("$@")
@@ -51,7 +53,7 @@ RUN_ARGS+=("${USER_ARGS[@]}")
 
 print_defaults() {
   echo "[ses-gpu-bench] Output: ${OUTPUT}"
-  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: program_version=${PROGRAM_VERSION}, auto_resume=${AUTO_RESUME}, sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}"
+  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: program_version=${PROGRAM_VERSION}, auto_resume=${AUTO_RESUME}, sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}, interfaces=${DEFAULT_INTERFACES}"
 }
 
 missing_dependency_message() {

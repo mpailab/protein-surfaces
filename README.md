@@ -123,6 +123,7 @@ The command builds a CUDA Docker image, runs all SES methods on
 repeats, and a limited set of PyTorch profiler traces so the first full run has
 both diagnostic and cleaner timing samples. The benchmark records internal
 section timings, intermediate tensor sizes, CUDA memory, parameter summaries,
-and reference-surface distance metrics. See `docs/gpu_benchmark.md` for smoke
-runs, existing-container execution, resume, sharding, profiling, and sweep
-options.
+reference-surface distance metrics, and optional interface overhead for normals
+and sparse adjacency outputs. See `docs/gpu_benchmark.md` for smoke runs,
+existing-container execution, resume, sharding, profiling, interface modes, and
+sweep options.
