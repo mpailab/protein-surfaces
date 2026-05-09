@@ -233,10 +233,12 @@ def _grid_subsample(points: torch.Tensor, spacing: Optional[float]) -> torch.Ten
     if spacing is None or points.shape[0] == 0:
         return points
 
-    origin = points.min(dim=0).values
-    labels = torch.floor((points - origin) / float(spacing)).to(torch.long)
-    _, inverse = torch.unique(labels, dim=0, return_inverse=True)
-    num_cells = int(inverse.max().item()) + 1
+    with torch.no_grad():
+        detached_points = points.detach()
+        origin = detached_points.min(dim=0).values
+        labels = torch.floor((detached_points - origin) / float(spacing)).to(torch.long)
+        _, inverse = torch.unique(labels, dim=0, return_inverse=True)
+        num_cells = int(inverse.max().item()) + 1
 
     sums = torch.zeros((num_cells, 3), dtype=points.dtype, device=points.device)
     counts = torch.zeros((num_cells, 1), dtype=points.dtype, device=points.device)
@@ -263,23 +265,30 @@ def _points_outside_atoms(
     if atom_coords.shape[0] == 0:
         return torch.ones((points.shape[0],), dtype=torch.bool, device=points.device)
 
-    rows = _max_sdf_rows(
-        atom_coords.shape[0],
-        pairwise_element_budget,
-        device=points.device,
-    )
-    masks = []
-    radii_sq = atom_radii.square().unsqueeze(0)
-    for start in range(0, points.shape[0], rows):
-        stop = min(start + rows, points.shape[0])
-        sq_dists = torch.cdist(points[start:stop], atom_coords).square()
-        tol = (
-            256
-            * torch.finfo(points.dtype).eps
-            * torch.maximum(sq_dists, radii_sq).clamp_min(1)
+    with torch.no_grad():
+        detached_points = points.detach()
+        detached_coords = atom_coords.detach()
+        detached_radii = atom_radii.detach()
+        rows = _max_sdf_rows(
+            detached_coords.shape[0],
+            pairwise_element_budget,
+            device=detached_points.device,
         )
-        masks.append((sq_dists >= radii_sq - tol).all(dim=-1))
-    return torch.cat(masks, dim=0)
+        masks = []
+        radii_sq = detached_radii.square().unsqueeze(0)
+        for start in range(0, detached_points.shape[0], rows):
+            stop = min(start + rows, detached_points.shape[0])
+            sq_dists = torch.cdist(
+                detached_points[start:stop],
+                detached_coords,
+            ).square()
+            tol = (
+                256
+                * torch.finfo(detached_points.dtype).eps
+                * torch.maximum(sq_dists, radii_sq).clamp_min(1)
+            )
+            masks.append((sq_dists >= radii_sq - tol).all(dim=-1))
+        return torch.cat(masks, dim=0)
 
 
 def _sdf_atom_features(
@@ -295,31 +304,36 @@ def _sdf_atom_features(
 
     num_points = centers.shape[0]
     num_atoms = atom_coords.shape[0]
-    features = torch.zeros(
-        (num_points, num_atoms),
-        dtype=centers.dtype,
-        device=centers.device,
-    )
-    if num_points == 0 or num_atoms == 0:
-        return features
-
-    rows = _max_sdf_rows(
-        num_atoms,
-        pairwise_element_budget,
-        device=centers.device,
-    )
-    for start in range(0, num_points, rows):
-        stop = min(start + rows, num_points)
-        center_distances = torch.linalg.norm(
-            centers[start:stop].unsqueeze(1) - atom_coords.unsqueeze(0),
-            dim=-1,
+    with torch.no_grad():
+        detached_centers = centers.detach()
+        detached_coords = atom_coords.detach()
+        detached_radii = expanded_atom_radii.detach()
+        features = torch.zeros(
+            (num_points, num_atoms),
+            dtype=centers.dtype,
+            device=centers.device,
         )
-        signed_distances = center_distances - expanded_atom_radii.unsqueeze(0)
-        weights = torch.softmax(-signed_distances / float(smoothness), dim=-1)
-        strongest = weights == weights.max(dim=-1, keepdim=True).values
-        supported = (weights >= float(feature_threshold)) | strongest
-        features[start:stop] = supported.to(dtype=features.dtype)
-    return features
+        if num_points == 0 or num_atoms == 0:
+            return features
+
+        rows = _max_sdf_rows(
+            num_atoms,
+            pairwise_element_budget,
+            device=detached_centers.device,
+        )
+        for start in range(0, num_points, rows):
+            stop = min(start + rows, num_points)
+            center_distances = torch.linalg.norm(
+                detached_centers[start:stop].unsqueeze(1)
+                - detached_coords.unsqueeze(0),
+                dim=-1,
+            )
+            signed_distances = center_distances - detached_radii.unsqueeze(0)
+            weights = torch.softmax(-signed_distances / float(smoothness), dim=-1)
+            strongest = weights == weights.max(dim=-1, keepdim=True).values
+            supported = (weights >= float(feature_threshold)) | strongest
+            features[start:stop] = supported.to(dtype=features.dtype)
+        return features
 
 
 def sample_sdf_points(
@@ -412,31 +426,38 @@ def sample_sdf_points(
         pairwise_element_budget=pairwise_element_budget,
     )
 
-    sdf_values = _sdf_values(
-        centers,
-        coords,
-        expanded_radii,
-        float(smoothness),
-        pairwise_element_budget=pairwise_element_budget,
-    )
-    finite_mask = torch.isfinite(centers).all(dim=-1) & torch.isfinite(sdf_values)
-    level_mask = sdf_values.abs() <= float(level_tolerance)
-    feasible_mask = _centers_feasible_against_all_atoms(
-        centers,
-        coords,
-        expanded_radii.square(),
-    )
-    valid_center_mask = finite_mask & level_mask & feasible_mask
-    accessible_mask = _probe_centers_accessible_from_exterior(
-        centers,
-        coords,
-        radii,
-        float(probe_radius),
-        valid_center_mask=valid_center_mask,
-        grid_spacing=grid_spacing,
-        max_grid_points=int(max_grid_points),
-        assume_centers_feasible=True,
-    )
+    with torch.no_grad():
+        detached_centers = centers.detach()
+        detached_coords = coords.detach()
+        detached_radii = radii.detach()
+        detached_expanded_radii = expanded_radii.detach()
+        sdf_values = _sdf_values(
+            detached_centers,
+            detached_coords,
+            detached_expanded_radii,
+            float(smoothness),
+            pairwise_element_budget=pairwise_element_budget,
+        )
+        finite_mask = torch.isfinite(detached_centers).all(dim=-1) & torch.isfinite(
+            sdf_values
+        )
+        level_mask = sdf_values.abs() <= float(level_tolerance)
+        feasible_mask = _centers_feasible_against_all_atoms(
+            detached_centers,
+            detached_coords,
+            detached_expanded_radii.square(),
+        )
+        valid_center_mask = finite_mask & level_mask & feasible_mask
+        accessible_mask = _probe_centers_accessible_from_exterior(
+            detached_centers,
+            detached_coords,
+            detached_radii,
+            float(probe_radius),
+            valid_center_mask=valid_center_mask,
+            grid_spacing=grid_spacing,
+            max_grid_points=int(max_grid_points),
+            assume_centers_feasible=True,
+        )
     centers = centers[accessible_mask]
     centers = _grid_subsample(centers, subsample_spacing)
 

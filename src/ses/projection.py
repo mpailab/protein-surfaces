@@ -246,8 +246,9 @@ def sample_projected_points(
         m,
         probe_radius,
     )
-    finite_mask = torch.isfinite(projected_points).all(dim=-1)
-    visible_mask = valid_mask & finite_mask
+    with torch.no_grad():
+        finite_mask = torch.isfinite(projected_points.detach()).all(dim=-1)
+        visible_mask = valid_mask & finite_mask
     points = projected_points[visible_mask]
 
     if not include_atom_features:
@@ -1180,7 +1181,8 @@ def _compute_active_set_probe_centers(
     device = points.device
     dtype = points.dtype
     atom_ext_radii = atom_radii + probe_radius
-    local_atom_indices = _build_local_atom_indices(atom_coords)
+    with torch.no_grad():
+        local_atom_indices = _build_local_atom_indices(atom_coords.detach())
     max_active_neighbors = min(8, max(num_atoms - 1, 0))
     probe_centers = torch.empty_like(points)
     valid_point_mask = torch.empty(points.shape[:2], dtype=torch.bool, device=device)
@@ -1191,7 +1193,7 @@ def _compute_active_set_probe_centers(
     flat_centers = probe_centers.reshape(-1, 3)
     flat_valid_mask = valid_point_mask.reshape(-1)
     total_rows = flat_points.shape[0]
-    block_rows = 8192
+    block_rows = 32768 if device.type == "cuda" else 8192
     atom_range = torch.arange(num_atoms, device=device, dtype=torch.long)
     pair_combinations = torch.combinations(
         torch.arange(max_active_neighbors + 1, device=device, dtype=torch.long),
@@ -1205,15 +1207,239 @@ def _compute_active_set_probe_centers(
     for start in range(0, total_rows, block_rows):
         stop = min(start + block_rows, total_rows)
         block_points = flat_points[start:stop]
+        row_count = stop - start
         owner_indices = atom_range[(torch.arange(start, stop, device=device) % num_atoms)]
-        owner_coords = atom_coords[owner_indices]
-        owner_radii = atom_radii[owner_indices]
-        owner_ext_radii = atom_ext_radii[owner_indices]
-        local_indices = local_atom_indices[owner_indices]
-        local_coords = atom_coords[local_indices]
-        local_radii = atom_radii[local_indices]
-        local_ext_radii = atom_ext_radii[local_indices]
 
+        with torch.no_grad():
+            detached_points = block_points.detach()
+            detached_coords = atom_coords.detach()
+            detached_radii = atom_radii.detach()
+            detached_ext_radii = atom_ext_radii.detach()
+
+            owner_coords = detached_coords[owner_indices]
+            owner_ext_radii = detached_ext_radii[owner_indices]
+            local_indices = local_atom_indices[owner_indices]
+            local_coords = detached_coords[local_indices]
+            local_radii = detached_radii[local_indices]
+            local_ext_radii = detached_ext_radii[local_indices]
+
+            owner_directions = detached_points - owner_coords
+            owner_direction_norms = torch.linalg.norm(
+                owner_directions,
+                dim=-1,
+                keepdim=True,
+            )
+            fallback_directions = torch.zeros_like(owner_directions)
+            fallback_directions[:, 0] = 1
+            owner_directions = torch.where(
+                owner_direction_norms > torch.finfo(dtype).eps,
+                owner_directions / owner_direction_norms.clamp_min(torch.finfo(dtype).eps),
+                fallback_directions,
+            )
+            direct_centers = owner_coords + owner_ext_radii.unsqueeze(-1) * owner_directions
+
+            if local_atom_indices.shape[1] == num_atoms:
+                point_is_valid = _valid_points_against_all_atoms(
+                    detached_points,
+                    detached_coords,
+                    detached_radii,
+                )
+            else:
+                point_is_valid = _valid_points_against_local_atoms(
+                    detached_points,
+                    local_coords,
+                    local_radii,
+                )
+            direct_is_feasible = _squared_feasibility_mask(
+                direct_centers.unsqueeze(-2),
+                local_coords,
+                local_ext_radii,
+            ).all(dim=-1)
+
+            selected_kind = torch.zeros((row_count,), dtype=torch.long, device=device)
+            selected_first = owner_indices.clone()
+            selected_second = owner_indices.clone()
+            selected_third = owner_indices.clone()
+            selected_sign = torch.zeros((row_count,), dtype=torch.long, device=device)
+            best_scores = torch.where(
+                point_is_valid & direct_is_feasible,
+                torch.zeros((row_count,), dtype=dtype, device=device),
+                torch.full((row_count,), float("inf"), dtype=dtype, device=device),
+            )
+
+            unresolved_mask = point_is_valid & ~direct_is_feasible
+            unresolved_indices = unresolved_mask.nonzero(as_tuple=False).reshape(-1)
+            if unresolved_indices.numel() > 0 and max_active_neighbors > 0:
+                unresolved_points = detached_points[unresolved_indices]
+                unresolved_direct_centers = direct_centers[unresolved_indices]
+                unresolved_local_indices = local_indices[unresolved_indices]
+                unresolved_local_coords = local_coords[unresolved_indices]
+                unresolved_local_ext_radii = local_ext_radii[unresolved_indices]
+                unresolved_owner_indices = owner_indices[unresolved_indices]
+                unresolved_best_scores = best_scores[unresolved_indices]
+
+                center_local_dists = torch.linalg.norm(
+                    unresolved_direct_centers.unsqueeze(-2) - unresolved_local_coords,
+                    dim=-1,
+                )
+                penetrations = unresolved_local_ext_radii - center_local_dists
+                penetrations = torch.where(
+                    unresolved_local_indices != unresolved_owner_indices.unsqueeze(-1),
+                    penetrations,
+                    torch.full((), float("-inf"), dtype=dtype, device=device),
+                )
+                _, blocker_slots = torch.topk(
+                    penetrations,
+                    k=max_active_neighbors,
+                    dim=-1,
+                    largest=True,
+                )
+                blocker_indices = torch.gather(
+                    unresolved_local_indices,
+                    1,
+                    blocker_slots,
+                )
+                active_indices = torch.cat(
+                    (unresolved_owner_indices.unsqueeze(-1), blocker_indices),
+                    dim=-1,
+                )
+
+                if pair_combinations.numel() > 0:
+                    pair_slots = pair_combinations
+                    first_indices = active_indices[:, pair_slots[:, 0]]
+                    second_indices = active_indices[:, pair_slots[:, 1]]
+                    first_coords = detached_coords[first_indices]
+                    second_coords = detached_coords[second_indices]
+                    first_radii = detached_ext_radii[first_indices]
+                    second_radii = detached_ext_radii[second_indices]
+                    pair_dists_sq = (first_coords - second_coords).square().sum(dim=-1)
+                    pair_valid = (
+                        (first_indices != second_indices)
+                        & (pair_dists_sq > (first_radii - second_radii).square())
+                        & (pair_dists_sq < (first_radii + second_radii).square())
+                    )
+                    pair_centers = _compute_pair_probe_centers(
+                        unresolved_points,
+                        detached_coords,
+                        detached_ext_radii,
+                        first_indices,
+                        second_indices,
+                    )
+                    pair_feasible = _centers_feasible_against_local_atoms(
+                        pair_centers,
+                        unresolved_local_coords,
+                        unresolved_local_ext_radii,
+                    )
+                    pair_scores = torch.abs(
+                        torch.linalg.norm(
+                            unresolved_points.unsqueeze(-2) - pair_centers,
+                            dim=-1,
+                        )
+                        - probe_radius
+                    )
+                    pair_membership = _pair_patch_membership(
+                        unresolved_points,
+                        pair_centers,
+                        detached_coords,
+                        detached_ext_radii,
+                        first_indices,
+                        second_indices,
+                    )
+                    pair_mask = pair_valid & pair_feasible & pair_membership
+                    masked_pair_scores = torch.where(
+                        pair_mask,
+                        pair_scores,
+                        torch.full((), float("inf"), dtype=dtype, device=device),
+                    )
+                    pair_best_scores, pair_best_cols = masked_pair_scores.min(dim=-1)
+                    pair_has = pair_best_scores < unresolved_best_scores
+                    target_rows = unresolved_indices[pair_has]
+                    local_cols = pair_best_cols[pair_has]
+                    selected_kind[target_rows] = 2
+                    selected_first[target_rows] = first_indices[pair_has, local_cols]
+                    selected_second[target_rows] = second_indices[pair_has, local_cols]
+                    unresolved_best_scores = torch.where(
+                        pair_has,
+                        pair_best_scores,
+                        unresolved_best_scores,
+                    )
+
+                triple_rows = (
+                    (~unresolved_best_scores.isfinite())
+                    | (unresolved_best_scores > 10 * torch.finfo(dtype).eps)
+                ).nonzero(as_tuple=False).reshape(-1)
+                if triple_rows.numel() > 0 and triple_combinations.numel() > 0:
+                    triple_active_indices = active_indices[triple_rows]
+                    triple_points = unresolved_points[triple_rows]
+                    triple_local_coords = unresolved_local_coords[triple_rows]
+                    triple_local_ext_radii = unresolved_local_ext_radii[triple_rows]
+                    triple_slots = triple_combinations
+                    first_indices = triple_active_indices[:, triple_slots[:, 0]]
+                    second_indices = triple_active_indices[:, triple_slots[:, 1]]
+                    third_indices = triple_active_indices[:, triple_slots[:, 2]]
+                    triple_centers, triple_valid = _compute_triple_probe_centers(
+                        detached_coords,
+                        detached_ext_radii,
+                        first_indices,
+                        second_indices,
+                        third_indices,
+                    )
+                    distinct_triples = (
+                        (first_indices != second_indices)
+                        & (first_indices != third_indices)
+                        & (second_indices != third_indices)
+                    ).unsqueeze(-1)
+                    triple_feasible = _centers_feasible_against_local_atoms(
+                        triple_centers,
+                        triple_local_coords,
+                        triple_local_ext_radii,
+                    )
+                    triple_scores = torch.abs(
+                        torch.linalg.norm(
+                            triple_points.unsqueeze(-2).unsqueeze(-2) - triple_centers,
+                            dim=-1,
+                        )
+                        - probe_radius
+                    )
+                    triple_membership = _triple_patch_membership(
+                        triple_points,
+                        triple_centers,
+                        detached_coords,
+                        detached_ext_radii,
+                        first_indices,
+                        second_indices,
+                        third_indices,
+                    )
+                    flat_scores = triple_scores.reshape(triple_centers.shape[0], -1)
+                    flat_mask = (
+                        distinct_triples
+                        & triple_valid
+                        & triple_feasible
+                        & triple_membership
+                    ).reshape(triple_centers.shape[0], -1)
+                    masked_triple_scores = torch.where(
+                        flat_mask,
+                        flat_scores,
+                        torch.full((), float("inf"), dtype=dtype, device=device),
+                    )
+                    triple_best_scores, triple_best_flat = masked_triple_scores.min(dim=-1)
+                    current_scores = unresolved_best_scores[triple_rows]
+                    triple_has = triple_best_scores < current_scores
+                    good_rows = triple_has.nonzero(as_tuple=False).reshape(-1)
+                    target_rows = unresolved_indices[triple_rows[good_rows]]
+                    flat_cols = triple_best_flat[good_rows]
+                    combo_cols = torch.div(flat_cols, 2, rounding_mode="floor")
+                    signs = flat_cols.remainder(2)
+                    selected_kind[target_rows] = 3
+                    selected_first[target_rows] = first_indices[good_rows, combo_cols]
+                    selected_second[target_rows] = second_indices[good_rows, combo_cols]
+                    selected_third[target_rows] = third_indices[good_rows, combo_cols]
+                    selected_sign[target_rows] = signs
+
+            flat_valid_mask[start:stop] = point_is_valid
+
+        owner_coords = atom_coords[owner_indices]
+        owner_ext_radii = atom_ext_radii[owner_indices]
         owner_directions = block_points - owner_coords
         owner_direction_norms = torch.linalg.norm(
             owner_directions,
@@ -1227,210 +1453,35 @@ def _compute_active_set_probe_centers(
             owner_directions / owner_direction_norms.clamp_min(torch.finfo(dtype).eps),
             fallback_directions,
         )
-        direct_centers = owner_coords + owner_ext_radii.unsqueeze(-1) * owner_directions
+        best_centers = (
+            owner_coords + owner_ext_radii.unsqueeze(-1) * owner_directions
+        ).clone()
 
-        if local_atom_indices.shape[1] == num_atoms:
-            point_is_valid = _valid_points_against_all_atoms(
-                block_points,
+        pair_rows = (selected_kind == 2).nonzero(as_tuple=False).reshape(-1)
+        if pair_rows.numel() > 0:
+            best_centers[pair_rows] = _compute_pair_probe_centers(
+                block_points[pair_rows],
                 atom_coords,
-                atom_radii,
+                atom_ext_radii,
+                selected_first[pair_rows],
+                selected_second[pair_rows],
             )
-        else:
-            point_is_valid = _valid_points_against_local_atoms(
-                block_points,
-                local_coords,
-                local_radii,
-            )
-        direct_is_feasible = _squared_feasibility_mask(
-            direct_centers.unsqueeze(-2),
-            local_coords,
-            local_ext_radii,
-        ).all(dim=-1)
 
-        best_centers = direct_centers
-        best_scores = torch.where(
-            point_is_valid & direct_is_feasible,
-            torch.zeros((stop - start,), dtype=dtype, device=device),
-            torch.full((stop - start,), float("inf"), dtype=dtype, device=device),
-        )
-
-        unresolved_mask = point_is_valid & ~direct_is_feasible
-        unresolved_indices = unresolved_mask.nonzero(as_tuple=False).reshape(-1)
-        if unresolved_indices.numel() > 0 and max_active_neighbors > 0:
-            unresolved_points = block_points[unresolved_indices]
-            unresolved_direct_centers = direct_centers[unresolved_indices]
-            unresolved_local_indices = local_indices[unresolved_indices]
-            unresolved_local_coords = local_coords[unresolved_indices]
-            unresolved_local_ext_radii = local_ext_radii[unresolved_indices]
-            unresolved_owner_indices = owner_indices[unresolved_indices]
-
-            center_local_dists = torch.linalg.norm(
-                unresolved_direct_centers.unsqueeze(-2) - unresolved_local_coords,
-                dim=-1,
+        triple_rows = (selected_kind == 3).nonzero(as_tuple=False).reshape(-1)
+        if triple_rows.numel() > 0:
+            triple_centers, _ = _compute_triple_probe_centers(
+                atom_coords,
+                atom_ext_radii,
+                selected_first[triple_rows],
+                selected_second[triple_rows],
+                selected_third[triple_rows],
             )
-            penetrations = unresolved_local_ext_radii - center_local_dists
-            penetrations = torch.where(
-                unresolved_local_indices != unresolved_owner_indices.unsqueeze(-1),
-                penetrations,
-                torch.full((), float("-inf"), dtype=dtype, device=device),
-            )
-            active_count = max_active_neighbors + 1
-            _, blocker_slots = torch.topk(
-                penetrations,
-                k=max_active_neighbors,
-                dim=-1,
-                largest=True,
-            )
-            blocker_indices = torch.gather(
-                unresolved_local_indices,
-                1,
-                blocker_slots,
-            )
-            active_indices = torch.cat(
-                (unresolved_owner_indices.unsqueeze(-1), blocker_indices),
-                dim=-1,
-            )
-            unresolved_best_centers = best_centers[unresolved_indices]
-            unresolved_best_scores = best_scores[unresolved_indices]
-
-            if pair_combinations.numel() > 0:
-                pair_slots = pair_combinations[
-                    (pair_combinations < active_count).all(dim=-1)
-                ]
-                first_indices = active_indices[:, pair_slots[:, 0]]
-                second_indices = active_indices[:, pair_slots[:, 1]]
-                first_coords = atom_coords[first_indices]
-                second_coords = atom_coords[second_indices]
-                first_radii = atom_ext_radii[first_indices]
-                second_radii = atom_ext_radii[second_indices]
-                pair_dists_sq = (first_coords - second_coords).square().sum(dim=-1)
-                pair_valid = (
-                    (first_indices != second_indices)
-                    & (pair_dists_sq > (first_radii - second_radii).square())
-                    & (pair_dists_sq < (first_radii + second_radii).square())
-                )
-                pair_centers = _compute_pair_probe_centers(
-                    unresolved_points,
-                    atom_coords,
-                    atom_ext_radii,
-                    first_indices,
-                    second_indices,
-                )
-                pair_feasible = _centers_feasible_against_local_atoms(
-                    pair_centers,
-                    unresolved_local_coords,
-                    unresolved_local_ext_radii,
-                )
-                pair_scores = torch.abs(
-                    torch.linalg.norm(
-                        unresolved_points.unsqueeze(-2) - pair_centers,
-                        dim=-1,
-                    )
-                    - probe_radius
-                )
-                pair_membership = _pair_patch_membership(
-                    unresolved_points,
-                    pair_centers,
-                    atom_coords,
-                    atom_ext_radii,
-                    first_indices,
-                    second_indices,
-                )
-                unresolved_best_centers, unresolved_best_scores = (
-                    _replace_better_probe_centers(
-                        unresolved_best_centers,
-                        unresolved_best_scores,
-                        pair_centers,
-                        pair_scores,
-                        pair_valid & pair_feasible & pair_membership,
-                    )
-                )
-
-            still_unresolved = ~unresolved_best_scores.isfinite()
-            triple_rows = (
-                still_unresolved
-                | (unresolved_best_scores > 10 * torch.finfo(dtype).eps)
-            ).nonzero(as_tuple=False).reshape(-1)
-            if triple_rows.numel() > 0 and triple_combinations.numel() > 0:
-                triple_active_indices = active_indices[triple_rows]
-                triple_points = unresolved_points[triple_rows]
-                triple_local_coords = unresolved_local_coords[triple_rows]
-                triple_local_ext_radii = unresolved_local_ext_radii[triple_rows]
-                triple_slots = triple_combinations[
-                    (triple_combinations < active_count).all(dim=-1)
-                ]
-                first_indices = triple_active_indices[:, triple_slots[:, 0]]
-                second_indices = triple_active_indices[:, triple_slots[:, 1]]
-                third_indices = triple_active_indices[:, triple_slots[:, 2]]
-                triple_centers, triple_valid = _compute_triple_probe_centers(
-                    atom_coords,
-                    atom_ext_radii,
-                    first_indices,
-                    second_indices,
-                    third_indices,
-                )
-                distinct_triples = (
-                    (first_indices != second_indices)
-                    & (first_indices != third_indices)
-                    & (second_indices != third_indices)
-                ).unsqueeze(-1)
-                triple_feasible = _centers_feasible_against_local_atoms(
-                    triple_centers,
-                    triple_local_coords,
-                    triple_local_ext_radii,
-                )
-                triple_scores = torch.abs(
-                    torch.linalg.norm(
-                        triple_points.unsqueeze(-2).unsqueeze(-2) - triple_centers,
-                        dim=-1,
-                    )
-                    - probe_radius
-                )
-                triple_membership = _triple_patch_membership(
-                    triple_points,
-                    triple_centers,
-                    atom_coords,
-                    atom_ext_radii,
-                    first_indices,
-                    second_indices,
-                    third_indices,
-                )
-                flat_triple_centers = triple_centers.reshape(
-                    triple_centers.shape[0],
-                    -1,
-                    3,
-                )
-                flat_triple_scores = triple_scores.reshape(
-                    triple_scores.shape[0],
-                    -1,
-                )
-                flat_strict_mask = (
-                    distinct_triples
-                    & triple_valid
-                    & triple_feasible
-                    & triple_membership
-                ).reshape(triple_centers.shape[0], -1)
-                triple_best_centers, triple_best_scores = _replace_better_probe_centers(
-                    unresolved_best_centers[triple_rows],
-                    unresolved_best_scores[triple_rows],
-                    flat_triple_centers,
-                    flat_triple_scores,
-                    flat_strict_mask,
-                )
-                unresolved_best_centers[triple_rows] = triple_best_centers
-                unresolved_best_scores[triple_rows] = triple_best_scores
-
-            use_direct_fallback = ~unresolved_best_scores.isfinite()
-            unresolved_best_centers = torch.where(
-                use_direct_fallback.unsqueeze(-1),
-                unresolved_direct_centers,
-                unresolved_best_centers,
-            )
-            best_centers[unresolved_indices] = unresolved_best_centers
-            best_scores[unresolved_indices] = unresolved_best_scores
+            best_centers[triple_rows] = triple_centers[
+                torch.arange(triple_rows.shape[0], device=device),
+                selected_sign[triple_rows].clamp(0, 1),
+            ]
 
         flat_centers[start:stop] = best_centers
-        flat_valid_mask[start:stop] = point_is_valid
 
     return probe_centers, valid_point_mask
 
@@ -1789,33 +1840,30 @@ def _segment_clearance_mask_with_atom_grid(
             dtype=torch.bool,
             device=starts.device,
         )
-        if not bool(has_atom.any().item()):
-            clear_mask[start:stop] = block_clear
-            continue
-
         center_rows, cell_rows, slot_rows = has_atom.nonzero(as_tuple=True)
-        atom_indices = table.sorted_atom_indices[
-            positions[center_rows, cell_rows, slot_rows]
-        ]
-        candidate_coords = atom_coords[atom_indices]
-        start_to_atoms = candidate_coords - block_starts[center_rows]
-        nearest_params = (
-            start_to_atoms * block_dirs[center_rows]
-        ).sum(dim=-1) / segment_lens_sq[start:stop][center_rows]
-        nearest_params = nearest_params.clamp(0, 1)
-        closest_points = (
-            block_starts[center_rows]
-            + nearest_params.unsqueeze(-1) * block_dirs[center_rows]
-        )
-        closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
-        local_radii_sq = expanded_atom_radii_sq[atom_indices]
-        tol = (
-            256
-            * torch.finfo(starts.dtype).eps
-            * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
-        )
-        blocked = closest_dists_sq < local_radii_sq - tol
-        block_clear[center_rows[blocked]] = False
+        if center_rows.numel() > 0:
+            atom_indices = table.sorted_atom_indices[
+                positions[center_rows, cell_rows, slot_rows]
+            ]
+            candidate_coords = atom_coords[atom_indices]
+            start_to_atoms = candidate_coords - block_starts[center_rows]
+            nearest_params = (
+                start_to_atoms * block_dirs[center_rows]
+            ).sum(dim=-1) / segment_lens_sq[start:stop][center_rows]
+            nearest_params = nearest_params.clamp(0, 1)
+            closest_points = (
+                block_starts[center_rows]
+                + nearest_params.unsqueeze(-1) * block_dirs[center_rows]
+            )
+            closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
+            local_radii_sq = expanded_atom_radii_sq[atom_indices]
+            tol = (
+                256
+                * torch.finfo(starts.dtype).eps
+                * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
+            )
+            blocked = closest_dists_sq < local_radii_sq - tol
+            block_clear[center_rows[blocked]] = False
         clear_mask[start:stop] = block_clear
     return clear_mask
 
@@ -2040,26 +2088,23 @@ def _centers_feasible_with_atom_table(
             dtype=torch.bool,
             device=centers.device,
         )
-        if not bool(has_atom.any().item()):
-            feasible[start:stop] = block_feasible
-            continue
-
         center_rows, cell_rows, slot_rows = has_atom.nonzero(as_tuple=True)
-        atom_indices = table.sorted_atom_indices[
-            positions[center_rows, cell_rows, slot_rows]
-        ]
-        candidate_coords = atom_coords[atom_indices]
-        sq_dists = (
-            block_centers[center_rows] - candidate_coords
-        ).square().sum(dim=-1)
-        local_radii_sq = expanded_atom_radii_sq[atom_indices]
-        tol = (
-            float(tol_scale)
-            * torch.finfo(centers.dtype).eps
-            * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
-        )
-        blocked = sq_dists < local_radii_sq - tol
-        block_feasible[center_rows[blocked]] = False
+        if center_rows.numel() > 0:
+            atom_indices = table.sorted_atom_indices[
+                positions[center_rows, cell_rows, slot_rows]
+            ]
+            candidate_coords = atom_coords[atom_indices]
+            sq_dists = (
+                block_centers[center_rows] - candidate_coords
+            ).square().sum(dim=-1)
+            local_radii_sq = expanded_atom_radii_sq[atom_indices]
+            tol = (
+                float(tol_scale)
+                * torch.finfo(centers.dtype).eps
+                * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
+            )
+            blocked = sq_dists < local_radii_sq - tol
+            block_feasible[center_rows[blocked]] = False
         feasible[start:stop] = block_feasible
 
     return feasible
@@ -2582,13 +2627,15 @@ def project_points(
         atom_radii,
         probe_radius,
     )
-    valid_point_mask = valid_point_mask & _probe_centers_accessible_from_exterior(
-        probe_centers,
-        atom_coords,
-        atom_radii,
-        probe_radius,
-        valid_point_mask,
-    )
+    with torch.no_grad():
+        accessibility_mask = _probe_centers_accessible_from_exterior(
+            probe_centers.detach(),
+            atom_coords.detach(),
+            atom_radii.detach(),
+            probe_radius,
+            valid_point_mask,
+        )
+        valid_point_mask = valid_point_mask & accessibility_mask
 
     # Finally, project the original points onto the probe spheres.
     point_probe_center_diffs = points - probe_centers
@@ -2596,7 +2643,10 @@ def project_points(
     projected_points_on_ses = (
         probe_centers
         + point_probe_center_diffs
-        * (probe_radius / point_probe_center_dists).unsqueeze(-1)
+        * (
+            probe_radius
+            / point_probe_center_dists.clamp_min(torch.finfo(points.dtype).eps)
+        ).unsqueeze(-1)
     )
 
     return projected_points_on_ses, valid_point_mask
