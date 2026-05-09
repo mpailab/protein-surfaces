@@ -547,6 +547,71 @@ def test_double_chamber_cage_probe_blocks_cover_both_chambers() -> None:
     assert bool((centers[:, 0] > 1.0).any().item())
 
 
+def test_double_chamber_large_probe_patches_are_not_clustered() -> None:
+    molecule = get_molecule("Double chamber cage")
+    coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
+    radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
+
+    samples = _sample_analytic_samples(
+        coords,
+        radii,
+        1.4,
+        point_area=0.5,
+        probe_density_scale=1.0,
+        max_grid_points=500_000,
+    )
+
+    assert samples.blocks is not None
+    probe_mask = samples.block_types == PROBE_BLOCK_TYPE
+    support_counts = samples.blocks.probe_support_mask.sum(dim=-1)
+    large_block_ids = (support_counts == support_counts.max()).nonzero(
+        as_tuple=False,
+    ).reshape(-1)
+    assert int(support_counts.max().item()) == 10
+    assert large_block_ids.numel() == 2
+
+    for block_id in large_block_ids:
+        block_mask = probe_mask & (samples.block_indices == block_id)
+        points = samples.points[block_mask]
+        assert points.shape[0] >= 35
+
+        distances = torch.cdist(points, points)
+        distances.fill_diagonal_(float("inf"))
+        nearest = distances.min(dim=1).values
+        assert float(nearest.min() / nearest.median()) > 0.75
+
+
+def test_double_chamber_coarse_side_probe_patches_do_not_hit_quad_floor() -> None:
+    molecule = get_molecule("Double chamber cage")
+    coords = torch.as_tensor(molecule["coords"], dtype=torch.float64)
+    radii = torch.as_tensor(molecule["radii"], dtype=torch.float64)
+
+    blocks, context = build_analytic_blocks(
+        coords,
+        radii,
+        1.4,
+        max_grid_points=500_000,
+    )
+    probe_samples = _sample_probe_blocks(
+        context,
+        blocks,
+        point_area=0.5,
+        oversample_factor=1.0,
+        probe_density_scale=1.0,
+    )
+
+    assert probe_samples.points.shape[0] > 0
+    support_counts = blocks.probe_support_mask.sum(dim=-1)
+    block_ids, block_counts = torch.unique(
+        probe_samples.block_indices,
+        return_counts=True,
+    )
+    quad_counts = block_counts[support_counts[block_ids] == 4]
+
+    assert quad_counts.numel() > 0
+    assert int(quad_counts.max().item()) <= 5
+
+
 def test_sample_analytic_points_smoke_on_real_benchmark_pdb() -> None:
     pdb_path = Path("Data/01-benchmark_pdbs/2DS2_A.pdb")
     if not pdb_path.exists():

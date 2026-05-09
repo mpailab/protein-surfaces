@@ -56,6 +56,9 @@ _DEFAULT_GPU_TRIPLE_COMBO_BUDGET = 64_000_000
 # coarse patches and then greedily picks well-spaced directions from that pool.
 _WELL_SPACED_SELECTION_LIMIT = 256
 _WELL_SPACED_CANDIDATE_FACTOR = 12
+_CLIPPED_CAP_MIN_SUPPORTS = 6
+_CLIPPED_CAP_MIN_ACCEPTANCE = 0.5
+_CLIPPED_CAP_CANDIDATE_OVERSAMPLE = 1.5
 
 
 def _tensor_int_list(values: torch.Tensor) -> list[int]:
@@ -2428,12 +2431,38 @@ def _polygon_probe_patch_weights(
     anchor_weights[support_slots] = 1.0 / (support_count * anchor_norm)
     boundary_count = int(ordered_normals.shape[0])
     sample_count = count
+    # Tiny four-support patches should honor the area-derived count.  The
+    # generic central-layer fan has a 17-point floor for quads, which visually
+    # overfills small probe-sphere side caps at coarse densities.
+    if support_count == 4 and count < 2 * boundary_count:
+        local_weights = _simplex_weight_rows(
+            count,
+            support_count,
+            support_count,
+            dtype,
+            device,
+        )
+        weights = torch.zeros(
+            (local_weights.shape[0], max_support),
+            dtype=dtype,
+            device=device,
+        )
+        weights[:, support_slots] = local_weights
+        return weights
+
     # Wide polygons need extra candidate directions because rejection sampling
     # can concentrate near edges when only a few points are requested.
     if support_count >= 5:
         sample_count = max(sample_count, 3 * boundary_count, 2 * support_count)
     elif support_count == 4:
         sample_count = max(sample_count, 2 * boundary_count)
+
+    # Wider high-support patches are fastest through one clipped-cap tensor
+    # batch.  Five-support patches in real PDBs are usually tiny, where the
+    # polygon fan below is faster than setting up the clipped-cap solve.
+    include_central_layer = support_count == 4 or sample_count > 4 * boundary_count
+    if support_count >= 5 and not include_central_layer:
+        sample_count = max(sample_count, 4 * boundary_count)
 
     # Triangulate the polygon fan from the anchor and sample each triangle in
     # proportion to its solid angle.  This avoids the rejection sampler's many
@@ -2448,24 +2477,40 @@ def _polygon_probe_patch_weights(
             )
         )
     sub_areas_tensor = torch.stack(sub_areas).clamp_min(0)
+    if support_count >= _CLIPPED_CAP_MIN_SUPPORTS:
+        clipped_weights = _clipped_cap_polygon_weight_rows(
+            sample_count,
+            ordered_normals,
+            ordered_slots,
+            anchor,
+            anchor_weights,
+            max_support,
+            sub_areas_tensor.sum(),
+            dtype,
+            device,
+        )
+        if clipped_weights.shape[0] >= sample_count:
+            return clipped_weights
+
     sub_counts = _allocate_counts_by_weights(sample_count, sub_areas_tensor)
 
     polygon_weights = []
-    central_count = max(8, min(sample_count, sample_count // 8 + support_count))
-    central_local_weights = _simplex_weight_rows(
-        central_count,
-        support_count,
-        support_count,
-        dtype,
-        device,
-    )
-    central_weights = torch.zeros(
-        (central_local_weights.shape[0], max_support),
-        dtype=dtype,
-        device=device,
-    )
-    central_weights[:, support_slots] = central_local_weights
-    polygon_weights.append(central_weights)
+    if include_central_layer:
+        central_count = max(8, min(sample_count, sample_count // 8 + support_count))
+        central_local_weights = _simplex_weight_rows(
+            central_count,
+            support_count,
+            support_count,
+            dtype,
+            device,
+        )
+        central_weights = torch.zeros(
+            (central_local_weights.shape[0], max_support),
+            dtype=dtype,
+            device=device,
+        )
+        central_weights[:, support_slots] = central_local_weights
+        polygon_weights.append(central_weights)
 
     for index, sub_count in enumerate(_tensor_int_list(sub_counts)):
         if sub_count <= 0:
@@ -2684,6 +2729,154 @@ def _rejection_spherical_triangle_weight_rows(
         selected = _well_spaced_direction_indices(directions, count, axis)
         weights = weights[selected]
     return weights[:count]
+
+
+def _clipped_cap_polygon_weight_rows(
+    count: int,
+    ordered_normals: torch.Tensor,
+    ordered_slots: torch.Tensor,
+    anchor: torch.Tensor,
+    anchor_weights: torch.Tensor,
+    max_support: int,
+    polygon_area: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample a wide spherical polygon with one clipped cap tensor batch."""
+
+    support_count = int(ordered_normals.shape[0])
+    if count <= 0 or support_count < 3:
+        return torch.empty((0, max_support), dtype=dtype, device=device)
+    polygon_area_value = float(polygon_area.detach().item())
+    if not math.isfinite(polygon_area_value) or polygon_area_value <= _sqrt_eps(dtype):
+        return torch.empty((0, max_support), dtype=dtype, device=device)
+
+    cap_cos = float((ordered_normals @ anchor).min().clamp(-1, 1).item()) - 1e-6
+    cap_cos = max(-1.0, min(1.0, cap_cos))
+    if cap_cos <= 0.0:
+        cap_cos = -1.0
+
+    cap_area = max(2 * math.pi * (1.0 - cap_cos), polygon_area_value)
+    acceptance = max(min(polygon_area_value / cap_area, 1.0), 1e-3)
+    if acceptance < _CLIPPED_CAP_MIN_ACCEPTANCE:
+        return torch.empty((0, max_support), dtype=dtype, device=device)
+
+    candidate_count = max(
+        count,
+        int(math.ceil(_CLIPPED_CAP_CANDIDATE_OVERSAMPLE * count / acceptance)),
+        32,
+    )
+    directions = _low_discrepancy_cap_directions(
+        candidate_count,
+        anchor,
+        cap_cos,
+        0,
+        dtype,
+        device,
+    )
+    edge_normals = torch.cross(
+        ordered_normals,
+        torch.roll(ordered_normals, shifts=-1, dims=0),
+        dim=-1,
+    )
+    edge_signs = torch.sign(edge_normals @ anchor).clamp_min(0) * 2 - 1
+    edge_normals = edge_normals * edge_signs.unsqueeze(-1)
+    inside_tol = 1000 * torch.finfo(dtype).eps
+    inside_polygon = (
+        directions @ edge_normals.transpose(0, 1) >= -inside_tol
+    ).all(dim=-1)
+    accepted = directions[inside_polygon]
+    if accepted.shape[0] < count:
+        return torch.empty((0, max_support), dtype=dtype, device=device)
+    weights = _vectorized_polygon_direction_weights(
+        accepted,
+        ordered_normals,
+        ordered_slots,
+        anchor,
+        anchor_weights,
+        max_support,
+        dtype,
+        device,
+    )
+    if weights.shape[0] < count:
+        return torch.empty((0, max_support), dtype=dtype, device=device)
+    if weights.shape[0] > count:
+        selected = (
+            torch.arange(count, dtype=torch.long, device=device) * weights.shape[0]
+        ) // count
+        weights = weights[selected]
+    return weights
+
+
+def _vectorized_polygon_direction_weights(
+    directions: torch.Tensor,
+    ordered_normals: torch.Tensor,
+    ordered_slots: torch.Tensor,
+    anchor: torch.Tensor,
+    anchor_weights: torch.Tensor,
+    max_support: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Assign accepted polygon directions to fan sectors in one tensor batch."""
+
+    support_count = int(ordered_normals.shape[0])
+    if directions.numel() == 0 or support_count < 3:
+        return torch.empty((0, max_support), dtype=dtype, device=device)
+
+    triangle_vertices = torch.stack(
+        (
+            anchor.unsqueeze(0).expand(support_count, -1),
+            ordered_normals,
+            torch.roll(ordered_normals, shifts=-1, dims=0),
+        ),
+        dim=1,
+    )
+    matrices = triangle_vertices.transpose(1, 2)
+    coefficients = torch.einsum(
+        "eij,mj->emi",
+        torch.linalg.pinv(matrices),
+        directions,
+    )
+    reconstructed = torch.einsum("emi,eik->emk", coefficients, triangle_vertices)
+    residuals = torch.linalg.norm(
+        reconstructed - directions.unsqueeze(0),
+        dim=-1,
+    )
+    coef_tol = 1000 * torch.finfo(dtype).eps
+    residual_tol = 10 * math.sqrt(torch.finfo(dtype).eps)
+    inside = (
+        torch.isfinite(coefficients).all(dim=-1)
+        & (coefficients >= -coef_tol).all(dim=-1)
+        & (residuals <= residual_tol)
+    )
+    assigned = inside.any(dim=0)
+    if not bool(assigned.any().item()):
+        return torch.empty((0, max_support), dtype=dtype, device=device)
+
+    direction_rows = assigned.nonzero(as_tuple=False).reshape(-1)
+    sector_rows = inside.to(torch.long).argmax(dim=0)[direction_rows]
+    local_weights = coefficients[sector_rows, direction_rows].clamp_min(0)
+    local_weights = local_weights / local_weights.sum(
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(torch.finfo(dtype).eps)
+
+    weights = local_weights[:, 0:1] * anchor_weights.unsqueeze(0)
+    sample_rows = torch.arange(
+        local_weights.shape[0],
+        dtype=torch.long,
+        device=device,
+    )
+    first_slots = ordered_slots[sector_rows]
+    second_slots = ordered_slots[(sector_rows + 1) % support_count]
+    weights[sample_rows, first_slots] = (
+        weights[sample_rows, first_slots] + local_weights[:, 1]
+    )
+    weights[sample_rows, second_slots] = (
+        weights[sample_rows, second_slots] + local_weights[:, 2]
+    )
+    return weights
 
 
 def _rejection_spherical_polygon_weight_rows(
