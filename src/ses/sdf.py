@@ -235,10 +235,12 @@ def _grid_subsample(points: torch.Tensor, spacing: Optional[float]) -> torch.Ten
     if spacing is None or points.shape[0] == 0:
         return points
 
-    origin = points.min(dim=0).values
-    labels = torch.floor((points - origin) / float(spacing)).to(torch.long)
-    _, inverse = torch.unique(labels, dim=0, return_inverse=True)
-    num_cells = int(inverse.max().item()) + 1
+    with torch.no_grad():
+        detached_points = points.detach()
+        origin = detached_points.min(dim=0).values
+        labels = torch.floor((detached_points - origin) / float(spacing)).to(torch.long)
+        _, inverse = torch.unique(labels, dim=0, return_inverse=True)
+        num_cells = int(inverse.max().item()) + 1
 
     sums = torch.zeros((num_cells, 3), dtype=points.dtype, device=points.device)
     counts = torch.zeros((num_cells, 1), dtype=points.dtype, device=points.device)
@@ -460,31 +462,33 @@ def sample_sdf_points(
         pairwise_element_budget=pairwise_element_budget,
     )
 
-    sdf_values = _sdf_values(
-        centers,
-        coords,
-        expanded_radii,
-        float(smoothness),
-        pairwise_element_budget=pairwise_element_budget,
-    )
-    finite_mask = torch.isfinite(centers).all(dim=-1) & torch.isfinite(sdf_values)
-    level_mask = sdf_values.abs() <= float(level_tolerance)
-    feasible_mask = _centers_feasible_against_all_atoms(
-        centers,
-        coords,
-        expanded_radii.square(),
-    )
-    valid_center_mask = finite_mask & level_mask & feasible_mask
-    accessible_mask = _probe_centers_accessible_from_exterior(
-        centers,
-        coords,
-        radii,
-        float(probe_radius),
-        valid_center_mask=valid_center_mask,
-        grid_spacing=grid_spacing,
-        max_grid_points=int(max_grid_points),
-        assume_centers_feasible=True,
-    )
+    with torch.no_grad():
+        detached_centers = centers.detach()
+        sdf_values = _sdf_values(
+            detached_centers,
+            coords.detach(),
+            expanded_radii.detach(),
+            float(smoothness),
+            pairwise_element_budget=pairwise_element_budget,
+        )
+        finite_mask = torch.isfinite(detached_centers).all(dim=-1) & torch.isfinite(sdf_values)
+        level_mask = sdf_values.abs() <= float(level_tolerance)
+        feasible_mask = _centers_feasible_against_all_atoms(
+            detached_centers,
+            coords.detach(),
+            expanded_radii.detach().square(),
+        )
+        valid_center_mask = finite_mask & level_mask & feasible_mask
+        accessible_mask = _probe_centers_accessible_from_exterior(
+            detached_centers,
+            coords.detach(),
+            radii.detach(),
+            float(probe_radius),
+            valid_center_mask=valid_center_mask,
+            grid_spacing=grid_spacing,
+            max_grid_points=int(max_grid_points),
+            assume_centers_feasible=True,
+        )
     centers = centers[accessible_mask]
     centers = _grid_subsample(centers, subsample_spacing)
 
@@ -496,12 +500,13 @@ def sample_sdf_points(
         pairwise_element_budget=pairwise_element_budget,
     )
     points = centers - float(probe_radius) * normals
-    outside_mask = _points_outside_atoms(
-        points,
-        coords,
-        radii,
-        pairwise_element_budget=pairwise_element_budget,
-    )
+    with torch.no_grad():
+        outside_mask = _points_outside_atoms(
+            points.detach(),
+            coords.detach(),
+            radii.detach(),
+            pairwise_element_budget=pairwise_element_budget,
+        )
     points = points[outside_mask]
     normals = normals[outside_mask]
     centers = centers[outside_mask]
@@ -511,14 +516,15 @@ def sample_sdf_points(
     support_indices = None
     support_mask = None
     if include_atom_features or include_adjacency:
-        atom_features = _sdf_atom_features(
-            centers,
-            coords,
-            expanded_radii,
-            float(smoothness),
-            float(feature_threshold),
-            pairwise_element_budget=pairwise_element_budget,
-        )
+        with torch.no_grad():
+            atom_features = _sdf_atom_features(
+                centers.detach(),
+                coords.detach(),
+                expanded_radii.detach(),
+                float(smoothness),
+                float(feature_threshold),
+                pairwise_element_budget=pairwise_element_budget,
+            )
     if include_adjacency:
         support_indices, support_mask = dense_features_to_supports(atom_features)
     adjacency = (

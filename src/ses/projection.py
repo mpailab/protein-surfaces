@@ -2659,13 +2659,15 @@ def project_points(
         atom_radii,
         probe_radius,
     )
-    valid_point_mask = valid_point_mask & _probe_centers_accessible_from_exterior(
-        probe_centers,
-        atom_coords,
-        atom_radii,
-        probe_radius,
-        valid_point_mask,
-    )
+    with torch.no_grad():
+        accessible_mask = _probe_centers_accessible_from_exterior(
+            probe_centers.detach(),
+            atom_coords.detach(),
+            atom_radii.detach(),
+            probe_radius,
+            valid_point_mask,
+        )
+    valid_point_mask = valid_point_mask & accessible_mask
 
     # Finally, project the original points onto the probe spheres.
     point_probe_center_diffs = points - probe_centers

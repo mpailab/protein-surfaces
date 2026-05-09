@@ -7,6 +7,7 @@ from ses.graph import (
     _candidate_edges_from_keep,
     _disjoint_single_support_relationships,
     _edge_weights,
+    _edge_weights_for_edges,
     _effective_pairwise_element_budget,
     _empty_adjacency,
     _masked_topk_candidates,
@@ -220,6 +221,26 @@ def test_vector_geometry_and_weight_helpers() -> None:
         _pairwise_metric_distances(euclidean_distances, row_normals, col_normals, "geodesic"),
         torch.tensor([[math.pi / 2**0.5]], dtype=torch.float64),
     )
+
+    edge_points = torch.tensor(
+        [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    edge_normals = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    edge_weights = _edge_weights_for_edges(
+        edge_points,
+        edge_normals,
+        torch.tensor([0]),
+        torch.tensor([1]),
+        "geodesic",
+    )
+    assert edge_weights.requires_grad
+    assert torch.allclose(edge_weights, torch.tensor([math.pi / 2**0.5], dtype=torch.float64))
 
 
 def test_candidate_selection_helpers() -> None:

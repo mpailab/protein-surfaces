@@ -60,6 +60,82 @@ def _assert_points_backprop_to_atom_inputs(
     assert float(radii.grad.abs().sum()) > 0
 
 
+def _assert_atom_input_gradients(
+    coords: torch.Tensor,
+    radii: torch.Tensor,
+) -> None:
+    assert coords.grad is not None
+    assert radii.grad is not None
+    assert torch.isfinite(coords.grad).all()
+    assert torch.isfinite(radii.grad).all()
+    assert float(coords.grad.abs().sum()) > 0
+    assert float(radii.grad.abs().sum()) > 0
+
+
+def _sample_public_geometry(
+    sampler_name: str,
+    coords: torch.Tensor,
+    radii: torch.Tensor,
+    *,
+    include_normals: bool = False,
+    include_adjacency: bool = False,
+):
+    if sampler_name == "projected":
+        return sample_projected_points(
+            coords,
+            radii,
+            m=32,
+            probe_radius=1.4,
+            include_normals=include_normals,
+            include_adjacency=include_adjacency,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+        )
+    if sampler_name == "analytic":
+        return sample_analytic_points(
+            coords,
+            radii,
+            1.4,
+            point_area=5.0,
+            atom_filter_samples=16,
+            pair_filter_samples=6,
+            include_normals=include_normals,
+            include_adjacency=include_adjacency,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+            max_grid_points=100_000,
+        )
+    if sampler_name == "sdf":
+        return sample_sdf_points(
+            coords,
+            radii,
+            m=32,
+            probe_radius=1.4,
+            smoothness=0.1,
+            level_tolerance=1e-5,
+            include_normals=include_normals,
+            include_adjacency=include_adjacency,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+            max_grid_points=100_000,
+        )
+    if sampler_name == "tiled_analytic":
+        return sample_tiled_analytic_points(
+            coords,
+            radii,
+            1.4,
+            point_area=4.0,
+            tile_size=4.0,
+            tile_overlap=2.0,
+            include_normals=include_normals,
+            include_adjacency=include_adjacency,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=6,
+            max_grid_points=100_000,
+        )
+    raise ValueError(f"unknown sampler {sampler_name!r}")
+
+
 def _assert_unit_normals(points: torch.Tensor, normals: torch.Tensor) -> None:
     assert normals.shape == points.shape
     assert normals.dtype == points.dtype
@@ -624,6 +700,64 @@ def test_all_public_samplers_can_return_surface_adjacency() -> None:
 
     for points, adjacency in sampler_outputs:
         _assert_sparse_adjacency(points, adjacency)
+
+
+@pytest.mark.parametrize(
+    "sampler_name",
+    ["projected", "analytic", "sdf", "tiled_analytic"],
+)
+def test_public_sampler_normals_backprop_to_atom_inputs(
+    sampler_name: str,
+) -> None:
+    coords, radii = _three_atom_cavity()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+
+    points, normals = _sample_public_geometry(
+        sampler_name,
+        coords,
+        radii,
+        include_normals=True,
+    )
+    _assert_unit_normals(points, normals)
+    assert normals.requires_grad
+
+    weights = torch.linspace(
+        -0.7,
+        0.9,
+        normals.numel(),
+        dtype=normals.dtype,
+        device=normals.device,
+    ).reshape_as(normals)
+    (normals * weights).sum().backward()
+
+    _assert_atom_input_gradients(coords, radii)
+
+
+@pytest.mark.parametrize(
+    "sampler_name",
+    ["projected", "analytic", "sdf", "tiled_analytic"],
+)
+def test_public_sampler_adjacency_values_backprop_to_atom_inputs(
+    sampler_name: str,
+) -> None:
+    coords, radii = _three_atom_cavity()
+    coords.requires_grad_(True)
+    radii.requires_grad_(True)
+
+    points, adjacency = _sample_public_geometry(
+        sampler_name,
+        coords,
+        radii,
+        include_adjacency=True,
+    )
+    _assert_sparse_adjacency(points, adjacency)
+    values = adjacency.coalesce().values()
+    assert values.requires_grad
+
+    values.sum().backward()
+
+    _assert_atom_input_gradients(coords, radii)
 
 
 def test_tiled_analytic_sampler_preserves_gradients_to_atom_inputs() -> None:

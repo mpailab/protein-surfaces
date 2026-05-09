@@ -133,74 +133,85 @@ def build_surface_adjacency(
 
     kept_neighbors = min(neighbors, num_points - 1)
     candidate_neighbors = min(candidate_neighbors, num_points - 1)
-    (
-        neighbor_indices,
-        neighbor_distances,
-        neighbor_euclidean_distances,
-    ) = _nearest_topology_candidates(
+    with torch.no_grad():
+        selection_points = points.detach()
+        selection_normals = normals.detach()
+        (
+            neighbor_indices,
+            neighbor_distances,
+            neighbor_euclidean_distances,
+        ) = _nearest_topology_candidates(
+            selection_points,
+            selection_normals,
+            candidate_neighbors,
+            weight_mode=weight_mode,
+            support_indices=support_indices,
+            support_mask=support_mask,
+            block_types=block_types,
+            block_indices=block_indices,
+            max_distance=max_distance,
+            allow_disjoint_single_support_edges=allow_disjoint_single_support_edges,
+            pairwise_element_budget=pairwise_element_budget,
+        )
+
+        row_indices = torch.arange(
+            num_points,
+            dtype=torch.long,
+            device=points.device,
+        ).view(-1, 1)
+        deltas = selection_points[neighbor_indices] - selection_points.unsqueeze(1)
+        eps = torch.finfo(selection_points.dtype).eps
+        safe_distances = neighbor_euclidean_distances.clamp_min(eps)
+        directions = deltas / safe_distances.unsqueeze(-1)
+
+        row_normals = selection_normals.unsqueeze(1)
+        col_normals = selection_normals[neighbor_indices]
+        normal_cosines = (row_normals * col_normals).sum(dim=-1).clamp(-1, 1)
+        row_tangent_components = (directions * row_normals).sum(dim=-1).abs()
+        col_tangent_components = (directions * col_normals).sum(dim=-1).abs()
+        valid = (
+            torch.isfinite(neighbor_distances)
+            & torch.isfinite(neighbor_euclidean_distances)
+            & (neighbor_euclidean_distances > eps)
+            & (normal_cosines >= float(min_normal_cosine))
+            & (row_tangent_components <= float(max_tangent_component))
+            & (col_tangent_components <= float(max_tangent_component))
+        )
+        if max_distance is not None:
+            valid = valid & (neighbor_distances <= float(max_distance))
+
+        if prune_redundant_edges and kept_neighbors >= 3:
+            keep = _select_angular_neighbors(
+                selection_normals,
+                directions,
+                neighbor_distances,
+                valid,
+                max_neighbors=kept_neighbors,
+            )
+        else:
+            keep = _select_nearest_valid_candidates(
+                neighbor_distances,
+                valid,
+                max_neighbors=kept_neighbors,
+            )
+        unique_first, unique_second, _ = _unique_undirected_edges(
+            *_candidate_edges_from_keep(
+                row_indices,
+                neighbor_indices,
+                neighbor_euclidean_distances,
+                normal_cosines,
+                keep,
+                weight_mode=weight_mode,
+                like=points,
+            ),
+            num_points,
+        )
+    unique_weights = _edge_weights_for_edges(
         points,
         normals,
-        candidate_neighbors,
-        weight_mode=weight_mode,
-        support_indices=support_indices,
-        support_mask=support_mask,
-        block_types=block_types,
-        block_indices=block_indices,
-        max_distance=max_distance,
-        allow_disjoint_single_support_edges=allow_disjoint_single_support_edges,
-        pairwise_element_budget=pairwise_element_budget,
-    )
-
-    row_indices = torch.arange(num_points, dtype=torch.long, device=points.device).view(
-        -1,
-        1,
-    )
-    deltas = points[neighbor_indices] - points.unsqueeze(1)
-    eps = torch.finfo(points.dtype).eps
-    safe_distances = neighbor_euclidean_distances.clamp_min(eps)
-    directions = deltas / safe_distances.unsqueeze(-1)
-
-    row_normals = normals.unsqueeze(1)
-    col_normals = normals[neighbor_indices]
-    normal_cosines = (row_normals * col_normals).sum(dim=-1).clamp(-1, 1)
-    row_tangent_components = (directions * row_normals).sum(dim=-1).abs()
-    col_tangent_components = (directions * col_normals).sum(dim=-1).abs()
-    valid = (
-        torch.isfinite(neighbor_distances)
-        & torch.isfinite(neighbor_euclidean_distances)
-        & (neighbor_euclidean_distances > eps)
-        & (normal_cosines >= float(min_normal_cosine))
-        & (row_tangent_components <= float(max_tangent_component))
-        & (col_tangent_components <= float(max_tangent_component))
-    )
-    if max_distance is not None:
-        valid = valid & (neighbor_distances <= float(max_distance))
-
-    if prune_redundant_edges and kept_neighbors >= 3:
-        keep = _select_angular_neighbors(
-            normals,
-            directions,
-            neighbor_distances,
-            valid,
-            max_neighbors=kept_neighbors,
-        )
-    else:
-        keep = _select_nearest_valid_candidates(
-            neighbor_distances,
-            valid,
-            max_neighbors=kept_neighbors,
-        )
-    unique_first, unique_second, unique_weights = _unique_undirected_edges(
-        *_candidate_edges_from_keep(
-            row_indices,
-            neighbor_indices,
-            neighbor_euclidean_distances,
-            normal_cosines,
-            keep,
-            weight_mode=weight_mode,
-            like=points,
-        ),
-        num_points,
+        unique_first,
+        unique_second,
+        weight_mode,
     )
 
     return _sparse_adjacency_from_edges(
@@ -210,6 +221,36 @@ def build_surface_adjacency(
         num_points,
         points,
     )
+
+
+def _edge_weights_for_edges(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    first: torch.Tensor,
+    second: torch.Tensor,
+    weight_mode: AdjacencyWeightMode,
+) -> torch.Tensor:
+    """Compute differentiable weights for already selected graph edges.
+
+    Args:
+        points: SES point coordinates, shape ``(num_points, 3)``.
+        normals: Unit normals aligned with ``points``.
+        first: First endpoint indices for undirected edges.
+        second: Second endpoint indices for undirected edges.
+        weight_mode: Edge-weight metric, either ``"euclidean"`` or
+            ``"geodesic"``.
+
+    Returns:
+        Edge weights with gradients flowing only through ``points`` and
+        ``normals`` at the selected endpoints.
+    """
+
+    if first.numel() == 0:
+        return torch.empty((0,), dtype=points.dtype, device=points.device)
+    deltas = points[second] - points[first]
+    distances = torch.linalg.norm(deltas, dim=-1)
+    normal_cosines = (normals[first] * normals[second]).sum(dim=-1).clamp(-1, 1)
+    return _edge_weights(distances, normal_cosines, weight_mode)
 
 
 def _candidate_edges_from_keep(
