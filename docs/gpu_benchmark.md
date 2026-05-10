@@ -277,9 +277,10 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
 ## Important Parameters
 
 - `--methods`: comma-separated subset, or `all`.
-- `--interfaces`: output interface modes to benchmark. Default: `points`; use
-  `points,normals,adjacency` or `all` when measuring normal and graph-building
-  overhead.
+- `--interfaces`: independent output variants to benchmark. Default: `points`,
+  which requests only point coordinates. Use comma-separated `features`,
+  `normals`, and `adjacency` to add isolated feature, normal, and graph
+  measurements, or `all` for all four variants.
 - `--sweep-preset`: `none`, `focused`, or `broad`.
 - `--repeats`: repeated runs per molecule/method/variant.
 - `--largest-first`: run the largest PDBs first, using an atom-count estimate.

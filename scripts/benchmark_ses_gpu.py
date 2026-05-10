@@ -48,7 +48,12 @@ SCHEMA_VERSION = 2
 PROGRAM_VERSION = "0.0.3"
 BENCHMARK_DRIVER_VERSION = "0.0.3"
 METHOD_ORDER = ("analytic", "projected", "sdf", "tiled_analytic")
-INTERFACE_MODE_ORDER = ("points", "normals", "adjacency", "normals_adjacency")
+INTERFACE_MODE_ORDER = (
+    "points",
+    "features",
+    "normals",
+    "adjacency",
+)
 MB = 1024 * 1024
 TILED_NUMERIC_TILE_SIZE_DEFAULT_OVERLAP = 4.0
 POINT_AREA_DEFAULT = 0.5
@@ -480,29 +485,37 @@ def _parse_interface_modes(value: str) -> List[str]:
     normalized = value.strip().lower()
     if normalized == "all":
         return list(INTERFACE_MODE_ORDER)
-    aliases = {
-        "points_only": "points",
-        "normal": "normals",
-        "normals_only": "normals",
-        "graph": "adjacency",
-        "edges": "adjacency",
-        "adjacency_only": "adjacency",
-        "all_outputs": "normals_adjacency",
-        "normals+adjacency": "normals_adjacency",
-        "normals,adjacency": "normals_adjacency",
+    aliases: Dict[str, Tuple[str, ...]] = {
+        "points_only": ("points",),
+        "atom_features": ("features",),
+        "feature": ("features",),
+        "features_only": ("features",),
+        "normal": ("normals",),
+        "normals_only": ("normals",),
+        "features_normals": ("features", "normals"),
+        "features+normals": ("features", "normals"),
+        "graph": ("adjacency",),
+        "edges": ("adjacency",),
+        "adjacency_only": ("adjacency",),
+        "all_outputs": INTERFACE_MODE_ORDER,
+        "features_normals_adjacency": ("features", "normals", "adjacency"),
+        "normals_adjacency": ("features", "normals", "adjacency"),
+        "normals+adjacency": ("features", "normals", "adjacency"),
+        "features+normals+adjacency": ("features", "normals", "adjacency"),
     }
     modes: List[str] = []
     for item in value.split(","):
-        mode = aliases.get(item.strip().lower(), item.strip().lower())
-        if not mode:
+        raw_mode = item.strip().lower()
+        if not raw_mode:
             continue
-        if mode not in INTERFACE_MODE_ORDER:
-            allowed = ", ".join(INTERFACE_MODE_ORDER)
-            raise argparse.ArgumentTypeError(
-                f"unknown interface mode {mode!r}; expected one of: {allowed}, all"
-            )
-        if mode not in modes:
-            modes.append(mode)
+        for mode in aliases.get(raw_mode, (raw_mode,)):
+            if mode not in INTERFACE_MODE_ORDER:
+                allowed = ", ".join(INTERFACE_MODE_ORDER)
+                raise argparse.ArgumentTypeError(
+                    f"unknown interface mode {mode!r}; expected one of: {allowed}, all"
+                )
+            if mode not in modes:
+                modes.append(mode)
     if not modes:
         raise argparse.ArgumentTypeError("at least one interface mode is required")
     return modes
@@ -747,10 +760,12 @@ def _method_params(
 
 
 def _interface_params(args: argparse.Namespace, mode: str) -> Dict[str, Any]:
-    include_normals = mode in {"normals", "normals_adjacency"}
-    include_adjacency = mode in {"adjacency", "normals_adjacency"}
+    include_atom_features = mode == "features"
+    include_normals = mode == "normals"
+    include_adjacency = mode == "adjacency"
     params: Dict[str, Any] = {
         "mode": mode,
+        "include_atom_features": include_atom_features,
         "include_normals": include_normals,
         "include_adjacency": include_adjacency,
     }
@@ -1073,7 +1088,9 @@ def _all_parameters(
             "oversample_factor=1.0, projected m=192, and SDF m=26. Sweep presets "
             "and *-values flags can vary these settings for throughput/quality "
             "tuning. Version 0.0.3 makes tiled_analytic auto tiles memory-aware "
-            "and lets one resolved tile use the analytic block pipeline."
+            "and lets one resolved tile use the analytic block pipeline. Interface "
+            "modes now measure points-only, feature, normal, and adjacency costs "
+            "as separate non-cumulative variants."
         ),
     }
 
@@ -1256,7 +1273,7 @@ def _call_method(
             point_area=method_params["point_area"],
             oversample_factor=method_params["oversample_factor"],
             probe_density_scale=method_params["probe_density_scale"],
-            include_atom_features=False,
+            include_atom_features=interface_params["include_atom_features"],
             include_normals=interface_params["include_normals"],
             include_adjacency=interface_params["include_adjacency"],
             **adjacency_kwargs,
@@ -1275,7 +1292,7 @@ def _call_method(
             radii,
             method_params["m"],
             args.probe_radius,
-            include_atom_features=False,
+            include_atom_features=interface_params["include_atom_features"],
             include_normals=interface_params["include_normals"],
             include_adjacency=interface_params["include_adjacency"],
             **adjacency_kwargs,
@@ -1291,7 +1308,7 @@ def _call_method(
             level_tolerance=method_params["level_tolerance"],
             subsample_spacing=method_params["subsample_spacing"],
             feature_threshold=method_params["feature_threshold"],
-            include_atom_features=False,
+            include_atom_features=interface_params["include_atom_features"],
             include_normals=interface_params["include_normals"],
             include_adjacency=interface_params["include_adjacency"],
             **adjacency_kwargs,
@@ -1312,7 +1329,7 @@ def _call_method(
             probe_density_scale=method_params["probe_density_scale"],
             dedup_tolerance=method_params["dedup_tolerance"],
             exact_accessibility=method_params["exact_accessibility"],
-            include_atom_features=False,
+            include_atom_features=interface_params["include_atom_features"],
             include_normals=interface_params["include_normals"],
             include_adjacency=interface_params["include_adjacency"],
             **adjacency_kwargs,
@@ -1327,7 +1344,7 @@ def _call_method(
 def _split_sampler_output(
     output: Any,
     interface_params: Dict[str, Any],
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     if isinstance(output, torch.Tensor):
         parts: List[torch.Tensor] = [output]
     elif isinstance(output, tuple):
@@ -1339,8 +1356,13 @@ def _split_sampler_output(
 
     points = parts[0]
     extras = parts[1:]
+    atom_features = None
     normals = None
     adjacency = None
+    if interface_params["include_atom_features"]:
+        if not extras or not isinstance(extras[0], torch.Tensor):
+            raise TypeError("sampler output is missing requested atom_features tensor")
+        atom_features = extras.pop(0)
     if interface_params["include_normals"]:
         if not extras or not isinstance(extras[0], torch.Tensor):
             raise TypeError("sampler output is missing requested normals tensor")
@@ -1351,7 +1373,7 @@ def _split_sampler_output(
         adjacency = extras.pop(0)
     if extras:
         raise TypeError("sampler returned unexpected extra tensors")
-    return points, normals, adjacency
+    return points, atom_features, normals, adjacency
 
 
 def _sparse_output_stats(adjacency: torch.Tensor, point_count: int) -> Dict[str, Any]:
@@ -1383,6 +1405,7 @@ def _sparse_output_stats(adjacency: torch.Tensor, point_count: int) -> Dict[str,
 
 def _output_stats(
     points: torch.Tensor,
+    atom_features: Optional[torch.Tensor],
     normals: Optional[torch.Tensor],
     adjacency: Optional[torch.Tensor],
 ) -> Dict[str, Any]:
@@ -1391,6 +1414,12 @@ def _output_stats(
         "output_tensor_count": 1,
         "output_tensor_bytes": _tensor_nbytes(points),
         "points_tensor_bytes": _tensor_nbytes(points),
+        "atom_features_present": atom_features is not None,
+        "atom_features_shape": None,
+        "atom_features_tensor_bytes": 0,
+        "finite_atom_features": None,
+        "atom_feature_active_mean": None,
+        "atom_feature_active_max": None,
         "normals_present": normals is not None,
         "normals_tensor_bytes": 0,
         "finite_normals": None,
@@ -1408,6 +1437,36 @@ def _output_stats(
         "adjacency_tensor_bytes": 0,
         "finite_adjacency_values": None,
     }
+    if atom_features is not None:
+        active_counts = (
+            atom_features.count_nonzero(dim=-1)
+            if atom_features.ndim == 2 and atom_features.numel()
+            else None
+        )
+        feature_bytes = _tensor_nbytes(atom_features)
+        stats.update(
+            {
+                "output_tensor_count": stats["output_tensor_count"] + 1,
+                "atom_features_shape": list(atom_features.shape),
+                "atom_features_tensor_bytes": feature_bytes,
+                "finite_atom_features": (
+                    bool(torch.isfinite(atom_features).all().item())
+                    if atom_features.numel()
+                    else True
+                ),
+                "atom_feature_active_mean": (
+                    float(active_counts.to(torch.float32).mean().item())
+                    if active_counts is not None and active_counts.numel()
+                    else None
+                ),
+                "atom_feature_active_max": (
+                    int(active_counts.max().item())
+                    if active_counts is not None and active_counts.numel()
+                    else None
+                ),
+            }
+        )
+        stats["output_tensor_bytes"] += feature_bytes
     if normals is not None:
         normal_lengths = torch.linalg.norm(normals, dim=-1) if normals.numel() else None
         normal_errors = (
@@ -1877,6 +1936,7 @@ def _run_one_method(
     wall_start = time.perf_counter()
     output: Any = None
     points: Optional[torch.Tensor] = None
+    atom_features: Optional[torch.Tensor] = None
     normals: Optional[torch.Tensor] = None
     adjacency: Optional[torch.Tensor] = None
     cuda_sync_error = None
@@ -1977,7 +2037,10 @@ def _run_one_method(
                         method_params,
                         interface_params,
                     )
-            points, normals, adjacency = _split_sampler_output(output, interface_params)
+            points, atom_features, normals, adjacency = _split_sampler_output(
+                output,
+                interface_params,
+            )
         if section_profiler is not None:
             section_summary = section_profiler.summary(limit=args.profile_top_functions)
         if end_event is not None:
@@ -1991,7 +2054,7 @@ def _run_one_method(
 
         memory = _cuda_memory(device)
         finite_points = bool(torch.isfinite(points).all().item()) if points.numel() else True
-        output_stats = _output_stats(points, normals, adjacency)
+        output_stats = _output_stats(points, atom_features, normals, adjacency)
         quality_metrics = _reference_metrics(
             points,
             reference_vertices,
@@ -2075,7 +2138,7 @@ def _run_one_method(
         if torch_profile_summary is not None:
             result["torch_profile"] = torch_profile_summary
     finally:
-        del output, points, normals, adjacency
+        del output, points, atom_features, normals, adjacency
         gc.collect()
         if device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -2776,8 +2839,9 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_parse_interface_modes,
         default=os.environ.get("SES_BENCH_INTERFACES", "points"),
         help=(
-            "Comma-separated sampler output interfaces to benchmark: points, "
-            "normals, adjacency, normals_adjacency, or all."
+            "Comma-separated independent sampler output variants to benchmark: "
+            "points, features, normals, adjacency, or all. The default points "
+            "variant requests only point coordinates."
         ),
     )
     parser.add_argument(
