@@ -51,7 +51,7 @@ defaults with normal CLI flags, or set `SES_BENCH_SWEEP_PRESET`,
 `SES_BENCH_REPEATS`, and `SES_BENCH_TORCH_PROFILE_LIMIT` before running the
 wrapper.
 
-Each run records `program_version`, defaulting to `0.0.2`. For release
+Each run records `program_version`, defaulting to `0.0.3`. For release
 benchmarks, set `SES_BENCH_PROGRAM_VERSION` to the same semantic version as the
 GitHub tag, for example `0.1.0`.
 
@@ -297,17 +297,21 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
   `euclidean`.
 - `--adjacency-neighbors`: maximum outgoing graph neighbors per point before
   symmetrization. Default: `6`.
-- `--tile-size` / `--tile-overlap`: default to `auto`; numeric tile-size sweeps use overlap `4.0` unless overridden.
+- `--tile-size` / `--tile-overlap`: default to `auto`; numeric tile-size
+  sweeps use overlap `4.0` unless overridden. For `tiled_analytic`, `auto`
+  prefers the largest candidate tile that fits the built-in 3 GiB tile-work
+  estimate. If one tile covers the molecule, `tiled_analytic` uses the same
+  analytic block pipeline as `sample_analytic_points`.
 - `--reference-sample-size`: reference quality subsample size. Default: `4096`.
 - `--torch-profile-limit`: number of method/variant runs to trace with PyTorch profiler.
 - `--profile-internals-every`: collect internal function profiles every N method/variant runs.
 - `--max-atoms`: optional debugging guard for very large structures.
 - `--dtype`: `float32` by default; use `float64` for precision comparisons.
 
-The defaults follow the 0.0.1 GPU focused sweep. The new tiled analytic default
-uses `point_area=0.5` and `atom/pair/probe_density_scale=1.55`; the projected,
-SDF, and analytic defaults were lowered to target a similar median point
-density.
+The defaults follow the 0.0.1 and 0.0.2 GPU focused sweeps. The tiled analytic
+default uses `point_area=0.5` and
+`atom/pair/probe_density_scale=1.55`; the projected, SDF, and analytic defaults
+target a similar median point density.
 
 ## Useful Environment Variables
 
@@ -315,7 +319,7 @@ density.
 - `SES_BENCH_OUTPUT`: JSONL output path.
 - `SES_BENCH_DATA_DIR`: PDB dataset directory.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
-- `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.2`.
+- `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.3`.
 - `SES_BENCH_INTERFACES`: default interface modes passed by the wrapper. Default: `points`.
 - `SES_BENCH_MOLECULE_ORDER`: default PDB order, for example `atom_count_desc`.
 - `SES_BENCH_AUTO_RESUME=0`: disable wrapper auto-resume. Auto-resume is enabled by default.

@@ -45,8 +45,8 @@ import ses.tiled_analytic as ses_tiled_analytic  # noqa: E402
 
 
 SCHEMA_VERSION = 2
-PROGRAM_VERSION = "0.0.2"
-BENCHMARK_DRIVER_VERSION = "0.0.2"
+PROGRAM_VERSION = "0.0.3"
+BENCHMARK_DRIVER_VERSION = "0.0.3"
 METHOD_ORDER = ("analytic", "projected", "sdf", "tiled_analytic")
 INTERFACE_MODE_ORDER = ("points", "normals", "adjacency", "normals_adjacency")
 MB = 1024 * 1024
@@ -1066,13 +1066,14 @@ def _all_parameters(
             "torch_profile_export_traces": args.torch_profile_export_traces,
         },
         "calibration_note": (
-            "Defaults are recalibrated from the 0.0.1 GPU focused sweep. "
+            "Defaults are recalibrated from the 0.0.1 and 0.0.2 GPU focused sweeps. "
             "The tiled analytic benchmark default is point_area=0.5 with "
             "atom/pair/probe density scales all set to 1.55. The other method "
             "defaults target a similar median point density: analytic "
             "oversample_factor=1.0, projected m=192, and SDF m=26. Sweep presets "
             "and *-values flags can vary these settings for throughput/quality "
-            "tuning."
+            "tuning. Version 0.0.3 makes tiled_analytic auto tiles memory-aware "
+            "and lets one resolved tile use the analytic block pipeline."
         ),
     }
 

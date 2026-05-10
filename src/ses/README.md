@@ -106,11 +106,14 @@ connect to fixed-probe reentrant patches, and boundary atom-to-probe links are
 kept when the local support metadata allows them. Concretely, nested support
 sets are treated as required neighboring SES patches: atom-pair when the atom
 belongs to the pair, atom-probe when the probe rests on the atom, and pair-probe
-when the probe rests on both atoms in the pair. Projection and SDF samplers use
-their available atom-support metadata as an approximation of the same rule. By
-default the graph is built for fast GPU construction and bounded degrees: all
-topologically allowed same-patch and adjacent-patch candidates compete in one
-nearest-neighbor pool, without separate reserve or repair passes.
+when the probe rests on both atoms in the pair. Projection uses its one-atom
+ownership metadata as a lightweight approximation of the same rule. SDF
+adjacency stays geometric by default to avoid building a dense point-by-atom
+feature matrix just for graph construction; when `include_atom_features=True`,
+those features are reused as support metadata. By default the graph is built
+for fast GPU construction and bounded degrees: all topologically allowed
+same-patch and adjacent-patch candidates compete in one nearest-neighbor pool,
+without separate reserve or repair passes.
 
 By default edge weights are Euclidean distances between endpoint coordinates.
 Pass `adjacency_weight="geodesic"` to use a local normal-angle geodesic
@@ -393,6 +396,22 @@ dense_points, dense_features = sample_analytic_points(
 fixed-probe support metadata. The point coordinates are still regenerated from
 the provided `atom_coords` and `atom_radii`.
 
+## Tiled Analytic Sampler
+
+`sample_tiled_analytic_points` is the GPU-oriented analytic interface. With
+multiple resolved tiles it samples local atom, pair and probe candidates in each
+tile, keeps only points that belong to the tile core, then stitches and
+deduplicates the results. Geometry-only calls avoid carrying full support
+metadata; requests for atom features or adjacency keep the sparse support data
+needed to build those outputs.
+
+When `tile_size="auto"` the sampler uses a memory-aware heuristic that prefers
+the largest candidate tile fitting the built-in 3 GiB tile-work estimate. Very
+large tiles are intentional: if the resolved grid contains one tile, the method
+falls back to the same analytic block pipeline used by `sample_analytic_points`,
+with `atom_density_scale` and `pair_density_scale` acting like analytic
+oversampling factors and `probe_density_scale` controlling fixed-probe patches.
+
 ## Choosing An Interface
 
 | Interface | Density parameter | Atom features | Best fit |
@@ -400,7 +419,7 @@ the provided `atom_coords` and `atom_radii`.
 | `sample_projected_points` | `m`, points per atom | One-hot owner atom | Quick deterministic SES clouds |
 | `sample_analytic_points` | `point_area`, approximate area per point | Multi-hot support atoms | Area-aware SES sampling and support metadata |
 | `sample_sdf_points` | `m`, level-set seeds per atom | Binary smooth-SDF supports | Smooth level-set SES clouds |
-| `sample_tiled_analytic_points` | `point_area`, approximate area per point | Multi-hot support atoms | Faster approximate analytic clouds for larger molecules |
+| `sample_tiled_analytic_points` | `point_area`, approximate area per point | Multi-hot support atoms | GPU-oriented analytic clouds with tiled or single-tile execution |
 
 The examples in `src/ses/example.py` are executable and show the core
 interfaces with comments focused on atom-type binding.

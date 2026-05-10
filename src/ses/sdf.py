@@ -532,7 +532,7 @@ def sample_sdf_points(
     atom_features = None
     support_indices = None
     support_mask = None
-    if include_atom_features or include_adjacency:
+    if include_atom_features:
         with torch.no_grad():
             atom_features = _sdf_atom_features(
                 centers.detach(),
@@ -542,7 +542,7 @@ def sample_sdf_points(
                 float(feature_threshold),
                 pairwise_element_budget=pairwise_element_budget,
             )
-    if include_adjacency:
+    if include_adjacency and atom_features is not None:
         support_indices, support_mask = dense_features_to_supports(atom_features)
     adjacency = (
         build_surface_adjacency(

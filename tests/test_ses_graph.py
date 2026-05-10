@@ -766,6 +766,40 @@ def test_surface_adjacency_can_allow_disjoint_single_support_edges() -> None:
     assert allowed[0, 1] > 0
 
 
+def test_surface_adjacency_single_support_unrestricted_matches_plain_knn() -> None:
+    points = torch.tensor(
+        [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+        ],
+        dtype=torch.float64,
+    )
+    normals = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float64).expand_as(points)
+    support_indices = torch.arange(points.shape[0], dtype=torch.long).unsqueeze(-1)
+    support_mask = torch.ones_like(support_indices, dtype=torch.bool)
+
+    plain = build_surface_adjacency(
+        points,
+        normals,
+        neighbors=2,
+        candidate_neighbors=2,
+    ).coalesce()
+    unrestricted = build_surface_adjacency(
+        points,
+        normals,
+        support_indices=support_indices,
+        support_mask=support_mask,
+        neighbors=2,
+        candidate_neighbors=2,
+        allow_disjoint_single_support_edges=True,
+    ).coalesce()
+
+    assert torch.equal(unrestricted.indices(), plain.indices())
+    assert torch.allclose(unrestricted.values(), plain.values())
+
+
 def test_surface_adjacency_keeps_atom_probe_links_with_weights() -> None:
     points = torch.tensor(
         [

@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 import torch
 
+import ses.sdf as sdf_module
 from ses import sample_analytic_points, sample_projected_points, sample_sdf_points
 from ses.sdf import _sdf_values_and_normals
 
@@ -171,6 +172,32 @@ def test_sample_sdf_points_preserves_gradients_to_atom_inputs() -> None:
     assert torch.isfinite(radii.grad).all()
     assert float(coords.grad.abs().sum()) > 0
     assert float(radii.grad.abs().sum()) > 0
+
+
+def test_sdf_adjacency_without_atom_features_skips_dense_features(monkeypatch) -> None:
+    coords, radii = _two_separated_atoms()
+
+    def _unexpected_dense_features(*args, **kwargs):
+        raise AssertionError("dense SDF atom features should not be built")
+
+    monkeypatch.setattr(sdf_module, "_sdf_atom_features", _unexpected_dense_features)
+    points, adjacency = sdf_module.sample_sdf_points(
+        coords,
+        radii,
+        m=12,
+        probe_radius=0.8,
+        smoothness=0.05,
+        level_tolerance=1e-6,
+        include_adjacency=True,
+        adjacency_neighbors=2,
+        adjacency_candidate_neighbors=4,
+    )
+
+    adjacency = adjacency.coalesce()
+    assert points.shape[0] > 0
+    assert adjacency.layout == torch.sparse_coo
+    assert adjacency.shape == (points.shape[0], points.shape[0])
+    assert torch.allclose(adjacency.to_dense(), adjacency.to_dense().transpose(0, 1))
 
 
 def test_sdf_normals_preserve_gradients_to_atom_inputs() -> None:

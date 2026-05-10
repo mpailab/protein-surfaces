@@ -12,6 +12,9 @@ AdjacencyWeightMode = Literal["euclidean", "geodesic"]
 
 _DEFAULT_PAIRWISE_ELEMENT_BUDGET = 8_000_000
 _DEFAULT_GPU_PAIRWISE_ELEMENT_BUDGET = 64_000_000
+_FAST_TOPOLOGY_MIN_POINTS = 4096
+_FAST_TOPOLOGY_MIN_CANDIDATES = 64
+_FAST_TOPOLOGY_CANDIDATE_MULTIPLIER = 8
 
 
 def build_surface_adjacency(
@@ -747,10 +750,41 @@ def _nearest_topology_candidates(
         )
 
     num_points = int(points.shape[0])
+    if _single_support_topology_is_unrestricted(
+        support_indices,
+        support_mask,
+        block_types,
+        block_indices,
+        allow_disjoint_single_support_edges,
+    ):
+        return _nearest_neighbor_candidates(
+            points,
+            normals,
+            neighbors,
+            weight_mode=weight_mode,
+            max_distance=max_distance,
+            pairwise_element_budget=pairwise_element_budget,
+        )
+
     effective_budget = _effective_pairwise_element_budget(
         points.device,
         pairwise_element_budget,
     )
+    if _should_prefilter_topology_candidates(num_points):
+        return _nearest_prefiltered_topology_candidates(
+            points,
+            normals,
+            neighbors,
+            weight_mode=weight_mode,
+            support_indices=support_indices,
+            support_mask=support_mask,
+            block_types=block_types,
+            block_indices=block_indices,
+            max_distance=max_distance,
+            allow_disjoint_single_support_edges=allow_disjoint_single_support_edges,
+            pairwise_element_budget=pairwise_element_budget,
+        )
+
     topology_element_multiplier = 1
     if support_indices is not None and support_mask is not None:
         topology_element_multiplier += max(1, int(support_indices.shape[1]))
@@ -822,6 +856,84 @@ def _nearest_topology_candidates(
     )
 
 
+def _single_support_topology_is_unrestricted(
+    support_indices: Optional[torch.Tensor],
+    support_mask: Optional[torch.Tensor],
+    block_types: Optional[torch.Tensor],
+    block_indices: Optional[torch.Tensor],
+    allow_disjoint_single_support_edges: bool,
+) -> bool:
+    if (
+        not allow_disjoint_single_support_edges
+        or support_indices is None
+        or support_mask is None
+        or block_types is not None
+        or block_indices is not None
+        or support_indices.shape[1] != 1
+    ):
+        return False
+    return bool(support_mask.all().item())
+
+
+def _should_prefilter_topology_candidates(num_points: int) -> bool:
+    return int(num_points) >= _FAST_TOPOLOGY_MIN_POINTS
+
+
+def _nearest_prefiltered_topology_candidates(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    neighbors: int,
+    *,
+    weight_mode: AdjacencyWeightMode,
+    support_indices: Optional[torch.Tensor],
+    support_mask: Optional[torch.Tensor],
+    block_types: Optional[torch.Tensor],
+    block_indices: Optional[torch.Tensor],
+    max_distance: Optional[float],
+    allow_disjoint_single_support_edges: bool,
+    pairwise_element_budget: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prefilter_neighbors = min(
+        int(points.shape[0]) - 1,
+        max(
+            int(neighbors),
+            _FAST_TOPOLOGY_MIN_CANDIDATES,
+            int(neighbors) * _FAST_TOPOLOGY_CANDIDATE_MULTIPLIER,
+        ),
+    )
+    neighbor_indices, metric_distances, euclidean_distances = _nearest_neighbor_candidates(
+        points,
+        normals,
+        prefilter_neighbors,
+        weight_mode=weight_mode,
+        max_distance=max_distance,
+        pairwise_element_budget=pairwise_element_budget,
+    )
+    rows = torch.arange(
+        int(points.shape[0]),
+        dtype=torch.long,
+        device=points.device,
+    ).view(-1, 1).expand_as(neighbor_indices)
+    topology_allowed = _topology_allowed_candidates(
+        rows,
+        neighbor_indices,
+        support_indices=support_indices,
+        support_mask=support_mask,
+        block_types=block_types,
+        block_indices=block_indices,
+        allow_disjoint_single_support_edges=allow_disjoint_single_support_edges,
+    )
+    valid = topology_allowed & torch.isfinite(metric_distances)
+    if max_distance is not None:
+        valid = valid & (metric_distances <= float(max_distance))
+    return _masked_topk_candidates(
+        neighbors,
+        metric_distances,
+        euclidean_distances,
+        valid,
+    )
+
+
 def _masked_topk_candidates(
     neighbors: int,
     metric_distances: torch.Tensor,
@@ -870,6 +982,54 @@ def _masked_topk_candidates(
     )
     block_euclidean_distances = torch.gather(euclidean_distances, 1, block_indices)
     return block_indices, block_distances, block_euclidean_distances
+
+
+def _topology_allowed_candidates(
+    rows: torch.Tensor,
+    cols: torch.Tensor,
+    *,
+    support_indices: Optional[torch.Tensor],
+    support_mask: Optional[torch.Tensor],
+    block_types: Optional[torch.Tensor],
+    block_indices: Optional[torch.Tensor],
+    allow_disjoint_single_support_edges: bool,
+) -> torch.Tensor:
+    if block_types is not None and block_indices is not None:
+        allowed = (
+            block_types[rows] == block_types[cols]
+        ) & (
+            block_indices[rows] == block_indices[cols]
+        )
+    else:
+        allowed = torch.ones_like(cols, dtype=torch.bool)
+
+    if support_indices is None or support_mask is None:
+        return allowed
+
+    same_support, adjacent_support, boundary_support = _support_relationships_for_pairs(
+        support_indices[rows],
+        support_mask[rows],
+        support_indices[cols],
+        support_mask[cols],
+    )
+    disjoint_single_support = (
+        _disjoint_single_support_relationships(
+            support_indices[rows],
+            support_mask[rows],
+            support_indices[cols],
+            support_mask[cols],
+        )
+        if allow_disjoint_single_support_edges
+        else torch.zeros_like(same_support)
+    )
+    support_allowed = (
+        same_support
+        | (adjacent_support & boundary_support)
+        | disjoint_single_support
+    )
+    if block_types is not None and block_indices is not None:
+        return allowed | support_allowed
+    return support_allowed
 
 
 def _topology_allowed_matrix(
