@@ -60,7 +60,7 @@ POINT_AREA_DEFAULT = 0.5
 ANALYTIC_OVERSAMPLE_FACTOR_DEFAULT = 1.0
 PROJECTED_M_DEFAULT = 192
 SDF_M_DEFAULT = 26
-TILED_DENSITY_SCALE_DEFAULT = 1.55
+TILED_DENSITY_SCALE_DEFAULT = 1.0
 _ACTIVE_SECTION_PROFILER: Optional["SectionProfiler"] = None
 _INSTALLED_PROFILE_WRAPPERS: List[Tuple[Any, str, Any]] = []
 _PROFILE_MODULES = (ses_projection, ses_analytic, ses_sdf, ses_tiled_analytic)
@@ -914,18 +914,18 @@ def _preset_values(method: str, base: Dict[str, Any], preset: str) -> Dict[str, 
         }
     elif method == "tiled_analytic":
         focused = {
-            "tile_size": ["auto", 24.0, 48.0, 64.0],
+            "tile_size": ["auto", 128.0, 256.0, 512.0],
             "tile_overlap": ["auto", 3.0, 4.0, 6.0],
-            "atom_density_scale": [1.0, base["atom_density_scale"], 4.0, 7.0],
-            "pair_density_scale": [0.0, 0.75, base["pair_density_scale"]],
-            "probe_density_scale": [0.0, 0.75, base["probe_density_scale"]],
+            "atom_density_scale": [0.75, base["atom_density_scale"], 1.55, 3.0],
+            "pair_density_scale": [0.0, 0.75, base["pair_density_scale"], 1.55],
+            "probe_density_scale": [0.0, 0.75, base["probe_density_scale"], 1.55],
         }
         broad = {
-            "tile_size": ["auto", 24.0, 32.0, 48.0, 64.0],
+            "tile_size": ["auto", 96.0, 128.0, 192.0, 256.0, 512.0],
             "tile_overlap": ["auto", 3.0, 4.0, 6.0],
-            "atom_density_scale": [1.0, 1.55, 3.0, 5.0, 7.0],
-            "pair_density_scale": [0.0, 0.75, 1.55, 2.0],
-            "probe_density_scale": [0.0, 0.75, 1.55, 2.0],
+            "atom_density_scale": [0.75, 1.0, 1.25, 1.55, 2.0, 3.0],
+            "pair_density_scale": [0.0, 0.5, 0.75, 1.0, 1.55],
+            "probe_density_scale": [0.0, 0.5, 0.75, 1.0, 1.55],
         }
     else:
         raise ValueError(f"unknown method: {method}")
@@ -1081,16 +1081,18 @@ def _all_parameters(
             "torch_profile_export_traces": args.torch_profile_export_traces,
         },
         "calibration_note": (
-            "Defaults are recalibrated from the 0.0.1 and 0.0.2 GPU focused sweeps. "
+            "Defaults are recalibrated from the 0.0.3 GPU default, tile sweep, "
+            "and analytic/tiled deep runs. "
             "The tiled analytic benchmark default is point_area=0.5 with "
-            "atom/pair/probe density scales all set to 1.55. The other method "
+            "atom/pair/probe density scales all set to 1.0. The other method "
             "defaults target a similar median point density: analytic "
             "oversample_factor=1.0, projected m=192, and SDF m=26. Sweep presets "
             "and *-values flags can vary these settings for throughput/quality "
-            "tuning. Version 0.0.3 makes tiled_analytic auto tiles memory-aware "
-            "and lets one resolved tile use the analytic block pipeline. Interface "
-            "modes now measure points-only, feature, normal, and adjacency costs "
-            "as separate non-cumulative variants."
+            "tuning. The tiled_analytic auto tile heuristic is memory-aware for "
+            "small and large molecules and prefers large tiles unless estimated "
+            "tile work would exceed the budget. Interface modes measure "
+            "points-only, feature, normal, and adjacency costs as separate "
+            "non-cumulative variants."
         ),
     }
 

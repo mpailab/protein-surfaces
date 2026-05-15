@@ -262,35 +262,13 @@ def _points_outside_atoms(
 ) -> torch.Tensor:
     """Return whether SES points are outside every atom van der Waals sphere."""
 
-    if points.shape[0] == 0:
-        return torch.empty((0,), dtype=torch.bool, device=points.device)
-    if atom_coords.shape[0] == 0:
-        return torch.ones((points.shape[0],), dtype=torch.bool, device=points.device)
-
     with torch.no_grad():
-        detached_points = points.detach()
-        detached_coords = atom_coords.detach()
-        detached_radii = atom_radii.detach()
-        rows = _max_sdf_rows(
-            detached_coords.shape[0],
-            pairwise_element_budget,
-            device=detached_points.device,
+        return _centers_feasible_against_all_atoms(
+            points.detach(),
+            atom_coords.detach(),
+            atom_radii.detach().square(),
+            tol_scale=256,
         )
-        masks = []
-        radii_sq = detached_radii.square().unsqueeze(0)
-        for start in range(0, detached_points.shape[0], rows):
-            stop = min(start + rows, detached_points.shape[0])
-            sq_dists = torch.cdist(
-                detached_points[start:stop],
-                detached_coords,
-            ).square()
-            tol = (
-                256
-                * torch.finfo(detached_points.dtype).eps
-                * torch.maximum(sq_dists, radii_sq).clamp_min(1)
-            )
-            masks.append((sq_dists >= radii_sq - tol).all(dim=-1))
-        return torch.cat(masks, dim=0)
 
 
 def _sdf_atom_features(
@@ -325,11 +303,7 @@ def _sdf_atom_features(
         )
         for start in range(0, num_points, rows):
             stop = min(start + rows, num_points)
-            center_distances = torch.linalg.norm(
-                detached_centers[start:stop].unsqueeze(1)
-                - detached_coords.unsqueeze(0),
-                dim=-1,
-            )
+            center_distances = torch.cdist(detached_centers[start:stop], detached_coords)
             signed_distances = center_distances - detached_radii.unsqueeze(0)
             weights = torch.softmax(-signed_distances / float(smoothness), dim=-1)
             strongest = weights == weights.max(dim=-1, keepdim=True).values
@@ -474,18 +448,34 @@ def sample_sdf_points(
         pairwise_element_budget=pairwise_element_budget,
     )
 
+    can_reuse_center_normals = (
+        subsample_spacing is None
+        and not coords.requires_grad
+        and not radii.requires_grad
+        and not centers.requires_grad
+    )
+    center_normals = None
     with torch.no_grad():
         detached_centers = centers.detach()
         detached_coords = coords.detach()
         detached_radii = radii.detach()
         detached_expanded_radii = expanded_radii.detach()
-        sdf_values = _sdf_values(
-            detached_centers,
-            detached_coords,
-            detached_expanded_radii,
-            float(smoothness),
-            pairwise_element_budget=pairwise_element_budget,
-        )
+        if can_reuse_center_normals:
+            sdf_values, center_normals = _sdf_values_and_normals(
+                detached_centers,
+                detached_coords,
+                detached_expanded_radii,
+                float(smoothness),
+                pairwise_element_budget=pairwise_element_budget,
+            )
+        else:
+            sdf_values = _sdf_values(
+                detached_centers,
+                detached_coords,
+                detached_expanded_radii,
+                float(smoothness),
+                pairwise_element_budget=pairwise_element_budget,
+            )
         finite_mask = torch.isfinite(detached_centers).all(dim=-1) & torch.isfinite(
             sdf_values
         )
@@ -507,15 +497,17 @@ def sample_sdf_points(
             assume_centers_feasible=True,
         )
     centers = centers[accessible_mask]
-    centers = _grid_subsample(centers, subsample_spacing)
-
-    _, normals = _sdf_values_and_normals(
-        centers,
-        coords,
-        expanded_radii,
-        float(smoothness),
-        pairwise_element_budget=pairwise_element_budget,
-    )
+    if center_normals is not None:
+        normals = center_normals[accessible_mask]
+    else:
+        centers = _grid_subsample(centers, subsample_spacing)
+        _, normals = _sdf_values_and_normals(
+            centers,
+            coords,
+            expanded_radii,
+            float(smoothness),
+            pairwise_element_budget=pairwise_element_budget,
+        )
     points = centers - float(probe_radius) * normals
     with torch.no_grad():
         outside_mask = _points_outside_atoms(

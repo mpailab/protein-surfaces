@@ -1421,11 +1421,46 @@ def _compute_active_set_probe_centers(
                     )
                     pair_best_scores, pair_best_cols = masked_pair_scores.min(dim=-1)
                     pair_has = pair_best_scores < unresolved_best_scores
-                    target_rows = unresolved_indices[pair_has]
-                    local_cols = pair_best_cols[pair_has]
-                    selected_kind[target_rows] = 2
-                    selected_first[target_rows] = first_indices[pair_has, local_cols]
-                    selected_second[target_rows] = second_indices[pair_has, local_cols]
+                    pair_best_first = torch.gather(
+                        first_indices,
+                        1,
+                        pair_best_cols.unsqueeze(-1),
+                    ).squeeze(-1)
+                    pair_best_second = torch.gather(
+                        second_indices,
+                        1,
+                        pair_best_cols.unsqueeze(-1),
+                    ).squeeze(-1)
+                    pair_update_mask = torch.zeros(
+                        (row_count,),
+                        dtype=torch.bool,
+                        device=device,
+                    ).scatter(0, unresolved_indices, pair_has)
+                    pair_first_by_row = selected_first.scatter(
+                        0,
+                        unresolved_indices,
+                        pair_best_first,
+                    )
+                    pair_second_by_row = selected_second.scatter(
+                        0,
+                        unresolved_indices,
+                        pair_best_second,
+                    )
+                    selected_kind = torch.where(
+                        pair_update_mask,
+                        torch.full_like(selected_kind, 2),
+                        selected_kind,
+                    )
+                    selected_first = torch.where(
+                        pair_update_mask,
+                        pair_first_by_row,
+                        selected_first,
+                    )
+                    selected_second = torch.where(
+                        pair_update_mask,
+                        pair_second_by_row,
+                        selected_second,
+                    )
                     unresolved_best_scores = torch.where(
                         pair_has,
                         pair_best_scores,
@@ -1493,16 +1528,68 @@ def _compute_active_set_probe_centers(
                     triple_best_scores, triple_best_flat = masked_triple_scores.min(dim=-1)
                     current_scores = unresolved_best_scores[triple_rows]
                     triple_has = triple_best_scores < current_scores
-                    good_rows = triple_has.nonzero(as_tuple=False).reshape(-1)
-                    target_rows = unresolved_indices[triple_rows[good_rows]]
-                    flat_cols = triple_best_flat[good_rows]
+                    target_rows = unresolved_indices[triple_rows]
+                    flat_cols = triple_best_flat
                     combo_cols = torch.div(flat_cols, 2, rounding_mode="floor")
                     signs = flat_cols.remainder(2)
-                    selected_kind[target_rows] = 3
-                    selected_first[target_rows] = first_indices[good_rows, combo_cols]
-                    selected_second[target_rows] = second_indices[good_rows, combo_cols]
-                    selected_third[target_rows] = third_indices[good_rows, combo_cols]
-                    selected_sign[target_rows] = signs
+                    local_rows = torch.arange(
+                        triple_rows.shape[0],
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    triple_best_first = first_indices[local_rows, combo_cols]
+                    triple_best_second = second_indices[local_rows, combo_cols]
+                    triple_best_third = third_indices[local_rows, combo_cols]
+                    triple_update_mask = torch.zeros(
+                        (row_count,),
+                        dtype=torch.bool,
+                        device=device,
+                    ).scatter(0, target_rows, triple_has)
+                    triple_first_by_row = selected_first.scatter(
+                        0,
+                        target_rows,
+                        triple_best_first,
+                    )
+                    triple_second_by_row = selected_second.scatter(
+                        0,
+                        target_rows,
+                        triple_best_second,
+                    )
+                    triple_third_by_row = selected_third.scatter(
+                        0,
+                        target_rows,
+                        triple_best_third,
+                    )
+                    triple_sign_by_row = selected_sign.scatter(
+                        0,
+                        target_rows,
+                        signs,
+                    )
+                    selected_kind = torch.where(
+                        triple_update_mask,
+                        torch.full_like(selected_kind, 3),
+                        selected_kind,
+                    )
+                    selected_first = torch.where(
+                        triple_update_mask,
+                        triple_first_by_row,
+                        selected_first,
+                    )
+                    selected_second = torch.where(
+                        triple_update_mask,
+                        triple_second_by_row,
+                        selected_second,
+                    )
+                    selected_third = torch.where(
+                        triple_update_mask,
+                        triple_third_by_row,
+                        selected_third,
+                    )
+                    selected_sign = torch.where(
+                        triple_update_mask,
+                        triple_sign_by_row,
+                        selected_sign,
+                    )
 
             flat_valid_mask[start:stop] = point_is_valid
 
@@ -1527,12 +1614,17 @@ def _compute_active_set_probe_centers(
 
         pair_rows = (selected_kind == 2).nonzero(as_tuple=False).reshape(-1)
         if pair_rows.numel() > 0:
-            best_centers[pair_rows] = _compute_pair_probe_centers(
+            pair_centers = _compute_pair_probe_centers(
                 block_points[pair_rows],
                 atom_coords,
                 atom_ext_radii,
                 selected_first[pair_rows],
                 selected_second[pair_rows],
+            )
+            best_centers = best_centers.scatter(
+                0,
+                pair_rows.view(-1, 1).expand(-1, 3),
+                pair_centers,
             )
 
         triple_rows = (selected_kind == 3).nonzero(as_tuple=False).reshape(-1)
@@ -1544,10 +1636,15 @@ def _compute_active_set_probe_centers(
                 selected_second[triple_rows],
                 selected_third[triple_rows],
             )
-            best_centers[triple_rows] = triple_centers[
+            chosen_triple_centers = triple_centers[
                 torch.arange(triple_rows.shape[0], device=device),
                 selected_sign[triple_rows].clamp(0, 1),
             ]
+            best_centers = best_centers.scatter(
+                0,
+                triple_rows.view(-1, 1).expand(-1, 3),
+                chosen_triple_centers,
+            )
 
         flat_centers[start:stop] = best_centers
 
@@ -1884,7 +1981,7 @@ def _segment_clearance_mask_with_atom_grid(
         min(
             starts.shape[0],
             _effective_pairwise_element_budget(starts.device)
-            // max(1, offsets.shape[0] * table.max_occupancy),
+            // max(1, offsets.shape[0] * table.max_occupancy * 2),
         ),
     )
     slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=starts.device)
@@ -1903,36 +2000,33 @@ def _segment_clearance_mask_with_atom_grid(
         has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
         block_starts = starts[start:stop]
         block_dirs = segment_dirs[start:stop]
-        block_clear = torch.ones(
+        safe_positions = positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
+        atom_indices = table.sorted_atom_indices[safe_positions].reshape(
             block_starts.shape[0],
-            dtype=torch.bool,
-            device=starts.device,
+            -1,
         )
-        center_rows, cell_rows, slot_rows = has_atom.nonzero(as_tuple=True)
-        if center_rows.numel() > 0:
-            atom_indices = table.sorted_atom_indices[
-                positions[center_rows, cell_rows, slot_rows]
-            ]
-            candidate_coords = atom_coords[atom_indices]
-            start_to_atoms = candidate_coords - block_starts[center_rows]
-            nearest_params = (
-                start_to_atoms * block_dirs[center_rows]
-            ).sum(dim=-1) / segment_lens_sq[start:stop][center_rows]
-            nearest_params = nearest_params.clamp(0, 1)
-            closest_points = (
-                block_starts[center_rows]
-                + nearest_params.unsqueeze(-1) * block_dirs[center_rows]
-            )
-            closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
-            local_radii_sq = expanded_atom_radii_sq[atom_indices]
-            tol = (
-                256
-                * torch.finfo(starts.dtype).eps
-                * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
-            )
-            blocked = closest_dists_sq < local_radii_sq - tol
-            block_clear[center_rows[blocked]] = False
-        clear_mask[start:stop] = block_clear
+        candidate_coords = atom_coords[atom_indices]
+        start_to_atoms = candidate_coords - block_starts.unsqueeze(1)
+        nearest_params = (
+            start_to_atoms * block_dirs.unsqueeze(1)
+        ).sum(dim=-1) / segment_lens_sq[start:stop].unsqueeze(-1)
+        nearest_params = nearest_params.clamp(0, 1)
+        closest_points = (
+            block_starts.unsqueeze(1)
+            + nearest_params.unsqueeze(-1) * block_dirs.unsqueeze(1)
+        )
+        closest_dists_sq = (closest_points - candidate_coords).square().sum(dim=-1)
+        local_radii_sq = expanded_atom_radii_sq[atom_indices]
+        tol = (
+            256
+            * torch.finfo(starts.dtype).eps
+            * torch.maximum(closest_dists_sq, local_radii_sq).clamp_min(1)
+        )
+        blocked = (
+            has_atom.reshape(block_starts.shape[0], -1)
+            & (closest_dists_sq < local_radii_sq - tol)
+        )
+        clear_mask[start:stop] = ~blocked.any(dim=-1)
     return clear_mask
 
 
@@ -2124,7 +2218,6 @@ def _centers_feasible_with_atom_table(
         ),
         dim=-1,
     ).reshape(-1, 3)
-    feasible = torch.ones(centers.shape[0], dtype=torch.bool, device=centers.device)
     rows_per_block = max(
         1,
         min(
@@ -2134,6 +2227,7 @@ def _centers_feasible_with_atom_table(
         ),
     )
     slot_offsets = torch.arange(table.max_occupancy, dtype=torch.long, device=centers.device)
+    block_masks = []
 
     for start in range(0, centers.shape[0], rows_per_block):
         stop = min(start + rows_per_block, centers.shape[0])
@@ -2151,31 +2245,29 @@ def _centers_feasible_with_atom_table(
 
         positions = starts_in_table.unsqueeze(-1) + slot_offsets.view(1, 1, -1)
         has_atom = valid_cells.unsqueeze(-1) & (positions < stops_in_table.unsqueeze(-1))
-        block_feasible = torch.ones(
-            block_centers.shape[0],
-            dtype=torch.bool,
-            device=centers.device,
-        )
-        center_rows, cell_rows, slot_rows = has_atom.nonzero(as_tuple=True)
-        if center_rows.numel() > 0:
-            atom_indices = table.sorted_atom_indices[
-                positions[center_rows, cell_rows, slot_rows]
-            ]
-            candidate_coords = atom_coords[atom_indices]
-            sq_dists = (
-                block_centers[center_rows] - candidate_coords
-            ).square().sum(dim=-1)
-            local_radii_sq = expanded_atom_radii_sq[atom_indices]
-            tol = (
-                float(tol_scale)
-                * torch.finfo(centers.dtype).eps
-                * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
-            )
-            blocked = sq_dists < local_radii_sq - tol
-            block_feasible[center_rows[blocked]] = False
-        feasible[start:stop] = block_feasible
 
-    return feasible
+        safe_positions = positions.clamp_max(table.sorted_atom_indices.shape[0] - 1)
+        atom_indices = table.sorted_atom_indices[safe_positions].reshape(
+            block_centers.shape[0],
+            -1,
+        )
+        candidate_coords = atom_coords[atom_indices]
+        sq_dists = (
+            block_centers.unsqueeze(1) - candidate_coords
+        ).square().sum(dim=-1)
+        local_radii_sq = expanded_atom_radii_sq[atom_indices]
+        tol = (
+            float(tol_scale)
+            * torch.finfo(centers.dtype).eps
+            * torch.maximum(sq_dists, local_radii_sq).clamp_min(1)
+        )
+        blocked = (
+            has_atom.reshape(block_centers.shape[0], -1)
+            & (sq_dists < local_radii_sq - tol)
+        )
+        block_masks.append(~blocked.any(dim=-1))
+
+    return torch.cat(block_masks, dim=0)
 
 
 def _grid_free_mask(
@@ -2311,7 +2403,7 @@ def _grid_free_mask_by_atom_raster(
     ).reshape(-1, 3)
     # Keep temporary `(atoms, offsets)` tensors bounded for both CPU and GPU.
     atom_chunk = max(1, min(atom_coords.shape[0], _PAIRWISE_ELEMENT_BUDGET // offset_count))
-    occupied = torch.zeros((grid_points,), dtype=torch.bool, device=device)
+    occupied = torch.zeros((grid_points,), dtype=torch.int8, device=device)
     dims_long = dims.to(device=device, dtype=torch.long)
     ny = int(dims_long[1].item())
     nz = int(dims_long[2].item())
@@ -2331,9 +2423,15 @@ def _grid_free_mask_by_atom_raster(
         flat_indices = (
             (safe_cells[..., 0] * ny + safe_cells[..., 1]) * nz + safe_cells[..., 2]
         )
-        occupied[flat_indices[inside]] = True
+        occupied.scatter_reduce_(
+            0,
+            flat_indices.reshape(-1),
+            inside.to(dtype=torch.int8).reshape(-1),
+            reduce="amax",
+            include_self=True,
+        )
 
-    return ~occupied
+    return occupied == 0
 
 
 def _external_reachable_grid(
@@ -2412,6 +2510,7 @@ def _flood_fill_reachable_grid(free_grid: torch.Tensor) -> torch.Tensor:
 
     reached_grid = seed_grid
     max_iterations = sum(int(size) for size in free_grid.shape)
+    check_convergence = torch.device(free_grid.device).type != "cuda"
     for _ in range(max_iterations):
         expanded = reached_grid.clone()
         expanded[1:, :, :] = expanded[1:, :, :] | reached_grid[:-1, :, :]
@@ -2421,7 +2520,7 @@ def _flood_fill_reachable_grid(free_grid: torch.Tensor) -> torch.Tensor:
         expanded[:, :, 1:] = expanded[:, :, 1:] | reached_grid[:, :, :-1]
         expanded[:, :, :-1] = expanded[:, :, :-1] | reached_grid[:, :, 1:]
         expanded = expanded & free_grid
-        if bool(torch.equal(expanded, reached_grid)):
+        if check_convergence and bool(torch.equal(expanded, reached_grid)):
             return reached_grid
         reached_grid = expanded
     return reached_grid
@@ -2487,7 +2586,12 @@ def _grid_accessible_query_centers(
                     atom_coords,
                     expanded_atom_radii_sq,
                 )
-                grid_accessible[unresolved_indices[segment_clear]] = True
+                corner_accessible = torch.zeros_like(grid_accessible).scatter(
+                    0,
+                    unresolved_indices,
+                    segment_clear,
+                )
+                grid_accessible = grid_accessible | corner_accessible
 
     return grid_accessible
 
@@ -2606,8 +2710,12 @@ def _probe_centers_accessible_from_exterior(
         as_tuple=False,
     ).reshape(-1)
     if unresolved_query_indices.numel() == 0:
-        flat_accessible = accessible_mask.reshape(-1)
-        flat_accessible[flat_candidate_indices[feasible_indices[query_accessible]]] = True
+        selected_accessible = flat_candidate_indices[feasible_indices[query_accessible]]
+        accessible_mask = accessible_mask.reshape(-1).scatter(
+            0,
+            selected_accessible,
+            torch.ones_like(selected_accessible, dtype=torch.bool),
+        ).reshape_as(accessible_mask)
         return accessible_mask
     unresolved_query_centers = feasible_query_centers[unresolved_query_indices]
     if use_grid_first:
@@ -2633,7 +2741,11 @@ def _probe_centers_accessible_from_exterior(
             calc_atom_coords,
             expanded_atom_radii_sq,
         )
-        query_accessible[unresolved_query_indices[segment_accessible]] = True
+        query_accessible = query_accessible | torch.zeros_like(query_accessible).scatter(
+            0,
+            unresolved_query_indices,
+            segment_accessible,
+        )
     else:
         grid_accessible = _grid_accessible_query_centers(
             unresolved_query_centers,
@@ -2644,11 +2756,18 @@ def _probe_centers_accessible_from_exterior(
             max_grid_points,
             grid_cache_key,
         )
-        query_accessible[unresolved_query_indices[grid_accessible]] = True
+        query_accessible = query_accessible | torch.zeros_like(query_accessible).scatter(
+            0,
+            unresolved_query_indices,
+            grid_accessible,
+        )
 
-    flat_accessible = accessible_mask.reshape(-1)
-    flat_accessible[flat_candidate_indices[feasible_indices[query_accessible]]] = True
-    return accessible_mask
+    selected_accessible = flat_candidate_indices[feasible_indices[query_accessible]]
+    return accessible_mask.reshape(-1).scatter(
+        0,
+        selected_accessible,
+        torch.ones_like(selected_accessible, dtype=torch.bool),
+    ).reshape_as(accessible_mask)
 
 
 def project_points(

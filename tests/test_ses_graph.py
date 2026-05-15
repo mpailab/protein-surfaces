@@ -3,6 +3,7 @@ import math
 import pytest
 import torch
 
+import ses.graph as graph_module
 from ses.graph import (
     _candidate_edges_from_keep,
     _disjoint_single_support_relationships,
@@ -838,6 +839,51 @@ def test_surface_adjacency_keeps_atom_probe_links_with_weights() -> None:
     assert dense[0, 1] > 0
     assert dense[0, 2] > 0
     assert dense[1, 2] > 0
+
+
+def test_surface_adjacency_windowed_topology_keeps_support_subset_links(monkeypatch) -> None:
+    monkeypatch.setattr(graph_module, "_WINDOWED_TOPOLOGY_MIN_POINTS", 1)
+
+    points = torch.tensor(
+        [
+            [0.00, 0.00, 0.0],
+            [0.04, 0.00, 0.0],
+            [0.08, 0.00, 0.0],
+            [0.04, 0.06, 0.0],
+        ],
+        dtype=torch.float64,
+    )
+    normals = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float64).expand_as(points)
+    support_indices = torch.tensor(
+        [
+            [0, -1, -1],
+            [0, 1, -1],
+            [0, 1, 2],
+            [0, 2, -1],
+        ],
+        dtype=torch.long,
+    )
+    support_mask = support_indices >= 0
+    block_types = torch.tensor([1, 2, 3, 2], dtype=torch.long)
+    block_indices = torch.tensor([0, 0, 0, 1], dtype=torch.long)
+
+    adjacency = build_surface_adjacency(
+        points,
+        normals,
+        support_indices=support_indices,
+        support_mask=support_mask,
+        block_types=block_types,
+        block_indices=block_indices,
+        neighbors=3,
+        candidate_neighbors=3,
+        max_tangent_component=0.1,
+    )
+    dense = _assert_sparse_symmetric(adjacency, points.shape[0])
+
+    assert dense[0, 1] > 0
+    assert dense[0, 2] > 0
+    assert dense[1, 2] > 0
+    assert dense[1, 3] == 0
 
 
 def test_surface_adjacency_handles_empty_point_clouds() -> None:

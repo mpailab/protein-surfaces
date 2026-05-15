@@ -488,14 +488,15 @@ def _extract_pair_blocks(
         pair_indices,
     )
     valid = valid & (circle_radii > _sqrt_eps(context.dtype))
-    if not bool(valid.any().item()):
+    valid_indices = valid.nonzero(as_tuple=False).reshape(-1)
+    if valid_indices.numel() == 0:
         return torch.empty((0, 2), dtype=torch.long, device=context.device)
 
-    pair_indices = pair_indices[valid]
-    centers = centers[valid]
-    circle_radii = circle_radii[valid]
-    basis_u = basis_u[valid]
-    basis_v = basis_v[valid]
+    pair_indices = pair_indices[valid_indices]
+    centers = centers[valid_indices]
+    circle_radii = circle_radii[valid_indices]
+    basis_u = basis_u[valid_indices]
+    basis_v = basis_v[valid_indices]
     angles = (
         2
         * math.pi
@@ -612,19 +613,17 @@ def _extract_probe_blocks(
     )
     flat_centers = centers.reshape(-1, 3)
     flat_valid = valid.reshape(-1) & torch.isfinite(flat_centers).all(dim=-1)
-    if not bool(flat_valid.any().item()):
-        return empty
-
     flat_valid_indices = flat_valid.nonzero(as_tuple=False).reshape(-1)
+    if flat_valid_indices.numel() == 0:
+        return empty
     flat_centers = flat_centers[flat_valid]
     flat_seeds = triple_indices[torch.div(flat_valid_indices, 2, rounding_mode="floor")]
     flat_signs = flat_valid_indices.remainder(2)
     feasible = context.centers_feasible(flat_centers)
     accessible = context.centers_accessible(flat_centers, feasible)
-    if not bool(accessible.any().item()):
-        return empty
-
     flat_centers = flat_centers[accessible]
+    if flat_centers.shape[0] == 0:
+        return empty
     flat_seeds = flat_seeds[accessible]
     flat_signs = flat_signs[accessible]
     # Different atom triples can describe the same physical probe center.  Keep
@@ -643,15 +642,20 @@ def _extract_probe_blocks(
     )
     support_counts = support_mask.sum(dim=-1)
     enough_support = support_counts >= 3
-    if not bool(enough_support.any().item()):
+    kept_seeds = flat_seeds[enough_support]
+    if kept_seeds.shape[0] == 0:
         return empty
+    kept_signs = flat_signs[enough_support]
+    kept_support_indices = support_indices[enough_support]
+    kept_support_mask = support_mask[enough_support]
+    kept_centers = flat_centers[enough_support]
 
     return _ProbeBlocks(
-        probe_seed_indices=flat_seeds[enough_support],
-        probe_center_signs=flat_signs[enough_support],
-        probe_support_indices=support_indices[enough_support],
-        probe_support_mask=support_mask[enough_support],
-        probe_center_hints=flat_centers[enough_support].detach(),
+        probe_seed_indices=kept_seeds,
+        probe_center_signs=kept_signs,
+        probe_support_indices=kept_support_indices,
+        probe_support_mask=kept_support_mask,
+        probe_center_hints=kept_centers.detach(),
     )
 
 
@@ -1471,8 +1475,14 @@ def _candidate_pair_indices_grid(context: ExteriorContext) -> Optional[torch.Ten
     keys = pairs[:, 0] * context.num_atoms + pairs[:, 1]
     order = torch.argsort(keys)
     pairs = pairs[order]
-    unique = torch.ones((pairs.shape[0],), dtype=torch.bool, device=context.device)
-    unique[1:] = keys[order][1:] != keys[order][:-1]
+    ordered_keys = keys[order]
+    unique = torch.cat(
+        (
+            torch.ones((1,), dtype=torch.bool, device=context.device),
+            ordered_keys[1:] != ordered_keys[:-1],
+        ),
+        dim=0,
+    )
     return pairs[unique]
 
 
@@ -1860,8 +1870,13 @@ def _candidate_triple_indices(
     order = torch.argsort(pair_keys)
     pair_keys = pair_keys[order]
     pairs = pairs[order]
-    unique = torch.ones((pairs.shape[0],), dtype=torch.bool, device=pairs.device)
-    unique[1:] = pair_keys[1:] != pair_keys[:-1]
+    unique = torch.cat(
+        (
+            torch.ones((1,), dtype=torch.bool, device=pairs.device),
+            pair_keys[1:] != pair_keys[:-1],
+        ),
+        dim=0,
+    )
     pairs = pairs[unique]
     pair_keys = pair_keys[unique]
 
@@ -1939,18 +1954,15 @@ def _candidate_triple_indices(
         second_column = neighbors[:, combo_first].reshape(-1)
         third_column = neighbors[:, combo_second].reshape(-1)
         valid = third_column >= 0
-        if not bool(valid.any().item()):
-            continue
-
         second_valid = second_column[valid]
         third_valid = third_column[valid]
+        if second_valid.numel() == 0:
+            continue
         candidate_keys = second_valid * int(num_atoms) + third_valid
         positions = torch.searchsorted(pair_keys, candidate_keys)
         in_bounds = positions < pair_keys.shape[0]
         safe_positions = positions.clamp_max(max(pair_keys.shape[0] - 1, 0))
         matches = in_bounds & (pair_keys[safe_positions] == candidate_keys)
-        if not bool(matches.any().item()):
-            continue
 
         chunk = torch.stack(
             (
@@ -1960,6 +1972,8 @@ def _candidate_triple_indices(
             ),
             dim=-1,
         )
+        if chunk.shape[0] == 0:
+            continue
         if max_triples is not None:
             remaining = int(max_triples) - triple_count
             if remaining <= 0:

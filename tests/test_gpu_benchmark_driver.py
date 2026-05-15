@@ -28,9 +28,9 @@ def test_gpu_benchmark_density_defaults_are_calibrated() -> None:
     assert args.sdf_m == 26
     assert args.tiled_point_area is None
     assert bench._method_params(args, "tiled_analytic")["point_area"] == 0.5
-    assert args.tiled_atom_density_scale == 1.55
-    assert args.tiled_pair_density_scale == 1.55
-    assert args.tiled_probe_density_scale == 1.55
+    assert args.tiled_atom_density_scale == 1.0
+    assert args.tiled_pair_density_scale == 1.0
+    assert args.tiled_probe_density_scale == 1.0
 
 
 def test_gpu_benchmark_interface_variants_are_hashed_separately() -> None:

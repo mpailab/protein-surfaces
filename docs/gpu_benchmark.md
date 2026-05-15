@@ -169,10 +169,10 @@ scripts/run_gpu_benchmarks.sh \
   --projected-m-values 96,160,192,230,320 \
   --sdf-m-values 16,26,34,64 \
   --sdf-smoothness-values 0.15,0.2,0.3 \
-  --tile-size-values auto,24,48,64 \
-  --tiled-atom-density-scale-values 1,1.55,4,7 \
-  --tiled-pair-density-scale-values 0,0.75,1.55 \
-  --tiled-probe-density-scale-values 0,0.75,1.55
+  --tile-size-values auto,128,256,512 \
+  --tiled-atom-density-scale-values 0.75,1,1.55,3 \
+  --tiled-pair-density-scale-values 0,0.75,1,1.55 \
+  --tiled-probe-density-scale-values 0,0.75,1,1.55
 ```
 
 By default, sweep presets create one-axis variants so the result remains
@@ -291,9 +291,9 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
 - `--analytic-oversample-factor`: analytic candidate oversampling. Default: `1.0`.
 - `--tiled-point-area`: tiled analytic target area per point. Defaults to
   `--point-area`, which is `0.5` unless overridden.
-- `--tiled-atom-density-scale`: tiled contact density multiplier. Default: `1.55`.
-- `--tiled-pair-density-scale`: tiled pair-torus density multiplier. Default: `1.55`.
-- `--tiled-probe-density-scale`: tiled fixed-probe density multiplier. Default: `1.55`.
+- `--tiled-atom-density-scale`: tiled contact density multiplier. Default: `1.0`.
+- `--tiled-pair-density-scale`: tiled pair-torus density multiplier. Default: `1.0`.
+- `--tiled-probe-density-scale`: tiled fixed-probe density multiplier. Default: `1.0`.
 - `--adjacency-weight`: graph edge weights, `euclidean` or `geodesic`. Default:
   `euclidean`.
 - `--adjacency-neighbors`: maximum outgoing graph neighbors per point before
@@ -309,9 +309,9 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
 - `--max-atoms`: optional debugging guard for very large structures.
 - `--dtype`: `float32` by default; use `float64` for precision comparisons.
 
-The defaults follow the 0.0.1 and 0.0.2 GPU focused sweeps. The tiled analytic
-default uses `point_area=0.5` and
-`atom/pair/probe_density_scale=1.55`; the projected, SDF, and analytic defaults
+The defaults follow the 0.0.3 GPU default, tile-size, and analytic/tiled deep
+runs. The tiled analytic default uses `point_area=0.5` and
+`atom/pair/probe_density_scale=1.0`; the projected, SDF, and analytic defaults
 target a similar median point density.
 
 ## Useful Environment Variables

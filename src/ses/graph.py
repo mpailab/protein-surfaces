@@ -15,6 +15,13 @@ _DEFAULT_GPU_PAIRWISE_ELEMENT_BUDGET = 64_000_000
 _FAST_TOPOLOGY_MIN_POINTS = 4096
 _FAST_TOPOLOGY_MIN_CANDIDATES = 64
 _FAST_TOPOLOGY_CANDIDATE_MULTIPLIER = 8
+_WINDOWED_TOPOLOGY_MIN_POINTS = 50_000
+_WINDOWED_TOPOLOGY_MIN_RADIUS = 8
+_WINDOWED_TOPOLOGY_GPU_MIN_POINTS = 4096
+_WINDOWED_TOPOLOGY_MAX_SUPPORT = 3
+_WINDOWED_NEIGHBOR_GPU_MIN_POINTS = 8192
+_WINDOWED_NEIGHBOR_MIN_RADIUS = 64
+_WINDOWED_NEIGHBOR_CANDIDATE_MULTIPLIER = 8
 
 
 def build_surface_adjacency(
@@ -191,14 +198,7 @@ def build_surface_adjacency(
                 valid,
                 max_neighbors=kept_neighbors,
             )
-        else:
-            keep = _select_nearest_valid_candidates(
-                neighbor_distances,
-                valid,
-                max_neighbors=kept_neighbors,
-            )
-        unique_first, unique_second, _ = _unique_undirected_edges(
-            *_candidate_edges_from_keep(
+            edge_arrays = _candidate_edges_from_keep(
                 row_indices,
                 neighbor_indices,
                 neighbor_euclidean_distances,
@@ -206,7 +206,24 @@ def build_surface_adjacency(
                 keep,
                 weight_mode=weight_mode,
                 like=points,
-            ),
+            )
+        else:
+            selected_positions, selected_valid = _select_nearest_valid_candidate_positions(
+                neighbor_distances,
+                valid,
+                max_neighbors=kept_neighbors,
+            )
+            edge_arrays = _candidate_edges_from_positions(
+                row_indices,
+                neighbor_indices,
+                neighbor_euclidean_distances,
+                normal_cosines,
+                selected_positions,
+                selected_valid,
+                weight_mode=weight_mode,
+            )
+        unique_first, unique_second, _ = _unique_undirected_edges(
+            *edge_arrays,
             num_points,
         )
     unique_weights = _edge_weights_for_edges(
@@ -294,6 +311,42 @@ def _candidate_edges_from_keep(
     distances = neighbor_distances[keep][non_self]
     weights = _edge_weights(distances, normal_cosines[keep][non_self], weight_mode)
     return first[non_self], second[non_self], weights
+
+
+def _candidate_edges_from_positions(
+    row_indices: torch.Tensor,
+    neighbor_indices: torch.Tensor,
+    neighbor_distances: torch.Tensor,
+    normal_cosines: torch.Tensor,
+    selected_positions: torch.Tensor,
+    selected_valid: torch.Tensor,
+    *,
+    weight_mode: AdjacencyWeightMode,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Convert selected per-row candidate positions into undirected edges."""
+
+    if selected_positions.numel() == 0:
+        empty_indices = torch.empty((0,), dtype=torch.long, device=neighbor_indices.device)
+        empty_weights = torch.empty(
+            (0,),
+            dtype=neighbor_distances.dtype,
+            device=neighbor_distances.device,
+        )
+        return empty_indices, empty_indices, empty_weights
+
+    rows = row_indices.expand_as(neighbor_indices)
+    selected_rows = torch.gather(rows, 1, selected_positions)
+    selected_cols = torch.gather(neighbor_indices, 1, selected_positions)
+    selected_distances = torch.gather(neighbor_distances, 1, selected_positions)
+    selected_cosines = torch.gather(normal_cosines, 1, selected_positions)
+
+    first = torch.minimum(selected_rows, selected_cols).reshape(-1)
+    second = torch.maximum(selected_rows, selected_cols).reshape(-1)
+    valid_edges = selected_valid.reshape(-1) & (first != second)
+    distances = selected_distances.reshape(-1)
+    cosines = selected_cosines.reshape(-1)
+    weights = _edge_weights(distances[valid_edges], cosines[valid_edges], weight_mode)
+    return first[valid_edges], second[valid_edges], weights
 
 
 def _sparse_adjacency_from_edges(
@@ -566,8 +619,17 @@ def dense_features_to_supports(
         dtype=torch.long,
         device=atom_features.device,
     ) - row_offsets[point_rows]
-    support_indices[point_rows, slot_ids] = atom_cols
-    support_mask[point_rows, slot_ids] = True
+    flat_offsets = point_rows * int(max_support) + slot_ids
+    support_indices = support_indices.reshape(-1).scatter(
+        0,
+        flat_offsets,
+        atom_cols,
+    ).view_as(support_indices)
+    support_mask = support_mask.reshape(-1).scatter(
+        0,
+        flat_offsets,
+        torch.ones_like(flat_offsets, dtype=torch.bool),
+    ).view_as(support_mask)
     return support_indices, support_mask
 
 
@@ -651,6 +713,15 @@ def _nearest_neighbor_candidates(
     """
 
     num_points = int(points.shape[0])
+    if _should_use_windowed_neighbor_candidates(points, num_points):
+        return _nearest_windowed_neighbor_candidates(
+            points,
+            normals,
+            neighbors,
+            weight_mode=weight_mode,
+            max_distance=max_distance,
+        )
+
     effective_budget = _effective_pairwise_element_budget(
         points.device,
         pairwise_element_budget,
@@ -669,9 +740,12 @@ def _nearest_neighbor_candidates(
             + point_sq_norms
             - 2 * (block @ points.transpose(0, 1))
         ).clamp_min(0)
-        block_rows = torch.arange(stop - start, device=points.device)
-        self_cols = torch.arange(start, stop, device=points.device)
-        sq_distances[block_rows, self_cols] = float("inf")
+        self_cols = torch.arange(num_points, dtype=torch.long, device=points.device)
+        block_rows = torch.arange(start, stop, dtype=torch.long, device=points.device)
+        sq_distances = sq_distances.masked_fill(
+            self_cols.view(1, -1) == block_rows.view(-1, 1),
+            float("inf"),
+        )
         sq_distances = torch.where(
             torch.isfinite(sq_distances),
             sq_distances,
@@ -701,6 +775,92 @@ def _nearest_neighbor_candidates(
         torch.cat(all_indices, dim=0),
         torch.cat(all_distances, dim=0),
         torch.cat(all_euclidean_distances, dim=0),
+    )
+
+
+def _nearest_windowed_neighbor_candidates(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    neighbors: int,
+    *,
+    weight_mode: AdjacencyWeightMode,
+    max_distance: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select local spatial candidates without materializing all point pairs."""
+
+    num_points = int(points.shape[0])
+    if num_points <= 1 or neighbors <= 0:
+        return _empty_candidate_tensors(num_points, 0, points)
+
+    radius = max(
+        _WINDOWED_NEIGHBOR_MIN_RADIUS,
+        int(neighbors) * _WINDOWED_NEIGHBOR_CANDIDATE_MULTIPLIER,
+    )
+    offsets = torch.cat(
+        (
+            torch.arange(-radius, 0, dtype=torch.long, device=points.device),
+            torch.arange(1, radius + 1, dtype=torch.long, device=points.device),
+        ),
+        dim=0,
+    )
+    order = _spatial_order(points)
+    inverse_order = torch.argsort(order)
+    sorted_points = points[order]
+    sorted_normals = normals[order]
+
+    sorted_rows = torch.arange(num_points, dtype=torch.long, device=points.device)
+    raw_neighbor_positions = sorted_rows.view(-1, 1) + offsets.view(1, -1)
+    in_bounds = (raw_neighbor_positions >= 0) & (raw_neighbor_positions < num_points)
+    neighbor_positions = raw_neighbor_positions.clamp(0, num_points - 1)
+    neighbor_indices = order[neighbor_positions]
+    non_self = neighbor_indices != order.view(-1, 1)
+
+    neighbor_points = points[neighbor_indices]
+    deltas = neighbor_points - sorted_points.unsqueeze(1)
+    euclidean_distances = torch.linalg.norm(deltas, dim=-1)
+    if weight_mode == "geodesic":
+        normal_cosines = (
+            sorted_normals.unsqueeze(1) * normals[neighbor_indices]
+        ).sum(dim=-1).clamp(-1, 1)
+        metric_distances = _edge_weights(
+            euclidean_distances,
+            normal_cosines,
+            weight_mode,
+        )
+    else:
+        metric_distances = euclidean_distances
+
+    valid = (
+        in_bounds
+        & non_self
+        & torch.isfinite(metric_distances)
+        & torch.isfinite(euclidean_distances)
+    )
+    if max_distance is not None:
+        valid = valid & (metric_distances <= float(max_distance))
+
+    selected_positions, selected_valid = _select_nearest_valid_candidate_positions(
+        metric_distances,
+        valid,
+        max_neighbors=min(int(neighbors), int(metric_distances.shape[1])),
+    )
+    selected_indices = torch.gather(neighbor_indices, 1, selected_positions)
+    selected_distances = torch.gather(metric_distances, 1, selected_positions)
+    selected_euclidean = torch.gather(euclidean_distances, 1, selected_positions)
+    selected_distances = torch.where(
+        selected_valid,
+        selected_distances,
+        torch.full_like(selected_distances, float("inf")),
+    )
+    selected_euclidean = torch.where(
+        selected_valid,
+        selected_euclidean,
+        torch.full_like(selected_euclidean, float("inf")),
+    )
+    return (
+        selected_indices[inverse_order],
+        selected_distances[inverse_order],
+        selected_euclidean[inverse_order],
     )
 
 
@@ -766,6 +926,27 @@ def _nearest_topology_candidates(
             pairwise_element_budget=pairwise_element_budget,
         )
 
+    if (
+        _should_use_windowed_topology_candidates(points, num_points)
+        and not allow_disjoint_single_support_edges
+        and block_types is not None
+        and block_indices is not None
+        and support_indices is not None
+        and support_mask is not None
+        and support_indices.shape[1] <= _WINDOWED_TOPOLOGY_MAX_SUPPORT
+    ):
+        return _nearest_windowed_topology_candidates(
+            points,
+            normals,
+            neighbors,
+            weight_mode=weight_mode,
+            support_indices=support_indices,
+            support_mask=support_mask,
+            block_types=block_types,
+            block_indices=block_indices,
+            max_distance=max_distance,
+        )
+
     effective_budget = _effective_pairwise_element_budget(
         points.device,
         pairwise_element_budget,
@@ -811,8 +992,11 @@ def _nearest_topology_candidates(
             - 2 * (block @ points.transpose(0, 1))
         ).clamp_min(0)
         block_rows = torch.arange(start, stop, dtype=torch.long, device=points.device)
-        self_rows = torch.arange(stop - start, device=points.device)
-        sq_distances[self_rows, block_rows] = float("inf")
+        self_cols = torch.arange(num_points, dtype=torch.long, device=points.device)
+        sq_distances = sq_distances.masked_fill(
+            self_cols.view(1, -1) == block_rows.view(-1, 1),
+            float("inf"),
+        )
         topology_allowed = _topology_allowed_matrix(
             block_rows,
             num_points,
@@ -856,6 +1040,335 @@ def _nearest_topology_candidates(
     )
 
 
+def _nearest_windowed_topology_candidates(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    neighbors: int,
+    *,
+    weight_mode: AdjacencyWeightMode,
+    support_indices: torch.Tensor,
+    support_mask: torch.Tensor,
+    block_types: torch.Tensor,
+    block_indices: torch.Tensor,
+    max_distance: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select topology-local candidates with fully tensorized GPU windows."""
+
+    block_group_ids = _metadata_group_ids(
+        torch.stack((block_types, block_indices), dim=-1),
+    )
+    block_candidates = _nearest_windowed_group_candidates(
+        points,
+        normals,
+        block_group_ids,
+        neighbors,
+        weight_mode=weight_mode,
+        max_distance=max_distance,
+    )
+
+    if support_indices.shape[1] == 0:
+        return block_candidates
+
+    support_candidates = _nearest_windowed_support_candidates(
+        points,
+        normals,
+        support_indices,
+        support_mask,
+        block_types,
+        block_indices,
+        neighbors,
+        weight_mode=weight_mode,
+        max_distance=max_distance,
+    )
+
+    combined_indices = torch.cat((block_candidates[0], support_candidates[0]), dim=1)
+    combined_distances = torch.cat((block_candidates[1], support_candidates[1]), dim=1)
+    combined_euclidean = torch.cat((block_candidates[2], support_candidates[2]), dim=1)
+    return _select_candidate_tensors(
+        combined_indices,
+        combined_distances,
+        combined_euclidean,
+        neighbors,
+    )
+
+
+def _metadata_group_ids(metadata: torch.Tensor) -> torch.Tensor:
+    _, inverse = torch.unique(metadata.to(dtype=torch.long), dim=0, return_inverse=True)
+    return inverse.to(dtype=torch.long)
+
+
+def _spatial_group_order(points: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
+    spatial_order = _spatial_order(points)
+    group_order = torch.argsort(group_ids[spatial_order], stable=True)
+    return spatial_order[group_order]
+
+
+def _spatial_order(points: torch.Tensor) -> torch.Tensor:
+    mins = points.min(dim=0).values
+    spans = (points.max(dim=0).values - mins).clamp_min(torch.finfo(points.dtype).eps)
+    scaled = ((points - mins.view(1, 3)) / spans.view(1, 3)).clamp(0, 1)
+    quantized = torch.floor(scaled * 1023).to(dtype=torch.long).clamp(0, 1023)
+    spatial_keys = (quantized[:, 0] * 1024 + quantized[:, 1]) * 1024 + quantized[:, 2]
+    return torch.argsort(spatial_keys, stable=True)
+
+
+def _nearest_windowed_group_candidates(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    group_ids: torch.Tensor,
+    neighbors: int,
+    *,
+    weight_mode: AdjacencyWeightMode,
+    max_distance: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_points = int(points.shape[0])
+    if num_points <= 1 or neighbors <= 0:
+        return _empty_candidate_tensors(num_points, 0, points)
+
+    radius = max(_WINDOWED_TOPOLOGY_MIN_RADIUS, int(neighbors) * 2)
+    offsets = torch.cat(
+        (
+            torch.arange(-radius, 0, dtype=torch.long, device=points.device),
+            torch.arange(1, radius + 1, dtype=torch.long, device=points.device),
+        ),
+        dim=0,
+    )
+    order = _spatial_group_order(points, group_ids)
+    inverse_order = torch.argsort(order)
+    sorted_group_ids = group_ids[order]
+    sorted_points = points[order]
+    sorted_normals = normals[order]
+
+    sorted_rows = torch.arange(num_points, dtype=torch.long, device=points.device)
+    raw_neighbor_positions = sorted_rows.view(-1, 1) + offsets.view(1, -1)
+    in_bounds = (raw_neighbor_positions >= 0) & (raw_neighbor_positions < num_points)
+    neighbor_positions = raw_neighbor_positions.clamp(0, num_points - 1)
+    neighbor_indices = order[neighbor_positions]
+    same_group = (
+        sorted_group_ids[neighbor_positions]
+        == sorted_group_ids.view(-1, 1)
+    )
+    non_self = neighbor_indices != order.view(-1, 1)
+
+    neighbor_points = points[neighbor_indices]
+    deltas = neighbor_points - sorted_points.unsqueeze(1)
+    euclidean_distances = torch.linalg.norm(deltas, dim=-1)
+    if weight_mode == "geodesic":
+        normal_cosines = (
+            sorted_normals.unsqueeze(1) * normals[neighbor_indices]
+        ).sum(dim=-1).clamp(-1, 1)
+        metric_distances = _edge_weights(
+            euclidean_distances,
+            normal_cosines,
+            weight_mode,
+        )
+    else:
+        metric_distances = euclidean_distances
+
+    valid = (
+        in_bounds
+        & same_group
+        & non_self
+        & torch.isfinite(metric_distances)
+        & torch.isfinite(euclidean_distances)
+    )
+    if max_distance is not None:
+        valid = valid & (metric_distances <= float(max_distance))
+
+    selected_positions, selected_valid = _select_nearest_valid_candidate_positions(
+        metric_distances,
+        valid,
+        max_neighbors=min(int(neighbors), int(metric_distances.shape[1])),
+    )
+    selected_indices = torch.gather(neighbor_indices, 1, selected_positions)
+    selected_distances = torch.gather(metric_distances, 1, selected_positions)
+    selected_euclidean = torch.gather(euclidean_distances, 1, selected_positions)
+    selected_distances = torch.where(
+        selected_valid,
+        selected_distances,
+        torch.full_like(selected_distances, float("inf")),
+    )
+    selected_euclidean = torch.where(
+        selected_valid,
+        selected_euclidean,
+        torch.full_like(selected_euclidean, float("inf")),
+    )
+    return (
+        selected_indices[inverse_order],
+        selected_distances[inverse_order],
+        selected_euclidean[inverse_order],
+    )
+
+
+def _nearest_windowed_support_candidates(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    support_indices: torch.Tensor,
+    support_mask: torch.Tensor,
+    block_types: torch.Tensor,
+    block_indices: torch.Tensor,
+    neighbors: int,
+    *,
+    weight_mode: AdjacencyWeightMode,
+    max_distance: Optional[float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_points = int(points.shape[0])
+    max_support = int(support_indices.shape[1])
+    if num_points <= 1 or neighbors <= 0 or max_support == 0:
+        return _empty_candidate_tensors(num_points, 0, points)
+
+    radius = max(_WINDOWED_TOPOLOGY_MIN_RADIUS, int(neighbors))
+    offsets = torch.cat(
+        (
+            torch.arange(-radius, 0, dtype=torch.long, device=points.device),
+            torch.arange(1, radius + 1, dtype=torch.long, device=points.device),
+        ),
+        dim=0,
+    )
+    point_rows = torch.arange(num_points, dtype=torch.long, device=points.device)
+    membership_rows = point_rows.view(-1, 1).expand(num_points, max_support).reshape(-1)
+    membership_valid = support_mask.reshape(-1)
+    membership_groups = torch.where(
+        membership_valid,
+        support_indices.reshape(-1),
+        torch.full_like(membership_rows, torch.iinfo(torch.long).max),
+    )
+
+    membership_points = points[membership_rows]
+    order = _spatial_group_order(membership_points, membership_groups)
+    inverse_order = torch.argsort(order)
+    sorted_rows = membership_rows[order]
+    sorted_groups = membership_groups[order]
+    sorted_valid = membership_valid[order]
+    sorted_points = points[sorted_rows]
+    sorted_normals = normals[sorted_rows]
+
+    membership_count = int(membership_rows.shape[0])
+    sorted_positions = torch.arange(
+        membership_count,
+        dtype=torch.long,
+        device=points.device,
+    )
+    raw_neighbor_positions = sorted_positions.view(-1, 1) + offsets.view(1, -1)
+    in_bounds = (
+        (raw_neighbor_positions >= 0)
+        & (raw_neighbor_positions < membership_count)
+    )
+    neighbor_positions = raw_neighbor_positions.clamp(0, membership_count - 1)
+    neighbor_rows = sorted_rows[neighbor_positions]
+    source_rows = sorted_rows.view(-1, 1).expand_as(neighbor_rows)
+    same_support_atom = (
+        sorted_valid.view(-1, 1)
+        & sorted_valid[neighbor_positions]
+        & (sorted_groups[neighbor_positions] == sorted_groups.view(-1, 1))
+    )
+    topology_allowed = _topology_allowed_candidates(
+        source_rows,
+        neighbor_rows,
+        support_indices=support_indices,
+        support_mask=support_mask,
+        block_types=block_types,
+        block_indices=block_indices,
+        allow_disjoint_single_support_edges=False,
+    )
+    non_self = source_rows != neighbor_rows
+
+    neighbor_points = points[neighbor_rows]
+    deltas = neighbor_points - sorted_points.unsqueeze(1)
+    euclidean_distances = torch.linalg.norm(deltas, dim=-1)
+    if weight_mode == "geodesic":
+        normal_cosines = (
+            sorted_normals.unsqueeze(1) * normals[neighbor_rows]
+        ).sum(dim=-1).clamp(-1, 1)
+        metric_distances = _edge_weights(
+            euclidean_distances,
+            normal_cosines,
+            weight_mode,
+        )
+    else:
+        metric_distances = euclidean_distances
+
+    valid = (
+        in_bounds
+        & same_support_atom
+        & topology_allowed
+        & non_self
+        & torch.isfinite(metric_distances)
+        & torch.isfinite(euclidean_distances)
+    )
+    if max_distance is not None:
+        valid = valid & (metric_distances <= float(max_distance))
+
+    selected_positions, selected_valid = _select_nearest_valid_candidate_positions(
+        metric_distances,
+        valid,
+        max_neighbors=min(int(neighbors), int(metric_distances.shape[1])),
+    )
+    selected_indices = torch.gather(neighbor_rows, 1, selected_positions)
+    selected_distances = torch.gather(metric_distances, 1, selected_positions)
+    selected_euclidean = torch.gather(euclidean_distances, 1, selected_positions)
+    selected_distances = torch.where(
+        selected_valid,
+        selected_distances,
+        torch.full_like(selected_distances, float("inf")),
+    )
+    selected_euclidean = torch.where(
+        selected_valid,
+        selected_euclidean,
+        torch.full_like(selected_euclidean, float("inf")),
+    )
+
+    unsorted_indices = selected_indices[inverse_order]
+    unsorted_distances = selected_distances[inverse_order]
+    unsorted_euclidean = selected_euclidean[inverse_order]
+    candidate_columns = int(unsorted_indices.shape[1])
+    if candidate_columns == 0:
+        return _empty_candidate_tensors(num_points, 0, points)
+    return _select_candidate_tensors(
+        unsorted_indices.reshape(num_points, max_support * candidate_columns),
+        unsorted_distances.reshape(num_points, max_support * candidate_columns),
+        unsorted_euclidean.reshape(num_points, max_support * candidate_columns),
+        neighbors,
+    )
+
+
+def _empty_candidate_tensors(
+    rows: int,
+    columns: int,
+    like: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    indices = torch.empty((rows, columns), dtype=torch.long, device=like.device)
+    distances = torch.empty((rows, columns), dtype=like.dtype, device=like.device)
+    return indices, distances, distances
+
+
+def _select_candidate_tensors(
+    neighbor_indices: torch.Tensor,
+    metric_distances: torch.Tensor,
+    euclidean_distances: torch.Tensor,
+    neighbors: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    selected_positions, selected_valid = _select_nearest_valid_candidate_positions(
+        metric_distances,
+        torch.isfinite(metric_distances) & torch.isfinite(euclidean_distances),
+        max_neighbors=min(int(neighbors), int(metric_distances.shape[1])),
+    )
+    selected_indices = torch.gather(neighbor_indices, 1, selected_positions)
+    selected_distances = torch.gather(metric_distances, 1, selected_positions)
+    selected_euclidean = torch.gather(euclidean_distances, 1, selected_positions)
+    selected_distances = torch.where(
+        selected_valid,
+        selected_distances,
+        torch.full_like(selected_distances, float("inf")),
+    )
+    selected_euclidean = torch.where(
+        selected_valid,
+        selected_euclidean,
+        torch.full_like(selected_euclidean, float("inf")),
+    )
+    return selected_indices, selected_distances, selected_euclidean
+
+
 def _single_support_topology_is_unrestricted(
     support_indices: Optional[torch.Tensor],
     support_mask: Optional[torch.Tensor],
@@ -877,6 +1390,25 @@ def _single_support_topology_is_unrestricted(
 
 def _should_prefilter_topology_candidates(num_points: int) -> bool:
     return int(num_points) >= _FAST_TOPOLOGY_MIN_POINTS
+
+
+def _should_use_windowed_topology_candidates(
+    points: torch.Tensor,
+    num_points: int,
+) -> bool:
+    if torch.device(points.device).type == "cuda":
+        return int(num_points) >= _WINDOWED_TOPOLOGY_GPU_MIN_POINTS
+    return int(num_points) >= _WINDOWED_TOPOLOGY_MIN_POINTS
+
+
+def _should_use_windowed_neighbor_candidates(
+    points: torch.Tensor,
+    num_points: int,
+) -> bool:
+    return (
+        torch.device(points.device).type == "cuda"
+        and int(num_points) >= _WINDOWED_NEIGHBOR_GPU_MIN_POINTS
+    )
 
 
 def _nearest_prefiltered_topology_candidates(
@@ -1225,16 +1757,68 @@ def _select_angular_neighbors(
         rounding_mode="floor",
     ).to(dtype=torch.long).clamp_max(sector_count - 1)
 
-    selected = torch.zeros_like(valid)
-    for sector in range(sector_count):
-        sector_valid = valid & (sectors == sector)
-        selected = selected | _select_nearest_valid_candidates(
-            neighbor_distances,
-            sector_valid,
-            max_neighbors=1,
+    sector_ids = torch.arange(sector_count, dtype=torch.long, device=valid.device)
+    sector_valid = valid.unsqueeze(-1) & (
+        sectors.unsqueeze(-1) == sector_ids.view(1, 1, -1)
+    )
+    rank_distances = torch.where(
+        sector_valid,
+        neighbor_distances.unsqueeze(-1),
+        torch.full(
+            (1, 1, 1),
+            float("inf"),
+            dtype=neighbor_distances.dtype,
+            device=neighbor_distances.device,
+        ),
+    )
+    selected_distances, selected_positions = rank_distances.min(dim=1)
+    slots = torch.arange(num_neighbors, dtype=torch.long, device=valid.device)
+    selected = (
+        (slots.view(1, -1, 1) == selected_positions.unsqueeze(1))
+        & torch.isfinite(selected_distances).unsqueeze(1)
+    ).any(dim=-1)
+    return selected & valid
+
+
+def _select_nearest_valid_candidate_positions(
+    neighbor_distances: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    max_neighbors: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return nearest valid candidate column positions in each row.
+
+    Args:
+        neighbor_distances: Candidate ranking distances.
+        valid: Boolean mask for candidates that may be kept.
+        max_neighbors: Maximum selected candidate positions per row.
+
+    Returns:
+        ``(positions, valid_positions)`` where both tensors have shape
+        ``(rows, selected_columns)``.
+    """
+
+    if max_neighbors <= 0 or neighbor_distances.shape[1] == 0:
+        rows = int(neighbor_distances.shape[0])
+        return (
+            torch.empty((rows, 0), dtype=torch.long, device=neighbor_distances.device),
+            torch.empty((rows, 0), dtype=torch.bool, device=neighbor_distances.device),
         )
 
-    return selected
+    finite_valid = valid & torch.isfinite(neighbor_distances)
+    rank_distances = torch.where(
+        finite_valid,
+        neighbor_distances,
+        torch.full_like(neighbor_distances, float("inf")),
+    )
+    selected_distances, selected_positions = torch.topk(
+        rank_distances,
+        min(int(max_neighbors), int(neighbor_distances.shape[1])),
+        dim=1,
+        largest=False,
+        sorted=True,
+    )
+    return selected_positions, torch.isfinite(selected_distances)
 
 
 def _select_nearest_valid_candidates(
@@ -1254,23 +1838,22 @@ def _select_nearest_valid_candidates(
         Boolean keep mask aligned with ``neighbor_distances``.
     """
 
-    if max_neighbors <= 0 or neighbor_distances.shape[1] == 0:
-        return torch.zeros_like(valid)
-
-    rank_distances = torch.where(
-        valid,
+    selected_positions, selected_valid = _select_nearest_valid_candidate_positions(
         neighbor_distances,
-        torch.full_like(neighbor_distances, float("inf")),
+        valid,
+        max_neighbors=max_neighbors,
     )
-    selected_distances, selected_positions = torch.topk(
-        rank_distances,
-        min(int(max_neighbors), int(neighbor_distances.shape[1])),
-        dim=1,
-        largest=False,
-        sorted=True,
+    if selected_positions.numel() == 0:
+        return torch.zeros_like(valid)
+    slots = torch.arange(
+        int(neighbor_distances.shape[1]),
+        dtype=torch.long,
+        device=neighbor_distances.device,
     )
-    selected = torch.zeros_like(valid)
-    selected.scatter_(1, selected_positions, torch.isfinite(selected_distances))
+    selected = (
+        (slots.view(1, -1, 1) == selected_positions.unsqueeze(1))
+        & selected_valid.unsqueeze(1)
+    ).any(dim=-1)
     return selected & valid
 
 
@@ -1295,8 +1878,15 @@ def _unique_undirected_edges(
     keys = first * int(num_points) + second
     order = torch.argsort(keys)
     ordered_keys = keys[order]
-    unique = torch.ones_like(ordered_keys, dtype=torch.bool)
-    unique[1:] = ordered_keys[1:] != ordered_keys[:-1]
+    if ordered_keys.numel() == 0:
+        return first, second, weights
+    unique = torch.cat(
+        (
+            torch.ones((1,), dtype=torch.bool, device=ordered_keys.device),
+            ordered_keys[1:] != ordered_keys[:-1],
+        ),
+        dim=0,
+    )
     selected = order[unique]
     return first[selected], second[selected], weights[selected]
 
