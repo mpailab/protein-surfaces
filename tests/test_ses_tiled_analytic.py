@@ -6,12 +6,15 @@ from ses.analytic import _dense_atom_features
 from ses.tiled_analytic import (
     _build_tile_grid,
     _packed_pair_parameters_uniform_arc,
+    _resolve_memory_aware_tile_parameters,
     _sample_tiled_analytic_samples,
     _sample_tile_local_pair_candidates,
     _sample_tile_local_probe_candidates,
     _segment_clearance_mask_line_grid,
+    _single_tile_geometry_prefers_local_tiles,
     _tile_atom_intersection_mask,
 )
+from ses.analytic import _build_exterior_context
 from ses.projection import _segment_clearance_mask
 
 
@@ -358,6 +361,53 @@ def test_tiled_analytic_can_use_auto_tile_parameters() -> None:
     assert points.ndim == 2
     assert points.shape[1] == 3
     assert torch.isfinite(points).all()
+
+
+def test_auto_tile_heuristic_predicts_local_tiles_before_sampling() -> None:
+    axes = torch.meshgrid(
+        torch.linspace(-38.0, 38.0, 17, dtype=torch.float32),
+        torch.linspace(-35.0, 35.0, 17, dtype=torch.float32),
+        torch.linspace(-34.0, 34.0, 19, dtype=torch.float32),
+        indexing="ij",
+    )
+    coords = torch.stack(axes, dim=-1).reshape(-1, 3)
+    radii = torch.full((coords.shape[0],), 1.5, dtype=torch.float32)
+    context = _build_exterior_context(coords, radii, 1.4)
+    pair_indices = torch.tensor([[0, 1]], dtype=torch.long)
+
+    assert _single_tile_geometry_prefers_local_tiles(context)
+    assert _resolve_memory_aware_tile_parameters(
+        context,
+        tile_size="auto",
+        tile_overlap="auto",
+        point_area=0.5,
+        pair_density_scale=1.0,
+        pair_indices=pair_indices,
+    ) == (64.0, 4.0)
+
+    elongated_context = _build_exterior_context(
+        coords * torch.tensor([1.6, 1.0, 1.0], dtype=torch.float32),
+        radii,
+        1.4,
+    )
+    assert not _single_tile_geometry_prefers_local_tiles(elongated_context)
+    assert _resolve_memory_aware_tile_parameters(
+        elongated_context,
+        tile_size="auto",
+        tile_overlap="auto",
+        point_area=0.5,
+        pair_density_scale=1.0,
+        pair_indices=pair_indices,
+    ) == (512.0, 4.0)
+    assert _resolve_memory_aware_tile_parameters(
+        elongated_context,
+        tile_size="auto",
+        tile_overlap="auto",
+        point_area=0.5,
+        pair_density_scale=1.0,
+        pair_indices=pair_indices,
+        tile_memory_budget_bytes=1,
+    ) == (64.0, 4.0)
 
 
 def test_tiled_analytic_is_close_to_analytic_for_separated_atoms() -> None:

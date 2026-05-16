@@ -62,6 +62,25 @@ _AUTO_SMALL_TILE_SIZE = 64.0
 _AUTO_SMALL_TILE_OVERLAP = 4.0
 _AUTO_LARGE_TILE_SIZE = 40.0
 _AUTO_LARGE_TILE_OVERLAP = 4.0
+_AUTO_SINGLE_TILE_GUARD_SIZE = 64.0
+_AUTO_SINGLE_TILE_GUARD_MIN_ATOMS = 5_000
+_AUTO_SINGLE_TILE_GUARD_MAX_ATOMS = 7_000
+_AUTO_COMPACT_ASPECT_LIMIT = 1.25
+_AUTO_COMPACT_MEDIAN_OFFSET_LIMIT = 0.60
+_AUTO_COMPACT_BBOX_OFFSET_LIMIT = 8.30
+_AUTO_COMPACT_DENSITY_MIN = 0.014
+_AUTO_SPARSE_ROUND_ASPECT_LIMIT = 1.15
+_AUTO_SPARSE_ROUND_DENSITY_LIMIT = 0.0065
+_AUTO_SPARSE_ROUND_EIGEN_BBOX_RATIO_MIN = 2.50
+_AUTO_COMPACT_ECCENTRIC_ASPECT_LIMIT = 1.40
+_AUTO_COMPACT_ECCENTRIC_DENSITY_MIN = 0.013
+_AUTO_COMPACT_ECCENTRIC_BBOX_OFFSET_LIMIT = 1.40
+_AUTO_COMPACT_ECCENTRIC_EIGEN_BBOX_RATIO_MIN = 1.40
+_AUTO_SPARSE_ECCENTRIC_ASPECT_MIN = 1.35
+_AUTO_SPARSE_ECCENTRIC_ASPECT_MAX = 1.42
+_AUTO_SPARSE_ECCENTRIC_DENSITY_LIMIT = 0.013
+_AUTO_SPARSE_ECCENTRIC_BBOX_OFFSET_MIN = 5.0
+_AUTO_SPARSE_ECCENTRIC_EIGEN_BBOX_RATIO_MIN = 1.70
 _RADIAL_LINE_GRID_MIN_SEGMENTS = 512
 _RADIAL_LINE_GRID_MAX_STEPS = 192
 _RADIAL_LINE_GRID_STEP_FRACTION = 0.5
@@ -115,6 +134,21 @@ def _effective_pairwise_element_budget(
     return int(pairwise_element_budget)
 
 
+def _tile_grid_bounds(
+    atom_coords: torch.Tensor,
+    atom_radii: torch.Tensor,
+    probe_radius: float,
+    *,
+    tile_size: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    margin = atom_radii.max() + float(probe_radius)
+    bbox_min = atom_coords.min(dim=0).values - margin
+    bbox_max = atom_coords.max(dim=0).values + margin
+    spans = (bbox_max - bbox_min).clamp_min(torch.finfo(atom_coords.dtype).eps)
+    dims = torch.ceil(spans / float(tile_size)).to(torch.long).clamp_min(1)
+    return bbox_min, bbox_max, dims
+
+
 def _build_tile_grid(
     atom_coords: torch.Tensor,
     atom_radii: torch.Tensor,
@@ -128,11 +162,12 @@ def _build_tile_grid(
     if tile_overlap < 0:
         raise ValueError("tile_overlap must be non-negative")
 
-    margin = atom_radii.max() + float(probe_radius)
-    bbox_min = atom_coords.min(dim=0).values - margin
-    bbox_max = atom_coords.max(dim=0).values + margin
-    spans = (bbox_max - bbox_min).clamp_min(torch.finfo(atom_coords.dtype).eps)
-    dims = torch.ceil(spans / float(tile_size)).to(torch.long).clamp_min(1)
+    bbox_min, bbox_max, dims = _tile_grid_bounds(
+        atom_coords,
+        atom_radii,
+        probe_radius,
+        tile_size=float(tile_size),
+    )
     axes = [
         torch.arange(int(dims[axis].item()), dtype=torch.long, device=atom_coords.device)
         for axis in range(3)
@@ -584,21 +619,6 @@ def _tile_pair_memberships(
     return active_tile_ids[active_rows], pair_rows
 
 
-def _tile_pair_membership_count(
-    atom_tile_mask: torch.Tensor,
-    pair_indices: torch.Tensor,
-    active_tile_ids: torch.Tensor,
-) -> int:
-    if pair_indices.shape[0] == 0 or active_tile_ids.numel() == 0:
-        return 0
-    active_mask = atom_tile_mask[active_tile_ids]
-    membership = (
-        active_mask[:, pair_indices[:, 0]]
-        & active_mask[:, pair_indices[:, 1]]
-    )
-    return int(membership.sum().item())
-
-
 def _estimate_tile_pair_work_bytes(
     membership_count: int,
     *,
@@ -620,6 +640,76 @@ def _estimate_tile_pair_work_bytes(
     return area_bytes + sample_bytes
 
 
+def _single_tile_geometry_prefers_local_tiles(context) -> bool:
+    # Tuned from the full tile sweep JSON summaries: keep this guard narrow so
+    # ordinary mid-sized molecules still take the fast single-tile path.
+    num_atoms = int(context.num_atoms)
+    if (
+        num_atoms < _AUTO_SINGLE_TILE_GUARD_MIN_ATOMS
+        or num_atoms > _AUTO_SINGLE_TILE_GUARD_MAX_ATOMS
+    ):
+        return False
+
+    _, _, guard_dims = _tile_grid_bounds(
+        context.atom_coords.detach(),
+        context.atom_radii.detach(),
+        context.probe_radius,
+        tile_size=_AUTO_SINGLE_TILE_GUARD_SIZE,
+    )
+    has_local_tiles = guard_dims.prod() > 1
+
+    coords = context.atom_coords.detach()
+    centered = coords - coords.mean(dim=0, keepdim=True)
+    bbox_min = centered.min(dim=0).values
+    bbox_max = centered.max(dim=0).values
+    spans = (bbox_max - bbox_min).clamp_min(torch.finfo(centered.dtype).eps)
+    sorted_spans = torch.sort(spans).values
+    aspect = sorted_spans[-1] / sorted_spans[0]
+    density = torch.as_tensor(num_atoms, dtype=centered.dtype, device=centered.device) / (
+        spans.prod().clamp_min(torch.finfo(centered.dtype).eps)
+    )
+    bbox_offset = (0.5 * (bbox_min + bbox_max)).norm()
+    median_offset = centered.median(dim=0).values.norm()
+
+    covariance = centered.transpose(0, 1).matmul(centered) / float(num_atoms)
+    eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(
+        torch.finfo(centered.dtype).eps,
+    )
+    eigen_aspect = torch.sqrt(eigenvalues[-1] / eigenvalues[0])
+    eigen_bbox_ratio = eigen_aspect / aspect.clamp_min(torch.finfo(centered.dtype).eps)
+
+    compact_shifted = (aspect < _AUTO_COMPACT_ASPECT_LIMIT) & (
+        (median_offset < _AUTO_COMPACT_MEDIAN_OFFSET_LIMIT)
+        | (
+            (bbox_offset > _AUTO_COMPACT_BBOX_OFFSET_LIMIT)
+            & (density > _AUTO_COMPACT_DENSITY_MIN)
+        )
+    )
+    sparse_round = (
+        (aspect < _AUTO_SPARSE_ROUND_ASPECT_LIMIT)
+        & (density < _AUTO_SPARSE_ROUND_DENSITY_LIMIT)
+        & (eigen_bbox_ratio > _AUTO_SPARSE_ROUND_EIGEN_BBOX_RATIO_MIN)
+    )
+    compact_eccentric = (
+        (aspect < _AUTO_COMPACT_ECCENTRIC_ASPECT_LIMIT)
+        & (density > _AUTO_COMPACT_ECCENTRIC_DENSITY_MIN)
+        & (bbox_offset < _AUTO_COMPACT_ECCENTRIC_BBOX_OFFSET_LIMIT)
+        & (eigen_bbox_ratio > _AUTO_COMPACT_ECCENTRIC_EIGEN_BBOX_RATIO_MIN)
+    )
+    sparse_eccentric = (
+        (aspect > _AUTO_SPARSE_ECCENTRIC_ASPECT_MIN)
+        & (aspect < _AUTO_SPARSE_ECCENTRIC_ASPECT_MAX)
+        & (density < _AUTO_SPARSE_ECCENTRIC_DENSITY_LIMIT)
+        & (bbox_offset > _AUTO_SPARSE_ECCENTRIC_BBOX_OFFSET_MIN)
+        & (eigen_bbox_ratio > _AUTO_SPARSE_ECCENTRIC_EIGEN_BBOX_RATIO_MIN)
+    )
+    prefers_local = (
+        has_local_tiles
+        & (compact_shifted | sparse_round | compact_eccentric | sparse_eccentric)
+    )
+    return bool(prefers_local.item())
+
+
 def _resolve_memory_aware_tile_parameters(
     context,
     *,
@@ -637,56 +727,33 @@ def _resolve_memory_aware_tile_parameters(
     )
     if not isinstance(tile_size, str) or tile_size != "auto":
         return resolved_size, resolved_overlap
+    max_auto_size = float(_AUTO_TILE_MEMORY_SIZES[-1])
     if pair_density_scale <= 0:
-        return float(_AUTO_TILE_MEMORY_SIZES[-1]), resolved_overlap
+        return max_auto_size, resolved_overlap
 
     if pair_indices is None:
         pair_indices = _candidate_pair_indices(context)
     else:
         pair_indices = pair_indices.to(device=context.device, dtype=torch.long)
     if pair_indices.numel() == 0:
-        return float(_AUTO_TILE_MEMORY_SIZES[-1]), resolved_overlap
+        return max_auto_size, resolved_overlap
+    if _single_tile_geometry_prefers_local_tiles(context):
+        return _AUTO_SINGLE_TILE_GUARD_SIZE, resolved_overlap
 
-    largest_fit_size: Optional[float] = None
-    best_over_budget_size = resolved_size
-    best_over_budget_bytes = float("inf")
-    for candidate_size in _AUTO_TILE_MEMORY_SIZES:
-        if candidate_size < resolved_size:
-            continue
-        grid = _build_tile_grid(
-            context.atom_coords.detach(),
-            context.atom_radii.detach(),
-            context.probe_radius,
-            tile_size=float(candidate_size),
-            tile_overlap=resolved_overlap,
-        )
-        atom_tile_mask = _tile_atom_intersection_mask(
-            context.atom_coords.detach(),
-            context.atom_radii.detach(),
-            context.probe_radius,
-            grid,
-        )
-        active_ids = _candidate_tile_ids(atom_tile_mask, min_atoms=2)
-        membership_count = _tile_pair_membership_count(
-            atom_tile_mask,
-            pair_indices,
-            active_ids,
-        )
-        estimate = _estimate_tile_pair_work_bytes(
-            membership_count,
-            point_area=point_area,
-            pair_density_scale=pair_density_scale,
-            dtype=context.dtype,
-        )
-        if estimate < best_over_budget_bytes:
-            best_over_budget_bytes = estimate
-            best_over_budget_size = float(candidate_size)
-        if estimate <= int(tile_memory_budget_bytes):
-            largest_fit_size = float(candidate_size)
+    single_tile_work = _estimate_tile_pair_work_bytes(
+        int(pair_indices.shape[0]),
+        point_area=point_area,
+        pair_density_scale=pair_density_scale,
+        dtype=context.dtype,
+    )
+    if single_tile_work <= int(tile_memory_budget_bytes):
+        return max_auto_size, resolved_overlap
 
-    if largest_fit_size is not None:
-        return largest_fit_size, resolved_overlap
-    return best_over_budget_size, resolved_overlap
+    # Avoid an expensive candidate sweep when the coarse single-tile estimate is
+    # already over budget.  A 64A tile is the best measured local fallback: it
+    # keeps the number of tiles moderate while avoiding the giant single-tile
+    # analytic block path on very large pair graphs.
+    return max(float(resolved_size), _AUTO_SINGLE_TILE_GUARD_SIZE), resolved_overlap
 
 
 def _candidate_tile_triple_indices(

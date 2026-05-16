@@ -408,9 +408,10 @@ needed to build those outputs.
 When `tile_size="auto"` the sampler uses a memory-aware heuristic that prefers
 the largest candidate tile fitting the built-in 3 GiB tile-work estimate. Very
 large tiles are intentional: if the resolved grid contains one tile, the method
-falls back to the same analytic block pipeline used by `sample_analytic_points`,
-with `atom_density_scale` and `pair_density_scale` acting like analytic
-oversampling factors and `probe_density_scale` controlling fixed-probe patches.
+uses the same analytic block pipeline as `sample_analytic_points`. Before that
+heavy sampling starts, a cheap geometry guard checks the mid-sized compact and
+sparse shapes that showed single-tile overgeneration in the benchmark traces;
+those cases resolve directly to local 64 Angstrom tiles.
 
 ## Choosing An Interface
 
