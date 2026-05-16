@@ -63,7 +63,7 @@ Chrome trace JSON export is disabled in every mode unless
 `--torch-profile-export-traces` is explicitly passed. The compact top-op summary
 and internal function summary are usually enough for hot-path optimization.
 
-Each run records `program_version`, defaulting to `0.0.3`. For release
+Each run records `program_version`, defaulting to `0.0.4`. For release
 benchmarks, set `SES_BENCH_PROGRAM_VERSION` to the same semantic version as the
 GitHub tag, for example `0.1.0`.
 
@@ -411,7 +411,7 @@ target a similar median point density.
 - `SES_BENCH_MODE`: `quick`, `detail`, or `sweep`. Default: `quick`.
 - `SES_BENCH_DATA_DIR`: PDB dataset directory.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
-- `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.3`.
+- `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.4`.
 - `SES_BENCH_INTERFACES`: default interface modes passed by the wrapper. Default: `points`.
 - `SES_BENCH_MOLECULE_ORDER`: default PDB order, for example `atom_count_desc`.
 - `SES_BENCH_REPEATS`: override mode-specific repeat defaults.

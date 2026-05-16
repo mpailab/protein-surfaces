@@ -103,7 +103,7 @@ def test_gpu_benchmark_profile_details_can_be_written_as_artifact(tmp_path) -> N
 def test_gpu_benchmark_density_defaults_are_calibrated() -> None:
     args = _parser_args()
 
-    assert args.program_version == "0.0.3"
+    assert args.program_version == "0.0.4"
     assert args.point_area == 0.5
     assert args.analytic_oversample_factor == 1.0
     assert args.projected_m == 192

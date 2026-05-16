@@ -45,7 +45,7 @@ import ses.tiled_analytic as ses_tiled_analytic  # noqa: E402
 
 
 SCHEMA_VERSION = 3
-PROGRAM_VERSION = "0.0.3"
+PROGRAM_VERSION = "0.0.4"
 BENCHMARK_DRIVER_VERSION = "0.0.4"
 BENCHMARK_MODE_ORDER = ("quick", "detail", "sweep")
 METHOD_ORDER = ("analytic", "projected", "sdf", "tiled_analytic")
