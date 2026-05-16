@@ -138,7 +138,8 @@ variants:
 SES_BENCH_PROGRAM_VERSION=0.0.4 \
 scripts/run_gpu_benchmarks.sh --mode sweep \
   --methods analytic,tiled_analytic \
-  --interfaces points,normals,adjacency
+  --interfaces all \
+  --interface-scenarios cumulative
 
 python scripts/analyze_gpu_benchmarks.py sweep \
   --benchmark tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4_sweep.jsonl \
@@ -359,10 +360,14 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
 
 - `--methods`: comma-separated subset, or `all`.
 - `--mode`: `quick`, `detail`, or `sweep`. Default: `quick`.
-- `--interfaces`: independent output variants to benchmark. Default: `points`,
-  which requests only point coordinates. Use comma-separated `features`,
-  `normals`, and `adjacency` to add isolated feature, normal, and graph
-  measurements, or `all` for all four variants.
+- `--interfaces`: interface modes to benchmark. Default: `points`, which
+  requests only point coordinates. By default, non-points modes are independent:
+  `features` requests points plus atom features, `normals` requests points plus
+  normals, and `adjacency` requests points plus the sparse adjacency matrix.
+- `--interface-scenarios`: `independent` or `cumulative`. Use `cumulative`
+  with `--interfaces all` for the four release-style scenarios in order:
+  points; points plus features; points plus features and normals; points plus
+  features, normals, and adjacency.
 - `--sweep-preset`: `none`, `focused`, or `broad`; defaults to `focused`
   only in `sweep` mode.
 - `--repeats`: repeated runs per molecule/method/variant. Defaults to `1` in
@@ -413,6 +418,7 @@ target a similar median point density.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
 - `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.4`.
 - `SES_BENCH_INTERFACES`: default interface modes passed by the wrapper. Default: `points`.
+- `SES_BENCH_INTERFACE_SCENARIOS`: `independent` or `cumulative`. Default: `independent`.
 - `SES_BENCH_MOLECULE_ORDER`: default PDB order, for example `atom_count_desc`.
 - `SES_BENCH_REPEATS`: override mode-specific repeat defaults.
 - `SES_BENCH_SWEEP_PRESET`: override mode-specific sweep defaults.

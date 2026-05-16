@@ -29,6 +29,7 @@ DEFAULT_SWEEP_PRESET="${SES_BENCH_SWEEP_PRESET:-}"
 DEFAULT_REPEATS="${SES_BENCH_REPEATS:-}"
 DEFAULT_TORCH_PROFILE_LIMIT="${SES_BENCH_TORCH_PROFILE_LIMIT:-}"
 DEFAULT_INTERFACES="${SES_BENCH_INTERFACES:-points}"
+DEFAULT_INTERFACE_SCENARIOS="${SES_BENCH_INTERFACE_SCENARIOS:-independent}"
 BASELINE_OUTPUT="${SES_BENCH_BASELINE_OUTPUT:-}"
 COMPARE_OUTPUT="${SES_BENCH_COMPARE_OUTPUT:-}"
 COMPARE_FAIL="${SES_BENCH_COMPARE_FAIL:-0}"
@@ -36,6 +37,7 @@ DEFAULT_ARGS=(
   --program-version "${PROGRAM_VERSION}"
   --mode "${DEFAULT_MODE}"
   --interfaces "${DEFAULT_INTERFACES}"
+  --interface-scenarios "${DEFAULT_INTERFACE_SCENARIOS}"
 )
 if [[ -n "${DEFAULT_SWEEP_PRESET}" ]]; then
   DEFAULT_ARGS+=(--sweep-preset "${DEFAULT_SWEEP_PRESET}")
@@ -71,7 +73,7 @@ print_defaults() {
   echo "[ses-gpu-bench] Wrapper defaults before CLI overrides:"
   echo "[ses-gpu-bench]   program_version=${PROGRAM_VERSION}, mode=${DEFAULT_MODE}, auto_resume=${AUTO_RESUME}"
   echo "[ses-gpu-bench]   sweep=${DEFAULT_SWEEP_PRESET:-mode-default}, repeats=${DEFAULT_REPEATS:-mode-default}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT:-mode-default}"
-  echo "[ses-gpu-bench]   interfaces=${DEFAULT_INTERFACES}"
+  echo "[ses-gpu-bench]   interfaces=${DEFAULT_INTERFACES}, interface_scenarios=${DEFAULT_INTERFACE_SCENARIOS}"
   if [[ -n "${BASELINE_OUTPUT}" ]]; then
     echo "[ses-gpu-bench] Baseline compare:"
     echo "[ses-gpu-bench]   baseline=${BASELINE_OUTPUT}, fail=${COMPARE_FAIL}, output=${COMPARE_OUTPUT:-stdout}"

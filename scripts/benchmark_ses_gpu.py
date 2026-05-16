@@ -915,11 +915,17 @@ def _method_params(
 
 
 def _interface_params(args: argparse.Namespace, mode: str) -> Dict[str, Any]:
-    include_atom_features = mode == "features"
-    include_normals = mode == "normals"
+    scenario_mode = getattr(args, "interface_scenarios", "independent")
+    if scenario_mode == "cumulative":
+        include_atom_features = mode in {"features", "normals", "adjacency"}
+        include_normals = mode in {"normals", "adjacency"}
+    else:
+        include_atom_features = mode == "features"
+        include_normals = mode == "normals"
     include_adjacency = mode == "adjacency"
     params: Dict[str, Any] = {
         "mode": mode,
+        "scenario_mode": scenario_mode,
         "include_atom_features": include_atom_features,
         "include_normals": include_normals,
         "include_adjacency": include_adjacency,
@@ -1208,6 +1214,7 @@ def _all_parameters(
         },
         "interfaces": {
             "modes": args.interfaces,
+            "scenario_mode": args.interface_scenarios,
             "adjacency_weight": args.adjacency_weight,
             "adjacency_neighbors": args.adjacency_neighbors,
             "adjacency_candidate_neighbors": args.adjacency_candidate_neighbors,
@@ -1256,9 +1263,11 @@ def _all_parameters(
             "and *-values flags can vary these settings for throughput/quality "
             "tuning. The tiled_analytic auto tile heuristic is memory-aware for "
             "small and large molecules and prefers large tiles unless estimated "
-            "tile work would exceed the budget. Interface modes measure "
-            "points-only, feature, normal, and adjacency costs as separate "
-            "non-cumulative variants."
+            "tile work would exceed the budget. Interface modes are independent "
+            "by default. Use --interface-scenarios cumulative to benchmark the "
+            "release-style output suite: points; points plus features; points "
+            "plus features and normals; points plus features, normals, and "
+            "adjacency."
         ),
     }
 
@@ -2117,6 +2126,13 @@ def _attach_profile_details(
         "method": variant["method"],
         "variant_name": variant["variant_name"],
         "interface_mode": variant["interface_mode"],
+        "interface_params": variant.get(
+            "interface_params",
+            {
+                "mode": variant["interface_mode"],
+                "scenario_mode": "independent",
+            },
+        ),
         "method_parameter_hash": variant["hash"],
         "run_index": run_index,
         "repeat_index": result.get("repeat_index"),
@@ -3182,9 +3198,20 @@ def _build_parser() -> argparse.ArgumentParser:
         type=_parse_interface_modes,
         default=os.environ.get("SES_BENCH_INTERFACES", "points"),
         help=(
-            "Comma-separated independent sampler output variants to benchmark: "
-            "points, features, normals, adjacency, or all. The default points "
-            "variant requests only point coordinates."
+            "Comma-separated sampler interface modes to benchmark: points, "
+            "features, normals, adjacency, or all. The default points mode "
+            "requests only point coordinates."
+        ),
+    )
+    parser.add_argument(
+        "--interface-scenarios",
+        choices=("independent", "cumulative"),
+        default=os.environ.get("SES_BENCH_INTERFACE_SCENARIOS", "independent"),
+        help=(
+            "Interpret non-points interface modes as independent measurements "
+            "or as the cumulative release suite: points; points plus features; "
+            "points plus features and normals; points plus features, normals, "
+            "and adjacency."
         ),
     )
     parser.add_argument(

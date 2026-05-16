@@ -27,6 +27,7 @@ def test_gpu_benchmark_quick_mode_defaults_are_compact() -> None:
     assert args.molecule_order == "atom_count_desc"
     assert args.repeats == 1
     assert args.sweep_preset == "none"
+    assert args.interface_scenarios == "independent"
     assert args.profile_internals is False
     assert args.torch_profile_limit == 0
     assert args.torch_profile_export_traces is False
@@ -115,7 +116,7 @@ def test_gpu_benchmark_density_defaults_are_calibrated() -> None:
     assert args.tiled_probe_density_scale == 1.0
 
 
-def test_gpu_benchmark_interface_variants_are_hashed_separately() -> None:
+def test_gpu_benchmark_interface_variants_are_independent_by_default() -> None:
     args = _parser_args(
         "--methods",
         "projected",
@@ -150,9 +151,13 @@ def test_gpu_benchmark_interface_variants_are_hashed_separately() -> None:
         (False, True, False),
         (False, False, True),
     ]
+    assert [
+        variant["interface_params"]["scenario_mode"]
+        for variant in variants
+    ] == ["independent"] * 4
 
 
-def test_gpu_benchmark_interface_parser_keeps_requested_variants_independent() -> None:
+def test_gpu_benchmark_interface_parser_keeps_requested_independent_variants() -> None:
     assert bench._parse_interface_modes("features,normals,adjacency") == [
         "features",
         "normals",
@@ -162,6 +167,34 @@ def test_gpu_benchmark_interface_parser_keeps_requested_variants_independent() -
         "features",
         "normals",
         "adjacency",
+    ]
+
+
+def test_gpu_benchmark_cumulative_interface_scenarios_request_release_suite() -> None:
+    args = _parser_args(
+        "--methods",
+        "projected",
+        "--interfaces",
+        "all",
+        "--interface-scenarios",
+        "cumulative",
+    )
+    variants = bench._build_variants(args, ["projected"])
+
+    assert [
+        (
+            variant["interface_mode"],
+            variant["interface_params"]["include_atom_features"],
+            variant["interface_params"]["include_normals"],
+            variant["interface_params"]["include_adjacency"],
+            variant["interface_params"]["scenario_mode"],
+        )
+        for variant in variants
+    ] == [
+        ("points", False, False, False, "cumulative"),
+        ("features", True, False, False, "cumulative"),
+        ("normals", True, True, False, "cumulative"),
+        ("adjacency", True, True, True, "cumulative"),
     ]
 
 
@@ -181,6 +214,32 @@ def test_gpu_benchmark_split_sampler_output_reads_independent_adjacency() -> Non
     assert split[0] is points
     assert split[1] is None
     assert split[2] is None
+    assert split[3] is adjacency
+
+
+def test_gpu_benchmark_split_sampler_output_reads_cumulative_adjacency() -> None:
+    args = _parser_args(
+        "--interfaces",
+        "adjacency",
+        "--interface-scenarios",
+        "cumulative",
+    )
+    interface_params = bench._interface_params(args, "adjacency")
+    points = torch.zeros((3, 3), dtype=torch.float32)
+    atom_features = torch.zeros((3, 2), dtype=torch.float32)
+    normals = torch.zeros((3, 3), dtype=torch.float32)
+    indices = torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long)
+    values = torch.ones(4, dtype=torch.float32)
+    adjacency = torch.sparse_coo_tensor(indices, values, (3, 3)).coalesce()
+
+    split = bench._split_sampler_output(
+        (points, atom_features, normals, adjacency),
+        interface_params,
+    )
+
+    assert split[0] is points
+    assert split[1] is atom_features
+    assert split[2] is normals
     assert split[3] is adjacency
 
 

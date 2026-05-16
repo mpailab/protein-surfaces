@@ -20,8 +20,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-CaseKey = Tuple[str, str, str, str]
-VariantKey = Tuple[str, str, str]
+CaseKey = Tuple[str, str, str, str, str]
+VariantKey = Tuple[str, str, str, str]
 
 
 def _json_default(value: Any) -> Any:
@@ -101,17 +101,19 @@ def _clean_timing_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, A
 
 
 def _case_key(record: Dict[str, Any]) -> CaseKey:
+    interface_params = record.get("interface_params") or {}
     return (
         str(record.get("pdb_id", "")),
         str(record.get("method", "")),
         str(record.get("method_variant_name") or record.get("variant_name", "default")),
         str(record.get("interface_mode", "points")),
+        str(interface_params.get("scenario_mode", "independent")),
     )
 
 
 def _variant_key_from_case(key: CaseKey) -> VariantKey:
-    _, method, method_variant_name, interface_mode = key
-    return (method, method_variant_name, interface_mode)
+    _, method, method_variant_name, interface_mode, scenario_mode = key
+    return (method, method_variant_name, interface_mode, scenario_mode)
 
 
 def _case_stats(records: Sequence[Dict[str, Any]]) -> Dict[CaseKey, Dict[str, Any]]:
@@ -171,6 +173,7 @@ def compare_benchmarks(
                 "method": key[1],
                 "method_variant_name": key[2],
                 "interface_mode": key[3],
+                "interface_scenarios": key[4],
                 "baseline_wall_seconds": base["wall_seconds"],
                 "current_wall_seconds": cur["wall_seconds"],
                 "wall_ratio": ratio,
@@ -199,6 +202,7 @@ def compare_benchmarks(
                 item["method"],
                 item["method_variant_name"],
                 item["interface_mode"],
+                item["interface_scenarios"],
             )
         ].append(item)
 
@@ -218,6 +222,7 @@ def compare_benchmarks(
                 "method": key[0],
                 "method_variant_name": key[1],
                 "interface_mode": key[2],
+                "interface_scenarios": key[3],
                 "cases": len(items),
                 "median_wall_ratio": _median(ratios),
                 "median_speedup": (
@@ -309,6 +314,7 @@ def _print_compare_report(report: Dict[str, Any]) -> None:
         print(
             "  "
             f"{item['method']} {item['method_variant_name']} {item['interface_mode']}: "
+            f"{item['interface_scenarios']}: "
             f"median={_format_ratio(item['median_wall_ratio'])}, "
             f"cases={item['cases']}, regressions={item['regression_cases']}, "
             f"worst={worst['pdb_id']} {_format_ratio(worst['wall_ratio'])}"
@@ -320,7 +326,8 @@ def _print_compare_report(report: Dict[str, Any]) -> None:
             print(
                 "  "
                 f"{item['pdb_id']} {item['method']} "
-                f"{item['method_variant_name']} {item['interface_mode']}: "
+                f"{item['method_variant_name']} {item['interface_mode']} "
+                f"{item['interface_scenarios']}: "
                 f"{_format_ratio(item['wall_ratio'])} "
                 f"({_format_seconds(item['baseline_wall_seconds'])} -> "
                 f"{_format_seconds(item['current_wall_seconds'])})"
@@ -332,7 +339,8 @@ def _print_compare_report(report: Dict[str, Any]) -> None:
             print(
                 "  "
                 f"{item['pdb_id']} {item['method']} "
-                f"{item['method_variant_name']} {item['interface_mode']}: "
+                f"{item['method_variant_name']} {item['interface_mode']} "
+                f"{item['interface_scenarios']}: "
                 f"{_format_ratio(item['wall_ratio'])} "
                 f"({_format_seconds(item['baseline_wall_seconds'])} -> "
                 f"{_format_seconds(item['current_wall_seconds'])})"
@@ -385,6 +393,7 @@ def _profile_payloads(
                     "method": record.get("method"),
                     "variant_name": record.get("variant_name"),
                     "interface_mode": record.get("interface_mode"),
+                    "interface_params": record.get("interface_params"),
                     "internal_profile": record.get("internal_profile"),
                     "torch_profile": record.get("torch_profile"),
                 }
@@ -423,6 +432,8 @@ def summarize_profiles(
     )
     top_calls = []
     for payload in payloads:
+        interface_params = payload.get("interface_params") or {}
+        scenario_mode = interface_params.get("scenario_mode", "independent")
         internal = payload.get("internal_profile") or {}
         for item in internal.get("top_functions", []) or []:
             name = str(item.get("name", ""))
@@ -436,6 +447,7 @@ def summarize_profiles(
                     "pdb_id": payload.get("pdb_id"),
                     "method": payload.get("method"),
                     "interface_mode": payload.get("interface_mode"),
+                    "interface_scenarios": scenario_mode,
                     "name": item.get("name"),
                     "wall_seconds": item.get("wall_seconds"),
                     "input_tensor_bytes": item.get("input_tensor_bytes"),
@@ -520,33 +532,37 @@ def _print_profile_report(report: Dict[str, Any], *, limit: int) -> None:
         print(
             "  "
             f"{item.get('pdb_id')} {item.get('method')} "
-            f"{item.get('interface_mode')} {item.get('name')}: "
+            f"{item.get('interface_mode')} {item.get('interface_scenarios')} "
+            f"{item.get('name')}: "
             f"{_format_seconds(item.get('wall_seconds'))}"
         )
 
 
 def summarize_sweep(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    grouped: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    grouped: Dict[Tuple[str, str, str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for record in records:
         if record.get("status") != "ok":
             continue
+        interface_params = record.get("interface_params") or {}
         key = (
             str(record.get("method", "")),
             str(record.get("interface_mode", "points")),
+            str(interface_params.get("scenario_mode", "independent")),
             str(record.get("method_variant_name") or record.get("variant_name", "default")),
             str(record.get("method_parameter_hash", "")),
         )
         grouped[key].append(record)
 
     rows = []
-    defaults: Dict[Tuple[str, str], Optional[float]] = {}
+    defaults: Dict[Tuple[str, str, str], Optional[float]] = {}
     for key, row_records in grouped.items():
-        method, interface_mode, variant_name, method_hash = key
+        method, interface_mode, scenario_mode, variant_name, method_hash = key
         timing_records = _clean_timing_records(row_records) or row_records
         wall_seconds = _median(record.get("wall_seconds") for record in timing_records)
         row = {
             "method": method,
             "interface_mode": interface_mode,
+            "interface_scenarios": scenario_mode,
             "method_variant_name": variant_name,
             "method_parameter_hash": method_hash,
             "records": len(row_records),
@@ -559,15 +575,18 @@ def summarize_sweep(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         }
         rows.append(row)
         if variant_name == "default":
-            defaults[(method, interface_mode)] = wall_seconds
+            defaults[(method, interface_mode, scenario_mode)] = wall_seconds
 
     for row in rows:
-        default_seconds = defaults.get((row["method"], row["interface_mode"]))
+        default_seconds = defaults.get(
+            (row["method"], row["interface_mode"], row["interface_scenarios"])
+        )
         row["speedup_vs_default"] = _safe_ratio(default_seconds, row["wall_seconds"])
     rows.sort(
         key=lambda item: (
             item["method"],
             item["interface_mode"],
+            item["interface_scenarios"],
             item["wall_seconds"] if item["wall_seconds"] is not None else math.inf,
         )
     )
@@ -584,11 +603,13 @@ def _print_sweep_report(report: Dict[str, Any], *, limit: int) -> None:
     print("GPU Benchmark Sweep Summary")
     print(f"Status counts: {report['status_counts']}")
     print(f"Variants: {report['variant_count']}")
-    by_method_interface: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
+    by_method_interface: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
     for row in report["variants"]:
-        by_method_interface[(row["method"], row["interface_mode"])].append(row)
+        by_method_interface[
+            (row["method"], row["interface_mode"], row["interface_scenarios"])
+        ].append(row)
     for key in sorted(by_method_interface):
-        print(f"\n{key[0]} {key[1]}:")
+        print(f"\n{key[0]} {key[1]} {key[2]}:")
         for row in by_method_interface[key][:limit]:
             print(
                 "  "
