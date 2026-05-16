@@ -10,7 +10,12 @@ DOCKERFILE="${SES_BENCH_DOCKERFILE:-Dockerfile.gpu}"
 PYTHON_VERSION="${SES_BENCH_PYTHON_VERSION:-3.9}"
 TORCH_INDEX_URL="${SES_BENCH_TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu121}"
 PROGRAM_VERSION="${SES_BENCH_PROGRAM_VERSION:-0.0.3}"
-OUTPUT="${SES_BENCH_OUTPUT:-tmp/gpu_benchmarks/ses_gpu_benchmark_${PROGRAM_VERSION}.jsonl}"
+DEFAULT_MODE="${SES_BENCH_MODE:-quick}"
+OUTPUT_SUFFIX=""
+if [[ "${DEFAULT_MODE}" != "quick" ]]; then
+  OUTPUT_SUFFIX="_${DEFAULT_MODE}"
+fi
+OUTPUT="${SES_BENCH_OUTPUT:-tmp/gpu_benchmarks/ses_gpu_benchmark_${PROGRAM_VERSION}${OUTPUT_SUFFIX}.jsonl}"
 DATA_DIR="${SES_BENCH_DATA_DIR:-Data/01-benchmark_pdbs}"
 SURFACE_DIR="${SES_BENCH_SURFACE_DIR:-Data/01-benchmark_surfaces}"
 SKIP_BUILD="${SES_BENCH_SKIP_BUILD:-0}"
@@ -20,17 +25,27 @@ CONTAINER="${SES_BENCH_CONTAINER:-}"
 CONTAINER_WORKDIR="${SES_BENCH_CONTAINER_WORKDIR:-/workspace}"
 EXEC_USER="${SES_BENCH_EXEC_USER:-}"
 RUN_LOCAL="${SES_BENCH_RUN_LOCAL:-0}"
-DEFAULT_SWEEP_PRESET="${SES_BENCH_SWEEP_PRESET:-focused}"
-DEFAULT_REPEATS="${SES_BENCH_REPEATS:-3}"
-DEFAULT_TORCH_PROFILE_LIMIT="${SES_BENCH_TORCH_PROFILE_LIMIT:-100}"
+DEFAULT_SWEEP_PRESET="${SES_BENCH_SWEEP_PRESET:-}"
+DEFAULT_REPEATS="${SES_BENCH_REPEATS:-}"
+DEFAULT_TORCH_PROFILE_LIMIT="${SES_BENCH_TORCH_PROFILE_LIMIT:-}"
 DEFAULT_INTERFACES="${SES_BENCH_INTERFACES:-points}"
+BASELINE_OUTPUT="${SES_BENCH_BASELINE_OUTPUT:-}"
+COMPARE_OUTPUT="${SES_BENCH_COMPARE_OUTPUT:-}"
+COMPARE_FAIL="${SES_BENCH_COMPARE_FAIL:-0}"
 DEFAULT_ARGS=(
   --program-version "${PROGRAM_VERSION}"
-  --sweep-preset "${DEFAULT_SWEEP_PRESET}"
-  --repeats "${DEFAULT_REPEATS}"
-  --torch-profile-limit "${DEFAULT_TORCH_PROFILE_LIMIT}"
+  --mode "${DEFAULT_MODE}"
   --interfaces "${DEFAULT_INTERFACES}"
 )
+if [[ -n "${DEFAULT_SWEEP_PRESET}" ]]; then
+  DEFAULT_ARGS+=(--sweep-preset "${DEFAULT_SWEEP_PRESET}")
+fi
+if [[ -n "${DEFAULT_REPEATS}" ]]; then
+  DEFAULT_ARGS+=(--repeats "${DEFAULT_REPEATS}")
+fi
+if [[ -n "${DEFAULT_TORCH_PROFILE_LIMIT}" ]]; then
+  DEFAULT_ARGS+=(--torch-profile-limit "${DEFAULT_TORCH_PROFILE_LIMIT}")
+fi
 
 USER_ARGS=("$@")
 RUN_ARGS=("${DEFAULT_ARGS[@]}")
@@ -53,7 +68,14 @@ RUN_ARGS+=("${USER_ARGS[@]}")
 
 print_defaults() {
   echo "[ses-gpu-bench] Output: ${OUTPUT}"
-  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides: program_version=${PROGRAM_VERSION}, auto_resume=${AUTO_RESUME}, sweep=${DEFAULT_SWEEP_PRESET}, repeats=${DEFAULT_REPEATS}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT}, interfaces=${DEFAULT_INTERFACES}"
+  echo "[ses-gpu-bench] Wrapper defaults before CLI overrides:"
+  echo "[ses-gpu-bench]   program_version=${PROGRAM_VERSION}, mode=${DEFAULT_MODE}, auto_resume=${AUTO_RESUME}"
+  echo "[ses-gpu-bench]   sweep=${DEFAULT_SWEEP_PRESET:-mode-default}, repeats=${DEFAULT_REPEATS:-mode-default}, torch_profile_limit=${DEFAULT_TORCH_PROFILE_LIMIT:-mode-default}"
+  echo "[ses-gpu-bench]   interfaces=${DEFAULT_INTERFACES}"
+  if [[ -n "${BASELINE_OUTPUT}" ]]; then
+    echo "[ses-gpu-bench] Baseline compare:"
+    echo "[ses-gpu-bench]   baseline=${BASELINE_OUTPUT}, fail=${COMPARE_FAIL}, output=${COMPARE_OUTPUT:-stdout}"
+  fi
 }
 
 missing_dependency_message() {
@@ -130,6 +152,26 @@ ensure_container_paths() {
   docker exec -w "${CONTAINER_WORKDIR}" "${CONTAINER}" mkdir -p "${output_dir}"
 }
 
+compare_args() {
+  local args=(compare --baseline "${BASELINE_OUTPUT}" --current "${OUTPUT}")
+  if [[ -n "${COMPARE_OUTPUT}" ]]; then
+    args+=(--output "${COMPARE_OUTPUT}")
+  fi
+  if [[ "${COMPARE_FAIL}" == "1" ]]; then
+    args+=(--fail-on-regression)
+  fi
+  printf '%s\n' "${args[@]}"
+}
+
+run_local_compare() {
+  if [[ -z "${BASELINE_OUTPUT}" ]]; then
+    return
+  fi
+  local args=()
+  mapfile -t args < <(compare_args)
+  python scripts/analyze_gpu_benchmarks.py "${args[@]}"
+}
+
 if [[ "${RUN_LOCAL}" == "1" ]]; then
   ensure_local_paths
   echo "[ses-gpu-bench] Running benchmark in the current environment"
@@ -141,6 +183,7 @@ if [[ "${RUN_LOCAL}" == "1" ]]; then
   SES_BENCH_SURFACE_DIR="${SURFACE_DIR}" \
   SES_BENCH_PROGRAM_VERSION="${PROGRAM_VERSION}" \
     python scripts/benchmark_ses_gpu.py "${RUN_ARGS[@]}"
+  run_local_compare
   exit 0
 fi
 
@@ -169,6 +212,13 @@ if [[ -n "${CONTAINER}" ]]; then
   docker "${DOCKER_EXEC_ARGS[@]}" \
     "${CONTAINER}" \
     python scripts/benchmark_ses_gpu.py "${RUN_ARGS[@]}"
+  if [[ -n "${BASELINE_OUTPUT}" ]]; then
+    COMPARE_ARGS=()
+    mapfile -t COMPARE_ARGS < <(compare_args)
+    docker "${DOCKER_EXEC_ARGS[@]}" \
+      "${CONTAINER}" \
+      python scripts/analyze_gpu_benchmarks.py "${COMPARE_ARGS[@]}"
+  fi
   exit 0
 fi
 
@@ -202,3 +252,14 @@ docker run --rm \
   -w /workspace \
   "${IMAGE}" \
   python scripts/benchmark_ses_gpu.py "${RUN_ARGS[@]}"
+
+if [[ -n "${BASELINE_OUTPUT}" ]]; then
+  COMPARE_ARGS=()
+  mapfile -t COMPARE_ARGS < <(compare_args)
+  docker run --rm \
+    -e "PYTHONUNBUFFERED=1" \
+    -v "${REPO_ROOT}:/workspace" \
+    -w /workspace \
+    "${IMAGE}" \
+    python scripts/analyze_gpu_benchmarks.py "${COMPARE_ARGS[@]}"
+fi

@@ -44,9 +44,10 @@ import ses.sdf as ses_sdf  # noqa: E402
 import ses.tiled_analytic as ses_tiled_analytic  # noqa: E402
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PROGRAM_VERSION = "0.0.3"
-BENCHMARK_DRIVER_VERSION = "0.0.3"
+BENCHMARK_DRIVER_VERSION = "0.0.4"
+BENCHMARK_MODE_ORDER = ("quick", "detail", "sweep")
 METHOD_ORDER = ("analytic", "projected", "sdf", "tiled_analytic")
 INTERFACE_MODE_ORDER = (
     "points",
@@ -64,6 +65,7 @@ TILED_DENSITY_SCALE_DEFAULT = 1.0
 _ACTIVE_SECTION_PROFILER: Optional["SectionProfiler"] = None
 _INSTALLED_PROFILE_WRAPPERS: List[Tuple[Any, str, Any]] = []
 _PROFILE_MODULES = (ses_projection, ses_analytic, ses_sdf, ses_tiled_analytic)
+PROFILE_ARTIFACT_FORMATS = ("none", "pt", "json")
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -456,9 +458,10 @@ def _utc_now() -> str:
     )
 
 
-def _default_output_path() -> str:
+def _default_output_path(mode: str = "quick") -> str:
     program_version = os.environ.get("SES_BENCH_PROGRAM_VERSION", PROGRAM_VERSION)
-    return f"tmp/gpu_benchmarks/ses_gpu_benchmark_{program_version}.jsonl"
+    mode_suffix = "" if mode == "quick" else f"_{mode}"
+    return f"tmp/gpu_benchmarks/ses_gpu_benchmark_{program_version}{mode_suffix}.jsonl"
 
 
 def _parse_methods(value: str) -> List[str]:
@@ -690,6 +693,158 @@ def _default_surface_dir(data_dir: str) -> str:
     if data_path.name == "01-benchmark_pdbs":
         return str(data_path.with_name("01-benchmark_surfaces"))
     return str(data_path.parent / "01-benchmark_surfaces")
+
+
+def _env_bool(name: str) -> Optional[bool]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise SystemExit(f"{name} must be a boolean value")
+
+
+def _env_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(f"{name} must be an integer") from exc
+
+
+def _coalesce(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _apply_mode_defaults(args: argparse.Namespace) -> None:
+    """Resolve benchmark-mode defaults after argparse/env parsing.
+
+    Quick mode is for regression control and keeps each JSONL record compact.
+    Detail mode records only compact top-level hot-path summaries and stores
+    those summaries outside the streaming JSONL by default. Sweep mode avoids
+    profiling overhead so parameter grids stay comparable.
+    """
+
+    mode = args.mode
+    if mode not in BENCHMARK_MODE_ORDER:
+        allowed = ", ".join(BENCHMARK_MODE_ORDER)
+        raise SystemExit(f"--mode must be one of: {allowed}")
+
+    if args.output is None:
+        args.output = os.environ.get("SES_BENCH_OUTPUT") or _default_output_path(mode)
+
+    args.molecule_order = _coalesce(
+        args.molecule_order,
+        os.environ.get("SES_BENCH_MOLECULE_ORDER"),
+        "atom_count_desc",
+    )
+    if args.largest_first:
+        args.molecule_order = "atom_count_desc"
+
+    args.repeats = int(
+        _coalesce(
+            args.repeats,
+            _env_int("SES_BENCH_REPEATS"),
+            3 if mode == "sweep" else 1,
+        )
+    )
+    args.sweep_preset = _coalesce(
+        args.sweep_preset,
+        os.environ.get("SES_BENCH_SWEEP_PRESET"),
+        "focused" if mode == "sweep" else "none",
+    )
+    args.reference_metrics = bool(
+        _coalesce(
+            args.reference_metrics,
+            _env_bool("SES_BENCH_REFERENCE_METRICS"),
+            False,
+        )
+    )
+
+    detail_mode = mode == "detail"
+    args.profile_internals = bool(
+        _coalesce(
+            args.profile_internals,
+            _env_bool("SES_BENCH_PROFILE_INTERNALS"),
+            detail_mode,
+        )
+    )
+    args.profile_shapes = bool(
+        _coalesce(
+            args.profile_shapes,
+            _env_bool("SES_BENCH_PROFILE_SHAPES"),
+            detail_mode,
+        )
+    )
+    args.profile_record_cuda_events = bool(
+        _coalesce(
+            args.profile_record_cuda_events,
+            _env_bool("SES_BENCH_PROFILE_RECORD_CUDA_EVENTS"),
+            False,
+        )
+    )
+    args.profile_synchronize_cuda = bool(
+        _coalesce(
+            args.profile_synchronize_cuda,
+            _env_bool("SES_BENCH_PROFILE_SYNCHRONIZE_CUDA"),
+            False,
+        )
+    )
+    args.torch_profile_limit = int(
+        _coalesce(
+            args.torch_profile_limit,
+            _env_int("SES_BENCH_TORCH_PROFILE_LIMIT"),
+            20 if detail_mode else 0,
+        )
+    )
+    args.torch_profile_every = int(
+        _coalesce(args.torch_profile_every, _env_int("SES_BENCH_TORCH_PROFILE_EVERY"), 0)
+    )
+    args.torch_profile_memory = bool(
+        _coalesce(
+            args.torch_profile_memory,
+            _env_bool("SES_BENCH_TORCH_PROFILE_MEMORY"),
+            detail_mode,
+        )
+    )
+    args.torch_profile_record_shapes = bool(
+        _coalesce(
+            args.torch_profile_record_shapes,
+            _env_bool("SES_BENCH_TORCH_PROFILE_RECORD_SHAPES"),
+            False,
+        )
+    )
+    args.torch_profile_export_traces = bool(
+        _coalesce(
+            args.torch_profile_export_traces,
+            _env_bool("SES_BENCH_TORCH_PROFILE_EXPORT_TRACES"),
+            False,
+        )
+    )
+    args.profile_artifact_format = _coalesce(
+        args.profile_artifact_format,
+        os.environ.get("SES_BENCH_PROFILE_ARTIFACT_FORMAT"),
+        "pt" if detail_mode else "none",
+    )
+    if args.profile_artifact_format not in PROFILE_ARTIFACT_FORMATS:
+        allowed = ", ".join(PROFILE_ARTIFACT_FORMATS)
+        raise SystemExit(f"--profile-artifact-format must be one of: {allowed}")
+    args.inline_profile_details = bool(
+        _coalesce(
+            args.inline_profile_details,
+            _env_bool("SES_BENCH_INLINE_PROFILE_DETAILS"),
+            args.profile_artifact_format == "none",
+        )
+    )
+    args.fsync = bool(_coalesce(args.fsync, _env_bool("SES_BENCH_FSYNC"), True))
 
 
 def _method_params(
@@ -937,6 +1092,10 @@ def _sweep_overrides(
     method: str,
     base: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
+    if args.sweep_preset is None:
+        args.sweep_preset = (
+            "focused" if getattr(args, "mode", "quick") == "sweep" else "none"
+        )
     explicit = _explicit_values(args, method)
     if explicit:
         values = {**_preset_values(method, base, args.sweep_preset), **explicit}
@@ -1020,6 +1179,7 @@ def _all_parameters(
     variants: Sequence[Dict[str, Any]],
 ) -> Dict[str, Any]:
     return {
+        "benchmark_mode": args.mode,
         "program_version": args.program_version,
         "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
         "probe_radius": args.probe_radius,
@@ -1079,6 +1239,12 @@ def _all_parameters(
             "torch_profile_record_shapes": args.torch_profile_record_shapes,
             "torch_profile_memory": args.torch_profile_memory,
             "torch_profile_export_traces": args.torch_profile_export_traces,
+            "profile_artifact_dir": args.profile_artifact_dir,
+            "profile_artifact_format": args.profile_artifact_format,
+            "inline_profile_details": args.inline_profile_details,
+        },
+        "output_safety": {
+            "fsync": args.fsync,
         },
         "calibration_note": (
             "Defaults are recalibrated from the 0.0.3 GPU default, tile sweep, "
@@ -1199,15 +1365,18 @@ def _load_existing_results(
 
 
 class JsonlWriter:
-    def __init__(self, path: Path, append: bool) -> None:
+    def __init__(self, path: Path, append: bool, *, fsync: bool) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
+        self.fsync = bool(fsync)
         self._handle = path.open("a" if append else "w", encoding="utf-8")
 
     def write(self, record: Dict[str, Any]) -> None:
         json.dump(record, self._handle, default=_json_default, sort_keys=True)
         self._handle.write("\n")
         self._handle.flush()
+        if self.fsync:
+            os.fsync(self._handle.fileno())
 
     def close(self) -> None:
         self._handle.close()
@@ -1227,6 +1396,7 @@ def _base_result(
     return {
         "event": "benchmark_result",
         "schema_version": SCHEMA_VERSION,
+        "benchmark_mode": args.mode,
         "program_version": args.program_version,
         "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
         "run_id": run_id,
@@ -1843,10 +2013,62 @@ def _torch_profile_path(
     return profile_dir / f"{name}.trace.json"
 
 
+def _profile_artifact_path(
+    args: argparse.Namespace,
+    *,
+    run_id: str,
+    pdb_id: str,
+    variant: Dict[str, Any],
+    run_index: int,
+) -> Path:
+    artifact_dir = Path(args.profile_artifact_dir)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    suffix = ".pt" if args.profile_artifact_format == "pt" else ".json"
+    name = "__".join(
+        [
+            run_id,
+            f"{run_index:06d}",
+            pdb_id,
+            variant["method"],
+            _safe_filename(variant["variant_name"]),
+            variant["hash"],
+        ]
+    )
+    return artifact_dir / f"{name}.profile{suffix}"
+
+
+def _write_profile_artifact(
+    path: Path,
+    payload: Dict[str, Any],
+    *,
+    fmt: str,
+) -> Dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    if fmt == "pt":
+        torch.save(payload, tmp_path)
+    elif fmt == "json":
+        tmp_path.write_text(
+            json.dumps(payload, sort_keys=True, default=_json_default) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        raise ValueError(f"unsupported profile artifact format: {fmt}")
+    os.replace(tmp_path, path)
+    return {
+        "path": str(path),
+        "format": fmt,
+        "file_size_bytes": path.stat().st_size if path.exists() else None,
+    }
+
+
 def _should_profile_internals(args: argparse.Namespace, run_index: int) -> bool:
     if not args.profile_internals:
         return False
-    if args.profile_internals_limit_runs is not None and run_index > args.profile_internals_limit_runs:
+    if (
+        args.profile_internals_limit_runs is not None
+        and run_index > args.profile_internals_limit_runs
+    ):
         return False
     return args.profile_internals_every > 0 and run_index % args.profile_internals_every == 0
 
@@ -1868,6 +2090,65 @@ def _should_torch_profile(
     if args.torch_profile_limit and profiles_attempted < args.torch_profile_limit:
         return True
     return args.torch_profile_every > 0 and run_index % args.torch_profile_every == 0
+
+
+def _attach_profile_details(
+    result: Dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    run_id: str,
+    pdb_path: Path,
+    variant: Dict[str, Any],
+    run_index: int,
+    section_summary: Optional[Dict[str, Any]],
+    torch_profile_summary: Optional[Dict[str, Any]],
+) -> None:
+    if section_summary is None and torch_profile_summary is None:
+        return
+
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "benchmark_mode": args.mode,
+        "program_version": args.program_version,
+        "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
+        "run_id": run_id,
+        "created_at_utc": _utc_now(),
+        "pdb_id": pdb_path.stem,
+        "method": variant["method"],
+        "variant_name": variant["variant_name"],
+        "interface_mode": variant["interface_mode"],
+        "method_parameter_hash": variant["hash"],
+        "run_index": run_index,
+        "repeat_index": result.get("repeat_index"),
+        "status": result.get("status"),
+        "internal_profile": section_summary,
+        "torch_profile": torch_profile_summary,
+    }
+    if args.profile_artifact_format != "none":
+        try:
+            artifact = _write_profile_artifact(
+                _profile_artifact_path(
+                    args,
+                    run_id=run_id,
+                    pdb_id=pdb_path.stem,
+                    variant=variant,
+                    run_index=run_index,
+                ),
+                payload,
+                fmt=args.profile_artifact_format,
+            )
+            result["profile_artifact"] = artifact
+        except Exception as exc:  # noqa: BLE001 - preserve the benchmark result.
+            result["profile_artifact_error"] = {
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+            }
+
+    if args.inline_profile_details or args.profile_artifact_format == "none":
+        if section_summary is not None:
+            result["internal_profile"] = section_summary
+        if torch_profile_summary is not None:
+            result["torch_profile"] = torch_profile_summary
 
 
 def _run_one_method(
@@ -2103,10 +2384,16 @@ def _run_one_method(
             }
         )
         result.update(memory)
-        if section_summary is not None:
-            result["internal_profile"] = section_summary
-        if torch_profile_summary is not None:
-            result["torch_profile"] = torch_profile_summary
+        _attach_profile_details(
+            result,
+            args=args,
+            run_id=run_id,
+            pdb_path=pdb_path,
+            variant=variant,
+            run_index=run_index,
+            section_summary=section_summary,
+            torch_profile_summary=torch_profile_summary,
+        )
     except Exception as exc:  # noqa: BLE001 - benchmark must keep going.
         cuda_sync_error = _safe_cuda_synchronize(device)
         cpu_rss_after = _current_rss_mb()
@@ -2404,7 +2691,11 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             for record in ok_records
             if record.get("reference_metrics", {}).get("status") == "ok"
         ]
-        params = ok_records[0].get("method_params") if ok_records else records[0].get("method_params")
+        params = (
+            ok_records[0].get("method_params")
+            if ok_records
+            else records[0].get("method_params")
+        )
         interface_mode = (
             ok_records[0].get("interface_mode")
             if ok_records
@@ -2603,6 +2894,7 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     def slim(record: Dict[str, Any]) -> Dict[str, Any]:
         profiling = record.get("profiling", {})
         torch_profile = record.get("torch_profile", {})
+        profile_artifact = record.get("profile_artifact", {})
         return {
             "pdb_id": record.get("pdb_id"),
             "method": record.get("method"),
@@ -2615,6 +2907,7 @@ def _summarize(results: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "internal_profile_enabled": profiling.get("internal_profile_enabled"),
             "torch_profile_enabled": profiling.get("torch_profile_enabled"),
             "torch_profile_trace_path": torch_profile.get("trace_path"),
+            "profile_artifact_path": profile_artifact.get("path"),
             "atom_count": record.get("atom_count"),
             "point_count": record.get("point_count"),
             "wall_seconds": record.get("wall_seconds"),
@@ -2682,14 +2975,23 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Benchmark SES samplers on a PDB dataset and write JSONL results."
     )
     parser.add_argument(
+        "--mode",
+        choices=BENCHMARK_MODE_ORDER,
+        default=os.environ.get("SES_BENCH_MODE", "quick"),
+        help=(
+            "Benchmark profile: quick for compact regression control, detail "
+            "for hot-path profiling, sweep for parameter grids."
+        ),
+    )
+    parser.add_argument(
         "--data-dir",
         default=os.environ.get("SES_BENCH_DATA_DIR", "Data/01-benchmark_pdbs"),
         help="Directory containing benchmark .pdb files.",
     )
     parser.add_argument(
         "--output",
-        default=os.environ.get("SES_BENCH_OUTPUT", _default_output_path()),
-        help="Streaming JSONL output path.",
+        default=None,
+        help="Streaming JSONL output path. Defaults to a mode-specific path.",
     )
     parser.add_argument(
         "--summary-output",
@@ -2719,10 +3021,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "file_size_desc",
             "file_size_asc",
         ),
-        default=os.environ.get("SES_BENCH_MOLECULE_ORDER", "name"),
+        default=None,
         help=(
             "Order PDB files before shard/offset/limit selection. "
-            "Use atom_count_desc to run the largest molecules first."
+            "Defaults to atom_count_desc so the largest molecules run first."
         ),
     )
     parser.add_argument(
@@ -2738,8 +3040,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--repeats",
         type=int,
-        default=1,
-        help="Number of repeated runs per molecule/method/variant.",
+        default=None,
+        help=(
+            "Number of repeated runs per molecule/method/variant. Defaults to "
+            "1 in quick/detail mode and 3 in sweep mode."
+        ),
     )
     parser.add_argument(
         "--profile-only-first-repeat",
@@ -2750,8 +3055,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sweep-preset",
         choices=("none", "focused", "broad"),
-        default=os.environ.get("SES_BENCH_SWEEP_PRESET", "none"),
-        help="Parameter sweep preset. focused varies one parameter at a time; broad is larger.",
+        default=None,
+        help=(
+            "Parameter sweep preset. Defaults to none except in sweep mode, "
+            "where focused is used."
+        ),
     )
     parser.add_argument(
         "--sweep-cartesian",
@@ -2765,26 +3073,53 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Optional cap including the default variant.",
     )
 
-    parser.add_argument("--profile-internals", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--profile-internals", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--profile-internals-every", type=int, default=1)
     parser.add_argument("--profile-internals-limit-runs", type=int, default=None)
-    parser.add_argument("--profile-shapes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--profile-shapes", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--profile-sample-structures", action="store_true")
-    parser.add_argument("--profile-record-cuda-events", action="store_true")
-    parser.add_argument("--profile-synchronize-cuda", action="store_true")
-    parser.add_argument("--profile-top-functions", type=int, default=40)
-    parser.add_argument("--profile-top-calls", type=int, default=12)
+    parser.add_argument(
+        "--profile-record-cuda-events",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--profile-synchronize-cuda",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--profile-top-functions", type=int, default=25)
+    parser.add_argument("--profile-top-calls", type=int, default=8)
     parser.add_argument("--profile-max-summary-items", type=int, default=6)
+    parser.add_argument("--profile-artifact-dir", default="tmp/gpu_benchmarks/profiles")
+    parser.add_argument(
+        "--profile-artifact-format",
+        choices=PROFILE_ARTIFACT_FORMATS,
+        default=None,
+        help=(
+            "Where compact detailed profiles are stored. Detail mode defaults "
+            "to pt; quick and sweep default to none."
+        ),
+    )
+    parser.add_argument(
+        "--inline-profile-details",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Inline internal/torch profile details into JSONL. Disabled by "
+            "default when profile artifacts are enabled."
+        ),
+    )
 
-    parser.add_argument("--torch-profile-limit", type=int, default=0)
-    parser.add_argument("--torch-profile-every", type=int, default=0)
+    parser.add_argument("--torch-profile-limit", type=int, default=None)
+    parser.add_argument("--torch-profile-every", type=int, default=None)
     parser.add_argument("--torch-profile-dir", default="tmp/gpu_benchmarks/traces")
     parser.add_argument("--torch-profile-top-ops", type=int, default=30)
     parser.add_argument("--torch-profile-with-stack", action="store_true")
     parser.add_argument(
         "--torch-profile-record-shapes",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Record operator input shapes in PyTorch profiler traces. Disabled "
             "by default because full-dataset traces become very large."
@@ -2793,17 +3128,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--torch-profile-memory",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Record PyTorch profiler memory events.",
     )
     parser.add_argument(
         "--torch-profile-export-traces",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help=(
-            "Export Chrome trace JSON files for profiled runs. Top-op summaries "
-            "are still written to JSONL when trace export is disabled."
+            "Export Chrome trace JSON files for profiled runs. Disabled by "
+            "default; compact top-op summaries are enough for most hot-path work."
         ),
+    )
+    parser.add_argument(
+        "--fsync",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Flush each JSONL record through fsync. Enabled by default.",
     )
 
     parser.add_argument("--device", default=os.environ.get("SES_BENCH_DEVICE", "cuda"))
@@ -2829,7 +3170,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--surface-dir",
         default=os.environ.get("SES_BENCH_SURFACE_DIR"),
     )
-    parser.add_argument("--reference-metrics", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reference-metrics", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--reference-sample-size", type=int, default=4096)
     parser.add_argument("--reference-distance-budget", type=int, default=16_000_000)
     parser.add_argument("--grid-spacing", type=float, default=None)
@@ -2940,8 +3281,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    if args.largest_first:
-        args.molecule_order = "atom_count_desc"
+    _apply_mode_defaults(args)
     if args.surface_dir is None:
         args.surface_dir = _default_surface_dir(args.data_dir)
     methods = args.methods if isinstance(args.methods, list) else _parse_methods(args.methods)
@@ -3010,11 +3350,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if append
         else (set(), [])
     )
-    writer = JsonlWriter(output_path, append=append)
+    writer = JsonlWriter(output_path, append=append, fsync=args.fsync)
 
     start_record = {
         "event": "run_start",
         "schema_version": SCHEMA_VERSION,
+        "benchmark_mode": args.mode,
         "program_version": args.program_version,
         "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
         "run_id": run_id,
@@ -3042,12 +3383,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "output": {
             "jsonl": str(output_path),
             "summary_json": str(summary_path),
+            "fsync": args.fsync,
+            "profile_artifact_dir": args.profile_artifact_dir,
+            "profile_artifact_format": args.profile_artifact_format,
         },
     }
     writer.write(start_record)
 
     print(
-        f"[ses-gpu-bench] run_id={run_id} methods={','.join(methods)} "
+        f"[ses-gpu-bench] run_id={run_id} mode={args.mode} "
+        f"methods={','.join(methods)} "
         f"variants={len(variants)} repeats={args.repeats} "
         f"molecules={len(pdbs)} output={output_path}",
         flush=True,
@@ -3175,6 +3520,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         summary = {
             "event": "run_end",
             "schema_version": SCHEMA_VERSION,
+            "benchmark_mode": args.mode,
             "program_version": args.program_version,
             "benchmark_driver_version": BENCHMARK_DRIVER_VERSION,
             "run_id": run_id,

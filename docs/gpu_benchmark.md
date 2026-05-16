@@ -30,26 +30,38 @@ results to:
 tmp/gpu_benchmarks/ses_gpu_benchmark_<program version>.jsonl
 ```
 
+For non-quick modes the wrapper appends the mode name unless
+`SES_BENCH_OUTPUT` is set, for example
+`ses_gpu_benchmark_<program version>_detail.jsonl`.
+
 A compact summary is written next to it as:
 
 ```text
 tmp/gpu_benchmarks/ses_gpu_benchmark_<program version>.summary.json
 ```
 
-Send both files back for optimization work. The JSONL file is the most useful
-artifact because it includes per-molecule timings, peak CUDA memory, point
-counts, molecule geometry, internal function timings, intermediate tensor sizes,
-reference-surface distance metrics, errors, tracebacks, environment metadata,
-and git status.
+Send the JSONL and summary files back for regression analysis. The default run
+uses `--mode quick`: all methods, all PDB files, largest molecules first,
+points-only output, no profiler overhead, no Chrome trace export, and fsync
+after every JSONL record. That keeps the file useful after interruption without
+turning routine regression control into a trace dump.
 
-The wrapper defaults are deliberately diagnostic: `--sweep-preset focused`,
-`--repeats 3`, and `--torch-profile-limit 100`. That gives profiled repeats on
-a limited prefix plus cleaner timing repeats for each molecule/method/variant.
-PyTorch traces can be large and slow to write, so use a lower
-`--torch-profile-limit` for throughput-focused full-dataset runs. Override the
-defaults with normal CLI flags, or set `SES_BENCH_SWEEP_PRESET`,
-`SES_BENCH_REPEATS`, and `SES_BENCH_TORCH_PROFILE_LIMIT` before running the
-wrapper.
+The benchmark has three modes:
+
+- `quick`: fast regression control over the selected PDB directory. Defaults to
+  all methods, `--interfaces points`, `--sweep-preset none`, `--repeats 1`,
+  largest molecules first, no reference metrics, no internal profiling, and no
+  PyTorch profiler.
+- `detail`: compact critical-path profiling. Defaults to internal function
+  summaries plus a limited PyTorch top-op profile, but stores profile details in
+  binary `.pt` artifacts under `tmp/gpu_benchmarks/profiles/` instead of
+  inlining them into the streaming JSONL.
+- `sweep`: parameter-grid tuning. Defaults to the focused sweep preset, three
+  repeats, no profiling, and the same compact JSONL records as quick mode.
+
+Chrome trace JSON export is disabled in every mode unless
+`--torch-profile-export-traces` is explicitly passed. The compact top-op summary
+and internal function summary are usually enough for hot-path optimization.
 
 Each run records `program_version`, defaulting to `0.0.3`. For release
 benchmarks, set `SES_BENCH_PROGRAM_VERSION` to the same semantic version as the
@@ -60,6 +72,79 @@ program version skips already recorded molecule/method/parameter/repeat results
 and only fills missing records. Use `--overwrite` when you intentionally want
 to rebuild the benchmark file for the same version.
 
+## Release Optimization Loop
+
+The intended release workflow is:
+
+1. After code changes, run a quick benchmark for the candidate version.
+2. Compare the quick result with the latest release benchmark.
+3. If the comparison is clean, cut the next release benchmark/tag.
+4. If it regresses, run detail mode for the affected methods/molecules and
+   optimize the hot path.
+5. If new parameters or heuristics were introduced, run sweep mode and adjust
+   defaults or `auto` selection from the sweep result.
+6. Repeat from quick mode until the candidate is clean.
+
+Quick release-gate run:
+
+```bash
+SES_BENCH_PROGRAM_VERSION=0.0.4 \
+scripts/run_gpu_benchmarks.sh --mode quick
+```
+
+Compare it with the latest release JSONL:
+
+```bash
+python scripts/analyze_gpu_benchmarks.py compare \
+  --baseline tmp/gpu_benchmarks/releases/ses_gpu_benchmark_0.0.3.jsonl \
+  --current tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4.jsonl \
+  --fail-on-regression \
+  --output tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4.compare.json
+```
+
+The wrapper can run that comparison automatically after collection:
+
+```bash
+SES_BENCH_PROGRAM_VERSION=0.0.4 \
+SES_BENCH_BASELINE_OUTPUT=tmp/gpu_benchmarks/releases/ses_gpu_benchmark_0.0.3.jsonl \
+SES_BENCH_COMPARE_OUTPUT=tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4.compare.json \
+SES_BENCH_COMPARE_FAIL=1 \
+scripts/run_gpu_benchmarks.sh --mode quick
+```
+
+The comparison groups records by molecule, method, method variant, and
+interface mode. It reports aggregate variant medians, the worst per-molecule
+regressions, improvements, missing cases, and point-count changes.
+
+When quick comparison finds a regression, collect compact detail profiles on
+the problematic slice:
+
+```bash
+SES_BENCH_PROGRAM_VERSION=0.0.4 \
+scripts/run_gpu_benchmarks.sh --mode detail \
+  --methods tiled_analytic \
+  --limit 20 \
+  --output tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4_detail.jsonl
+
+python scripts/analyze_gpu_benchmarks.py profiles \
+  --benchmark tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4_detail.jsonl \
+  --output tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4_detail.profiles.json
+```
+
+When tuning defaults or `auto` heuristics, run a parameter grid and rank
+variants:
+
+```bash
+SES_BENCH_PROGRAM_VERSION=0.0.4 \
+scripts/run_gpu_benchmarks.sh --mode sweep \
+  --methods analytic,tiled_analytic \
+  --interfaces points,normals,adjacency
+
+python scripts/analyze_gpu_benchmarks.py sweep \
+  --benchmark tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4_sweep.jsonl \
+  --output tmp/gpu_benchmarks/ses_gpu_benchmark_0.0.4_sweep.analysis.json
+```
+
 ## Smoke Run
 
 Use a small limit before launching the full dataset:
@@ -68,10 +153,10 @@ Use a small limit before launching the full dataset:
 scripts/run_gpu_benchmarks.sh --limit 10 --log-every 1
 ```
 
-To stress the largest molecules first:
+Largest molecules already run first in quick mode. To use a different order:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --largest-first --limit 10 --log-every 1
+scripts/run_gpu_benchmarks.sh --molecule-order name --limit 10 --log-every 1
 ```
 
 CPU-only smoke runs are also possible for validating the benchmark driver inside
@@ -152,19 +237,20 @@ way to find the fastest useful settings before changing code.
 Focused sweep, one parameter varied at a time:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --sweep-preset focused
+scripts/run_gpu_benchmarks.sh --mode sweep
 ```
 
 Broader sweep:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --sweep-preset broad
+scripts/run_gpu_benchmarks.sh --mode sweep --sweep-preset broad
 ```
 
 Explicit method-specific sweeps:
 
 ```bash
 scripts/run_gpu_benchmarks.sh \
+  --mode sweep \
   --methods projected,sdf,tiled_analytic \
   --projected-m-values 96,160,192,230,320 \
   --sdf-m-values 16,26,34,64 \
@@ -180,83 +266,78 @@ interpretable. Add `--sweep-cartesian` when you intentionally want a Cartesian
 product. The summary JSON includes `variant_summaries` and
 `fastest_variants_by_method`.
 
-For more stable timings without losing diagnostic detail, use repeated runs.
-With the default `--profile-only-first-repeat`, repeat `0` keeps internal
-profiling while later repeats are cleaner timing samples. The summary exposes
-both `wall_seconds` and `clean_wall_seconds`, so profiler overhead does not hide
-the fastest useful variant:
+Sweep mode defaults to repeated clean runs with no profiling. The summary
+exposes both `wall_seconds` and `clean_wall_seconds`; in sweep mode they should
+match unless profiling is explicitly enabled:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --sweep-preset focused --repeats 3
+scripts/run_gpu_benchmarks.sh --mode sweep --repeats 5
 ```
 
 ## Reference Metrics
 
-When matching `.ply` files are present in `Data/01-benchmark_surfaces`, each
-method result also records approximate quality metrics against reference
-vertices:
+Reference metrics are disabled by default in all modes because they add a
+separate nearest-neighbor pass. When matching `.ply` files are present in
+`Data/01-benchmark_surfaces`, enable them to record approximate quality metrics
+against reference vertices:
 
 - generated point count to reference vertex count ratio;
 - point-to-reference and reference-to-point nearest-distance summaries;
 - symmetric mean nearest-distance score.
 
 Distances are computed on deterministic subsamples so they stay practical on
-the full dataset. Increase or reduce the sample size with:
+the full dataset:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --reference-sample-size 8192
-```
-
-Disable reference metrics only for pure runtime debugging:
-
-```bash
-scripts/run_gpu_benchmarks.sh --no-reference-metrics
+scripts/run_gpu_benchmarks.sh --reference-metrics --reference-sample-size 8192
 ```
 
 ## Profiling Detail
 
-Internal section profiling is enabled by default. Each benchmark result includes
-`internal_profile.top_functions` and `internal_profile.top_calls` with inclusive
-wall time plus maximum input/output tensor sizes. This is designed to identify
-hot helper functions and oversized intermediate structures.
-
-For cleaner throughput-only measurements, disable internal profiling:
+Use `detail` mode when the quick run finds a regression and you need the hot
+path:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --no-profile-internals
+scripts/run_gpu_benchmarks.sh --mode detail --methods tiled_analytic --limit 10
 ```
 
-For deeper CUDA/operator traces on a limited subset, enable PyTorch profiler:
+Each profiled result writes a compact `profile_artifact` path in the JSONL. The
+default artifact format is binary `.pt` and contains:
+
+- `internal_profile.top_functions`: inclusive SES helper timings plus maximum
+  input/output tensor counts and bytes;
+- `internal_profile.top_calls`: slow individual helper calls;
+- `torch_profile.top_ops`: top CUDA, CPU, and memory operators.
+
+The profile payload is not inlined into JSONL by default. Inline it only for
+small diagnostic runs:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --limit 20 --torch-profile-limit 20
+scripts/run_gpu_benchmarks.sh --mode detail --limit 3 --inline-profile-details
 ```
 
-Trace files are written under `tmp/gpu_benchmarks/traces/` and can be opened in
-Chrome trace viewer or Perfetto. Records with `torch_profile` include top CUDA,
-CPU, and memory ops, and are marked because `wall_seconds` includes profiler
-overhead. Prefer the `clean_*` summary metrics for throughput comparisons.
-Operator input-shape recording is disabled by default because the 0.0.1 GPU
-run showed that shape-heavy traces can grow into multi-gigabyte files. Re-enable
-it only for a small diagnostic subset:
+For deeper CUDA/operator traces on a limited subset, explicitly export Chrome
+trace JSON files. Keep the limit small; these are for viewer inspection, not
+routine optimization loops:
 
 ```bash
 scripts/run_gpu_benchmarks.sh --limit 5 --torch-profile-limit 5 \
-  --torch-profile-record-shapes
+  --torch-profile-export-traces
 ```
 
-To keep top-op summaries in JSONL without exporting trace files:
+Operator input-shape recording is disabled by default because shape-heavy traces
+can become enormous. Re-enable it only for a tiny diagnostic subset:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --limit 20 --torch-profile-limit 20 \
-  --no-torch-profile-export-traces
+scripts/run_gpu_benchmarks.sh --mode detail --limit 3 \
+  --torch-profile-record-shapes
 ```
 
 For maximum structure detail on a small diagnostic run, include nested sample
 summaries:
 
 ```bash
-scripts/run_gpu_benchmarks.sh --limit 5 --profile-sample-structures
+scripts/run_gpu_benchmarks.sh --mode detail --limit 3 --profile-sample-structures
 ```
 
 ## Sharding
@@ -277,13 +358,17 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
 ## Important Parameters
 
 - `--methods`: comma-separated subset, or `all`.
+- `--mode`: `quick`, `detail`, or `sweep`. Default: `quick`.
 - `--interfaces`: independent output variants to benchmark. Default: `points`,
   which requests only point coordinates. Use comma-separated `features`,
   `normals`, and `adjacency` to add isolated feature, normal, and graph
   measurements, or `all` for all four variants.
-- `--sweep-preset`: `none`, `focused`, or `broad`.
-- `--repeats`: repeated runs per molecule/method/variant.
-- `--largest-first`: run the largest PDBs first, using an atom-count estimate.
+- `--sweep-preset`: `none`, `focused`, or `broad`; defaults to `focused`
+  only in `sweep` mode.
+- `--repeats`: repeated runs per molecule/method/variant. Defaults to `1` in
+  quick/detail mode and `3` in sweep mode.
+- `--largest-first`: shortcut for largest PDBs first, which is already the
+  default order.
 - `--molecule-order`: `name`, `atom_count_desc`, `atom_count_asc`, `file_size_desc`, or `file_size_asc`.
 - `--point-area`: analytic target area per point. Default: `0.5`.
 - `--projected-m`: projection seeds per atom. Default: `192`.
@@ -304,7 +389,12 @@ scripts/run_gpu_benchmarks.sh --shard-count 4 --shard-index 1
   estimate. If one tile covers the molecule, `tiled_analytic` uses the same
   analytic block pipeline as `sample_analytic_points`.
 - `--reference-sample-size`: reference quality subsample size. Default: `4096`.
-- `--torch-profile-limit`: number of method/variant runs to trace with PyTorch profiler.
+- `--torch-profile-limit`: number of method/variant runs to profile with the
+  PyTorch profiler. Defaults to `20` in detail mode and `0` otherwise.
+- `--torch-profile-export-traces`: write Chrome trace JSON files. Disabled by
+  default.
+- `--profile-artifact-format`: `none`, `pt`, or `json`. Detail mode defaults to
+  `pt`.
 - `--profile-internals-every`: collect internal function profiles every N method/variant runs.
 - `--max-atoms`: optional debugging guard for very large structures.
 - `--dtype`: `float32` by default; use `float64` for precision comparisons.
@@ -318,11 +408,22 @@ target a similar median point density.
 
 - `SES_BENCH_IMAGE`: Docker image tag.
 - `SES_BENCH_OUTPUT`: JSONL output path.
+- `SES_BENCH_MODE`: `quick`, `detail`, or `sweep`. Default: `quick`.
 - `SES_BENCH_DATA_DIR`: PDB dataset directory.
 - `SES_BENCH_SURFACE_DIR`: PLY reference surface directory.
 - `SES_BENCH_PROGRAM_VERSION`: semantic program version recorded in benchmark output. Default: `0.0.3`.
 - `SES_BENCH_INTERFACES`: default interface modes passed by the wrapper. Default: `points`.
 - `SES_BENCH_MOLECULE_ORDER`: default PDB order, for example `atom_count_desc`.
+- `SES_BENCH_REPEATS`: override mode-specific repeat defaults.
+- `SES_BENCH_SWEEP_PRESET`: override mode-specific sweep defaults.
+- `SES_BENCH_TORCH_PROFILE_LIMIT`: override mode-specific PyTorch profiler limits.
+- `SES_BENCH_PROFILE_ARTIFACT_FORMAT`: `none`, `pt`, or `json`.
+- `SES_BENCH_BASELINE_OUTPUT`: optional release JSONL for automatic post-run
+  quick comparison.
+- `SES_BENCH_COMPARE_OUTPUT`: optional JSON output path for automatic
+  comparison reports.
+- `SES_BENCH_COMPARE_FAIL=1`: make the wrapper fail when automatic comparison
+  finds regressions, point-count changes, or missing baseline cases.
 - `SES_BENCH_AUTO_RESUME=0`: disable wrapper auto-resume. Auto-resume is enabled by default.
 - `SES_BENCH_CONTAINER`: run inside an already-running Docker container with `docker exec`.
 - `SES_BENCH_CONTAINER_WORKDIR`: repository path inside that container. Default: `/workspace`.

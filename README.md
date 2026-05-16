@@ -119,12 +119,11 @@ scripts/run_gpu_benchmarks.sh
 
 The command builds a CUDA Docker image, runs all SES methods on
 `Data/01-benchmark_pdbs`, and writes streaming JSONL plus a summary JSON under
-`tmp/gpu_benchmarks/`. The wrapper defaults to a focused parameter sweep, three
-repeats, and a limited set of PyTorch profiler traces so the first full run has
-both diagnostic and cleaner timing samples. The benchmark records internal
-section timings, intermediate tensor sizes, CUDA memory, parameter summaries,
-reference-surface distance metrics, optional atom-feature tensor costs, and
-isolated interface overhead for normals and sparse adjacency outputs. See
-`docs/gpu_benchmark.md` for smoke runs,
-existing-container execution, resume, sharding, profiling, interface modes, and
-sweep options.
+`tmp/gpu_benchmarks/`. The wrapper now defaults to `--mode quick`: largest
+molecules first, all methods, points-only output, no heavy profiling, and
+crash-safe per-record writes. Use `--mode detail` for compact hot-path profiling
+artifacts, or `--mode sweep` for parameter-grid tuning. Compare candidate runs
+with release baselines using `scripts/analyze_gpu_benchmarks.py compare`; the
+same helper also summarizes detail profiles and sweep results. See
+`docs/gpu_benchmark.md` for the release loop, smoke runs, existing-container
+execution, resume, sharding, profiling, interface modes, and sweep options.

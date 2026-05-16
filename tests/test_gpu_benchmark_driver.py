@@ -4,7 +4,7 @@ from scripts import benchmark_ses_gpu as bench
 
 
 def _parser_args(*extra: str):
-    return bench._build_parser().parse_args(
+    args = bench._build_parser().parse_args(
         [
             "--device",
             "cpu",
@@ -16,6 +16,88 @@ def _parser_args(*extra: str):
             *extra,
         ]
     )
+    bench._apply_mode_defaults(args)
+    return args
+
+
+def test_gpu_benchmark_quick_mode_defaults_are_compact() -> None:
+    args = _parser_args()
+
+    assert args.mode == "quick"
+    assert args.molecule_order == "atom_count_desc"
+    assert args.repeats == 1
+    assert args.sweep_preset == "none"
+    assert args.profile_internals is False
+    assert args.torch_profile_limit == 0
+    assert args.torch_profile_export_traces is False
+    assert args.profile_artifact_format == "none"
+    assert args.fsync is True
+
+
+def test_gpu_benchmark_detail_mode_defaults_to_compact_artifacts() -> None:
+    args = _parser_args(
+        "--mode",
+        "detail",
+        "--profile-internals",
+        "--reference-metrics",
+    )
+
+    assert args.repeats == 1
+    assert args.sweep_preset == "none"
+    assert args.reference_metrics is True
+    assert args.profile_internals is True
+    assert args.profile_shapes is True
+    assert args.torch_profile_limit == 20
+    assert args.torch_profile_memory is True
+    assert args.torch_profile_export_traces is False
+    assert args.profile_artifact_format == "pt"
+    assert args.inline_profile_details is False
+
+
+def test_gpu_benchmark_sweep_mode_defaults_to_focused_grid() -> None:
+    args = _parser_args("--mode", "sweep")
+
+    assert args.repeats == 3
+    assert args.sweep_preset == "focused"
+    assert args.profile_internals is False
+    assert args.torch_profile_limit == 0
+
+
+def test_gpu_benchmark_profile_details_can_be_written_as_artifact(tmp_path) -> None:
+    args = _parser_args(
+        "--mode",
+        "detail",
+        "--profile-internals",
+        "--profile-artifact-dir",
+        str(tmp_path),
+    )
+    variant = {
+        "method": "projected",
+        "variant_name": "default",
+        "interface_mode": "points",
+        "hash": "abc123",
+    }
+    result = {"status": "ok", "repeat_index": 0}
+    section_summary = {"top_functions": [{"name": "ses.projected.foo"}]}
+
+    bench._attach_profile_details(
+        result,
+        args=args,
+        run_id="run1",
+        pdb_path=tmp_path / "1ABC_A.pdb",
+        variant=variant,
+        run_index=1,
+        section_summary=section_summary,
+        torch_profile_summary=None,
+    )
+
+    artifact = result["profile_artifact"]
+    assert artifact["format"] == "pt"
+    assert artifact["file_size_bytes"] > 0
+    assert "internal_profile" not in result
+    payload = torch.load(artifact["path"])
+    assert payload["pdb_id"] == "1ABC_A"
+    assert payload["internal_profile"] == section_summary
 
 
 def test_gpu_benchmark_density_defaults_are_calibrated() -> None:
