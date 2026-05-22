@@ -1,7 +1,10 @@
-import torch
+from pathlib import Path
+
 import pytest
+import torch
 
 import ses
+from data import read_pdb_tensors
 from ses import (
     sample_analytic_points,
     sample_projected_points,
@@ -15,6 +18,10 @@ from ses.example import (
     sdf_example,
     water_atoms,
 )
+
+
+TEST_PDB_DIR = Path(__file__).resolve().parent / "data" / "pdb"
+REAL_MOLECULE_IDS = ("2PQ2_B", "4FT4_Q", "4Q6I_J")
 
 
 def _two_separated_atoms() -> tuple[torch.Tensor, torch.Tensor]:
@@ -40,6 +47,13 @@ def _three_atom_cavity() -> tuple[torch.Tensor, torch.Tensor]:
     )
     radii = torch.full((3,), 1.5, dtype=torch.float64)
     return coords, radii
+
+
+def _real_molecule_inputs(pdb_id: str) -> tuple[torch.Tensor, torch.Tensor]:
+    protein = read_pdb_tensors(TEST_PDB_DIR / f"{pdb_id}.pdb").to(
+        dtype=torch.float64,
+    )
+    return protein.atom_coords, protein.atom_radii
 
 
 def _assert_points_backprop_to_atom_inputs(
@@ -136,6 +150,73 @@ def _sample_public_geometry(
     raise ValueError(f"unknown sampler {sampler_name!r}")
 
 
+def _sample_real_molecule_geometry(
+    sampler_name: str,
+    coords: torch.Tensor,
+    radii: torch.Tensor,
+    *,
+    adjacency_weight: str,
+):
+    if sampler_name == "projected":
+        return sample_projected_points(
+            coords,
+            radii,
+            m=16,
+            probe_radius=1.4,
+            include_normals=True,
+            include_adjacency=True,
+            adjacency_weight=adjacency_weight,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=8,
+        )
+    if sampler_name == "analytic":
+        return sample_analytic_points(
+            coords,
+            radii,
+            1.4,
+            point_area=10.0,
+            atom_filter_samples=16,
+            pair_filter_samples=6,
+            include_normals=True,
+            include_adjacency=True,
+            adjacency_weight=adjacency_weight,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=8,
+            max_grid_points=100_000,
+        )
+    if sampler_name == "sdf":
+        return sample_sdf_points(
+            coords,
+            radii,
+            m=12,
+            probe_radius=1.4,
+            smoothness=0.1,
+            level_tolerance=1e-5,
+            include_normals=True,
+            include_adjacency=True,
+            adjacency_weight=adjacency_weight,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=8,
+            max_grid_points=100_000,
+        )
+    if sampler_name == "tiled_analytic":
+        return sample_tiled_analytic_points(
+            coords,
+            radii,
+            1.4,
+            point_area=10.0,
+            tile_size=8.0,
+            tile_overlap=2.0,
+            include_normals=True,
+            include_adjacency=True,
+            adjacency_weight=adjacency_weight,
+            adjacency_neighbors=3,
+            adjacency_candidate_neighbors=8,
+            max_grid_points=100_000,
+        )
+    raise ValueError(f"unknown sampler {sampler_name!r}")
+
+
 def _assert_unit_normals(points: torch.Tensor, normals: torch.Tensor) -> None:
     assert normals.shape == points.shape
     assert normals.dtype == points.dtype
@@ -168,6 +249,46 @@ def _assert_sparse_adjacency(
     if expect_edges:
         assert adjacency.values().numel() > 0
         assert bool((adjacency.values() > 0).all().item())
+
+
+def _expected_normal_angle_geodesic_weights(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    edge_indices: torch.Tensor,
+) -> torch.Tensor:
+    first, second = edge_indices
+    chord_lengths = torch.linalg.norm(
+        points[second] - points[first],
+        dim=-1,
+    )
+    normal_cosines = (
+        (normals[first] * normals[second]).sum(dim=-1).clamp(-1, 1)
+    )
+    angles = torch.acos(normal_cosines)
+    eps = torch.finfo(points.dtype).eps
+    radius_denominators = (2 * torch.sin(0.5 * angles)).clamp_min(eps)
+    arc_lengths = chord_lengths / radius_denominators * angles
+    return torch.where(angles <= eps**0.5, chord_lengths, arc_lengths)
+
+
+def _assert_geodesic_adjacency_weights(
+    points: torch.Tensor,
+    normals: torch.Tensor,
+    adjacency: torch.Tensor,
+) -> None:
+    adjacency = adjacency.coalesce()
+    indices = adjacency.indices()
+    values = adjacency.values()
+    expected = _expected_normal_angle_geodesic_weights(points, normals, indices)
+    chord_lengths = torch.linalg.norm(
+        points[indices[1]] - points[indices[0]],
+        dim=-1,
+    )
+
+    assert torch.all(torch.isfinite(expected))
+    assert torch.allclose(values, expected, atol=1e-6, rtol=1e-6)
+    assert torch.all(values >= chord_lengths - 1e-8)
+    assert bool(torch.any(values > chord_lengths + 1e-6).item())
 
 
 def _assert_public_samplers_preserve_device(device: torch.device) -> None:
@@ -700,6 +821,29 @@ def test_all_public_samplers_can_return_surface_adjacency() -> None:
 
     for points, adjacency in sampler_outputs:
         _assert_sparse_adjacency(points, adjacency)
+
+
+@pytest.mark.parametrize("pdb_id", REAL_MOLECULE_IDS)
+@pytest.mark.parametrize(
+    "sampler_name",
+    ["projected", "analytic", "sdf", "tiled_analytic"],
+)
+def test_public_samplers_geodesic_adjacency_matches_arc_lengths_on_real_molecules(
+    sampler_name: str,
+    pdb_id: str,
+) -> None:
+    coords, radii = _real_molecule_inputs(pdb_id)
+
+    points, normals, adjacency = _sample_real_molecule_geometry(
+        sampler_name,
+        coords,
+        radii,
+        adjacency_weight="geodesic",
+    )
+
+    _assert_unit_normals(points, normals)
+    _assert_sparse_adjacency(points, adjacency)
+    _assert_geodesic_adjacency_weights(points, normals, adjacency)
 
 
 @pytest.mark.parametrize(
