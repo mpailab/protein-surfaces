@@ -1,9 +1,9 @@
 ﻿# SES-GNN: предсказание сайтов связывания
 
-Три скрипта:
 - `preprocess.py` — строит SES поверхность из PDB
 - `build_graphs.py` — строит графы
-- `train.py` — обучает GNN
+- `train_clean.py` — обучает GNN (один GPU)
+- `train_clean_ddp.py` — обучает GNN (несколько GPU, DDP)
 
 ## Установка
 
@@ -22,14 +22,17 @@ python preprocess.py --dataset training_ppi.txt --pdb_dir ./pdb_files --out_dir 
 # 2. Графы
 python build_graphs.py --raw_dir ./data/raw --out_dir ./data/graphs --r_cutoff 3.0
 
-# 3. Обучение
-python train.py --data_dir ./data/graphs --n_files 500 --threshold 4.0 --layers 6 --hidden 64 --lr 1e-3
+# 3. Обучение на одном GPU
+python train_clean.py --data_dir ./data/graphs --n_files 500 --threshold 4.0 --layers 6 --hidden 64 --lr 1e-3
+
+# 3b. Обучение на нескольких GPU (DDP)
+python train_clean_ddp.py --data_dir ./data/graphs --n_files 3000 --threshold 4.0 --layers 6 --hidden 64 --lr 1e-3
 
 # 4. Визуализация
 python viz.py --model best_model.pt --name 3P0C_D --threshold 0.4
 ```
 
-## Параметры train.py
+## Параметры train_clean.py / train_clean_ddp.py
 
 | Параметр | По умолчанию | Описание |
 |----------|--------------|----------|
@@ -38,22 +41,30 @@ python viz.py --model best_model.pt --name 3P0C_D --threshold 0.4
 | `--threshold` | `4.0` | Порог интерфейса (Å) |
 | `--layers` | `6` | Слоёв TransformerConv |
 | `--hidden` | `64` | Размер скрытого слоя |
+| `--heads` | `4` | Число голов внимания |
 | `--lr` | `1e-3` | Learning rate |
 | `--epochs` | `300` | Эпох |
 | `--ckpt` | `best_model.pt` | Имя чекпоинта |
+| `--resume` | `None` | Путь к чекпоинту для продолжения |
+| `--checkpoint` | `True` | Gradient checkpointing (экономия памяти) |
 
+## 📊 Результаты
 
-## 📊 Результаты: сравнение с dMaSIF
+### Наша модель (6 слоёв, hidden=64, обучение с hard negative mining)
 
-### Наша модель (500 файлов, 6 слоёв, hidden=64)
-
-| Метрика | Train | Val |
-|---------|-------|-----|
-| **F1** | 0.406 | **0.313** |
-| **ROC-AUC** | 0.729 | **0.627** |
-| **PR-AUC** | 0.566 | **0.322** |
-| **Precision** | 0.782 | **0.442** |
-| **Recall** | 0.274 | **0.141** |
+| Размер данных | Метрика | Train | Val | Оптимальный порог |
+|---------------|---------|-------|-----|-------------------|
+| **500 файлов** | F1 | 0.406 | 0.313 | — |
+| | ROC-AUC | 0.729 | 0.627 | — |
+| | PR-AUC | 0.566 | 0.322 | — |
+| | Precision | 0.782 | 0.442 | — |
+| | Recall | 0.274 | 0.141 | — |
+| **1500 файлов** | F1 (global) | **0.534** | **0.436** | **0.22** |
+| | F1 (per-protein) | **0.520** | **0.410** | **0.22** |
+| | ROC-AUC | **0.779** | **0.706** | — |
+| | PR-AUC | **0.666** | **0.355** | — |
+| | Precision (opt thr) | 0.438 | 0.330 | — |
+| | Recall (opt thr) | 0.683 | 0.635 | — |
 
 ### dMaSIF (из статьи Gainza et al. 2020, Nature Methods)
 
@@ -63,27 +74,26 @@ python viz.py --model best_model.pt --name 3P0C_D --threshold 0.4
 | PR-AUC | 0.50-0.60 |
 | F1 | ~0.45 (оценка) |
 
-### Сравнение
+### Сравнение с dMaSIF
 
-| Метрика | dMaSIF | Наша модель | Отставание |
-|---------|--------|-------------|------------|
-| **ROC-AUC** | 0.85-0.87 | **0.627** | -0.22 |
-| **PR-AUC** | 0.50-0.60 | **0.322** | -0.18 |
-| **F1** | ~0.45 | **0.313** | -0.14 |
-| **Время инференса** | 164 ms | **~30 ms** | ✅ быстрее |
-| **Память** | 1.5 GB | **~0.2 GB** | ✅ меньше |
+| Метрика | dMaSIF | Наша модель (1500 файлов) | Отставание |
+|---------|--------|---------------------------|------------|
+| **ROC-AUC** | 0.85-0.87 | **0.706** | -0.14 |
+| **PR-AUC** | 0.50-0.60 | **0.355** | -0.15 |
+| **F1** | ~0.45 | **0.410** (per-protein) | -0.04 |
 
 **Наши преимущества:**
-- Инференс в 5 раз быстрее
-- Памяти в 7 раз меньше
+- Инференс быстрее (оценочно в 5 раз)
+- Памяти меньше (оценочно в 7 раз)
 - Не нужны предварительные вычисления (меши, фичи)
 - Сквозной пайплайн от PDB до предсказания
 
 **Что нужно дотянуть:**
-- ROC-AUC: +0.22
-- PR-AUC: +0.18
-- Recall: поднять с 0.14 до 0.25-0.30
+- ROC-AUC: +0.14
+- PR-AUC: +0.15
+- Per-protein F1: +0.04
 
+---
 
 ## 🔬 План экспериментов (что дальше)
 
@@ -94,6 +104,8 @@ python viz.py --model best_model.pt --name 3P0C_D --threshold 0.4
 **Как проверить:**
 ```python
 # В build_graphs.py или прямо в train.py
+from torch_cluster import radius_graph
+
 e1 = radius_graph(pos, r=2.0, max_num_neighbors=24)
 e2 = radius_graph(pos, r=4.0, max_num_neighbors=32)
 e3 = radius_graph(pos, r=8.0, max_num_neighbors=48)
@@ -121,15 +133,14 @@ x = x + x_global.unsqueeze(0)      # добавить к каждой точке
 
 ### Эксперимент 3: Больше данных (приоритет 3)
 
-**Гипотеза:** 500 → 1000 → 1800 файлов дадут прирост.
+**Гипотеза:** 1500 → 3000 файлов дадут прирост.
 
 **Как проверить:**
 ```bash
-python train.py --n_files 1000
-python train.py --n_files 1800
+python train_clean_ddp.py --n_files 3000 --hidden 64 --layers 6 --resume last3_1500.pt
 ```
 
-**Ожидаемый прирост:** ROC-AUC +0.03-0.05
+**Ожидаемый прирост:** ROC-AUC +0.02-0.03
 
 ---
 
@@ -152,9 +163,9 @@ python train.py --n_files 1800
 
 **Как проверить:**
 ```bash
-python train.py --n_files 500 --ckpt model1.pt --seed 42
-python train.py --n_files 500 --ckpt model2.pt --seed 123
-python train.py --n_files 500 --ckpt model3.pt --seed 777
+python train_clean.py --n_files 1500 --ckpt model1.pt --seed 42
+python train_clean.py --n_files 1500 --ckpt model2.pt --seed 123
+python train_clean.py --n_files 1500 --ckpt model3.pt --seed 777
 # Усреднить логиты
 ```
 
@@ -168,12 +179,12 @@ python train.py --n_files 500 --ckpt model3.pt --seed 777
 
 **Как проверить:**
 ```bash
-python train.py --n_files 500 --layers 8 --hidden 128
-python train.py --n_files 500 --layers 10 --hidden 128
+python train_clean_ddp.py --n_files 3000 --layers 8 --hidden 128 --heads 4
 ```
 
 **Ожидаемый прирост:** ROC-AUC +0.02-0.04
 
+---
 
 ## 📋 Приоритеты экспериментов
 
@@ -181,7 +192,7 @@ python train.py --n_files 500 --layers 10 --hidden 128
 |---|-------------|-----------|-------------------|--------------|
 | 1 | Мультимасштабные графы | Низкая | Высокий | Сейчас |
 | 2 | Глобальный контекст | Низкая | Средний | После #1 |
-| 3 | Больше данных (1000→1800) | Низкая | Средний | Параллельно |
+| 3 | Больше данных (3000 файлов) | Низкая | Средний | Параллельно |
 | 4 | Добавить признаки | Средняя | Высокий | После #1-#3 |
 | 5 | Ансамбль | Низкая | Низкий | В конце |
 | 6 | Увеличить модель | Средняя | Средний | После #4 |
@@ -190,9 +201,37 @@ python train.py --n_files 500 --layers 10 --hidden 128
 
 Конечная цель — приблизиться к dMaSIF:
 
-| Метрика | Сейчас | Цель |
-|---------|--------|------|
-| ROC-AUC | 0.627 | **0.75+** |
-| PR-AUC | 0.322 | **0.45+** |
-| F1 | 0.313 | **0.40+** |
-| Recall | 0.141 | **0.25+** |
+| Метрика | Сейчас (1500) | Цель |
+|---------|---------------|------|
+| ROC-AUC | 0.706 | **0.80+** |
+| PR-AUC | 0.355 | **0.50+** |
+| Per-protein F1 | 0.410 | **0.50+** |
+| Recall (opt thr) | 0.635 | **0.70+** |
+
+---
+
+## 🛠️ Технические детали
+
+### DDP обучение на нескольких GPU
+
+`train_clean_ddp.py` использует `DistributedDataParallel` для распределённого обучения:
+
+```bash
+# Автоматически определяет количество GPU
+python train_clean_ddp.py --n_files 3000 --hidden 64 --layers 6
+
+# С продолжением с чекпоинта
+python train_clean_ddp.py --n_files 3000 --hidden 64 --layers 6 --resume last3_1500.pt
+
+# С отключением gradient checkpointing (больше памяти, быстрее)
+python train_clean_ddp.py --n_files 3000 --no_checkpoint
+```
+
+### Gradient checkpointing
+
+По умолчанию включён (`--checkpoint`). Экономит ~30% памяти ценой 10-15% скорости.
+
+### Восстановление обучения (resume)
+
+При `--resume` загружаются веса из чекпоинта. Поддерживается частичная загрузка — слои с несовпадающей размерностью пропускаются.
+

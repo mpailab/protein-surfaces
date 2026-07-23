@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env python3
 """
-train.py - Максимально простая версия, без контекстов, без сложностей
+train_clean.py - Максимально простая версия, без контекстов, без сложностей
 """
 
 import torch
@@ -210,14 +210,20 @@ def print_stats(files, title="Statistics"):
     print("-" * 70)
 
 
-def train(data_dir, ckpt_path, n_files=2):
+def train(data_dir, ckpt_path, n_files=2, resume=None):
     all_paths = sorted(glob.glob(os.path.join(data_dir, "*.pt")))
     random.Random(42).shuffle(all_paths)
     
     n_files = min(n_files, len(all_paths))
     train_files = all_paths[:n_files]
     val_files = all_paths[n_files:min(n_files+20, len(all_paths))]
-    
+    with open('train_files_exact.txt', 'w') as f:
+        for p in train_files:
+            f.write(os.path.basename(p) + '\n')
+
+    with open('val_files_exact.txt', 'w') as f:
+        for p in val_files:
+            f.write(os.path.basename(p) + '\n')
     print(f"\n{'='*80}")
     print(f"TRAINING CONFIGURATION")
     print(f"{'='*80}")
@@ -265,6 +271,9 @@ def train(data_dir, ckpt_path, n_files=2):
     print(f"\n{'='*80}")
     print(f"STARTING TRAINING")
     print(f"{'='*80}\n")
+    if resume:
+        model.load_state_dict(torch.load(resume, map_location=device))
+        print(f"✅ Loaded weights from {resume}")
     
     for epoch in range(1, EPOCHS + 1):
         model.train()
@@ -333,16 +342,35 @@ def train(data_dir, ckpt_path, n_files=2):
             print(f"{'='*80}\n")
     
     print(f"\n✅ Best VAL F1: {best_f1:.4f}")
-    # После обучения
-    best_f1 = 0
+    
+    # ── 1. Собираем предсказания и метки на валидации ──
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for data in val_loader:
+            if data is None: continue
+            data = data.to(device)
+            logits = model(data)
+            # squeeze(-1) гарантирует 1D массив для np.concatenate и f1_score
+            all_probs.append(torch.sigmoid(logits).squeeze(-1).cpu().numpy())
+            all_labels.append(data.y.cpu().numpy())
+            
+    probs = np.concatenate(all_probs)
+    labels = np.concatenate(all_labels)
+    
+    # ── 2. Поиск оптимального порога по F1 ──
+    best_f1 = 0.0
     best_thresh = 0.5
     for thresh in np.arange(0.1, 0.9, 0.05):
         preds = (probs > thresh).astype(int)
-        f1 = f1_score(labels, preds)
+        f1 = f1_score(labels, preds, zero_division=0)
         if f1 > best_f1:
             best_f1 = f1
             best_thresh = thresh
-    print(f"Best F1={best_f1:.4f} @ threshold={best_thresh:.2f}")
+            
+    print(f"🎯 Optimal threshold search:")
+    print(f"   Best F1={best_f1:.4f} @ threshold={best_thresh:.2f}")
+    print(f"   (Default 0.5 gave F1={f1_score(labels, (probs>0.5).astype(int), zero_division=0):.4f})")
 
 def main():
     import argparse
@@ -354,6 +382,7 @@ def main():
     parser.add_argument('--layers', type=int, default=6)
     parser.add_argument('--hidden', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     args = parser.parse_args()
     
     global CONTACT_THRESHOLD, NUM_LAYERS, HIDDEN, LR
@@ -362,7 +391,7 @@ def main():
     HIDDEN = args.hidden
     LR = args.lr
     
-    train(args.data_dir, args.ckpt, n_files=args.n_files)
+    train(args.data_dir, args.ckpt, n_files=args.n_files, resume=args.resume)
 
 
 if __name__ == '__main__':
