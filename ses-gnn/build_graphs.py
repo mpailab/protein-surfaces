@@ -19,7 +19,7 @@ MAX_NEIGHBORS = 24
 SIGMA = 1.5
 
 
-def build_graph_for_file(raw_path, out_dir, r_cutoff=R_CUTOFF, max_neighbors=MAX_NEIGHBORS):
+def build_graph_for_file(raw_path, out_dir, r_cutoff=R_CUTOFF, max_neighbors=MAX_NEIGHBORS, sigma=SIGMA):
     """Загружает сырые данные, строит граф, сохраняет"""
     
     raw_data = torch.load(raw_path, map_location='cpu', weights_only=False)
@@ -39,7 +39,7 @@ def build_graph_for_file(raw_path, out_dir, r_cutoff=R_CUTOFF, max_neighbors=MAX
     src, dst = edge_index
     edge_dist = torch.norm(pos[src] - pos[dst], dim=1, keepdim=True)
     n_cos = (norms[src] * norms[dst]).sum(dim=1, keepdim=True)
-    edge_w = torch.exp(-edge_dist**2 / (2 * SIGMA**2)) * (1.0 + n_cos) / 2.0
+    edge_w = torch.exp(-edge_dist**2 / (2 * sigma**2)) * (1.0 + n_cos) / 2.0
     edge_attr = torch.cat([edge_dist, n_cos, edge_w], dim=-1)
     
     # Сохраняем с графом
@@ -73,6 +73,8 @@ def main():
                         help='Radius for graph edges (Å)')
     parser.add_argument('--max_neighbors', type=int, default=24,
                         help='Maximum neighbors per node')
+    parser.add_argument('--sigma', type=float, default=SIGMA,
+                        help='Sigma for edge weight decay')
     args = parser.parse_args()
     
     os.makedirs(args.out_dir, exist_ok=True)
@@ -83,7 +85,7 @@ def main():
     saved = 0
     for raw_path in tqdm(raw_paths, desc="Building graphs"):
         try:
-            if build_graph_for_file(raw_path, args.out_dir, args.r_cutoff, args.max_neighbors):
+            if build_graph_for_file(raw_path, args.out_dir, args.r_cutoff, args.max_neighbors, args.sigma):
                 saved += 1
         except Exception as e:
             print(f"Error: {raw_path} - {e}")
