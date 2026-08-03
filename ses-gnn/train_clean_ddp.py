@@ -3,6 +3,7 @@
 train_clean_ddp.py - Обучение с DistributedDataParallel на нескольких GPU
 - Тренировка: DDP на всех GPU
 - Валидация: только на rank 0 (без DDP, чтобы избежать зависаний)
+- Поддерживает --epochs и --val_interval для гибкой настройки
 """
 
 import os
@@ -44,6 +45,7 @@ HIDDEN = 32
 HEADS = 4
 LR = 1e-3
 EPOCHS = 300
+VAL_INTERVAL = 5          # по умолчанию каждые 5 эпох
 USE_CHECKPOINT = True
 N_VAL = 50
 
@@ -345,6 +347,8 @@ def train_worker(rank, world_size, args):
         print(f"Threshold: {args.threshold}Å")
         print(f"Hard ratio: {args.hard_ratio}")
         print(f"LR: {args.lr}")
+        print(f"Epochs: {args.epochs}")
+        print(f"Val interval: {args.val_interval} (first eval always at epoch 1)")
         print(f"Gradient checkpointing: {args.checkpoint}")
         print(f"Log dir: {args.log_dir}")
         print(f"Checkpoints: {args.ckpt_f1} (F1), {args.ckpt_roc} (ROC), {args.ckpt_pr} (PR)")
@@ -400,6 +404,7 @@ def train_worker(rank, world_size, args):
             model_dict = model.state_dict()
             pretrained_dict = {}
             skipped_keys = []
+            missing_keys = []
             
             for k, v in checkpoint.items():
                 if k in model_dict and v.shape == model_dict[k].shape:
@@ -407,8 +412,24 @@ def train_worker(rank, world_size, args):
                 else:
                     skipped_keys.append(k)
             
+            # Находим ключи, которые есть в модели, но отсутствуют в чекпоинте
+            for k in model_dict.keys():
+                if k not in checkpoint:
+                    missing_keys.append(k)
+            
             if skipped_keys and rank == 0:
                 print(f"⚠️ Skipped {len(skipped_keys)} layers due to shape mismatch")
+                if len(skipped_keys) <= 5:
+                    print(f"   Skipped: {skipped_keys}")
+                else:
+                    print(f"   First 5 skipped: {skipped_keys[:5]}")
+            
+            if missing_keys and rank == 0:
+                print(f"⚠️ Missing {len(missing_keys)} layers in checkpoint (randomly initialized)")
+                if len(missing_keys) <= 5:
+                    print(f"   Missing: {missing_keys}")
+                else:
+                    print(f"   First 5 missing: {missing_keys[:5]}")
             
             model_dict.update(pretrained_dict)
             model.load_state_dict(model_dict, strict=False)
@@ -429,7 +450,7 @@ def train_worker(rank, world_size, args):
     
     # 9. Оптимизатор и scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler = GradScaler()
     
     # 10. Лучшие метрики
@@ -456,7 +477,7 @@ def train_worker(rank, world_size, args):
         print(f"STARTING TRAINING")
         print(f"{'='*80}\n")
     
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         train_sampler.set_epoch(epoch)
         
         model.train()
@@ -502,7 +523,10 @@ def train_worker(rank, world_size, args):
         torch.cuda.empty_cache()
         
         # Метрики (только на rank 0)
-        if rank == 0 and (epoch % 5 == 0 or epoch <= 10 or epoch == EPOCHS):
+        # Всегда считаем на эпохе 1, затем с интервалом val_interval
+        should_evaluate = (epoch == 1) or (epoch % args.val_interval == 0) or (epoch == args.epochs)
+        
+        if rank == 0 and should_evaluate:
             print(f"\n📊 Computing metrics for epoch {epoch}...")
             
             # 12a. Train eval — DDP режим
@@ -684,11 +708,15 @@ def main():
     parser.add_argument('--hidden', type=int, default=32)
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--epochs', type=int, default=300,
+                        help='Number of epochs to train')
+    parser.add_argument('--val_interval', type=int, default=5,
+                        help='Validation interval (epochs). First eval always at epoch 1.')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--checkpoint', action='store_true', default=True)
     parser.add_argument('--no_checkpoint', action='store_false', dest='checkpoint')
     parser.add_argument('--hard_ratio', type=float, default=2.0,
-                    help='Hard negative mining ratio (default: 2.0)')
+                        help='Hard negative mining ratio (default: 2.0)')
     args = parser.parse_args()
     
     global CONTACT_THRESHOLD, N_VAL
