@@ -1,7 +1,8 @@
 ﻿#!/usr/bin/env python3
 """
 evaluate.py - Оценка модели на новых данных
-- Использует последние N файлов из директории (не пересекается с train/val)
+- Использует список train-файлов (train_files.txt) для исключения из теста
+- Если train_list не найден, использует train_val_size (старый способ)
 - Подбирает оптимальный порог методом бисекции (если не указан фиксированный)
 - Считает per-protein и global метрики
 """
@@ -385,15 +386,17 @@ def main():
     parser.add_argument('--output_dir', type=str, default='./evaluation_results')
     parser.add_argument('--n_files', type=int, default=100)
     parser.add_argument('--threshold_contact', type=float, default=4.0)
-    parser.add_argument('--train_val_size', type=int, default=3020,
-                        help='Number of files used for training + validation (to skip)')
+    parser.add_argument('--train_val_size', type=int, default=-1,
+                        help='Number of files used for training + validation (to skip) - fallback if train_list not found')
+    parser.add_argument('--train_list', type=str, default='train_files.txt',
+                        help='File with train file names (to exclude from test)')
     parser.add_argument('--threshold', type=float, default=None,
                         help='Fixed threshold for predictions (if not set, optimal will be searched)')
     parser.add_argument('--hidden', type=int, default=None)
     parser.add_argument('--layers', type=int, default=None)
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument('--shuffle_seed', type=int, default=None,
-                    help='Seed for shuffling files (use 42 to match training)')
+                        help='Seed for shuffling files (use 42 to match training)')
     args = parser.parse_args()
     
     global CONTACT_THRESHOLD
@@ -426,27 +429,47 @@ def main():
     # Загружаем данные
     print(f"\n📂 Loading data from {args.data_dir}...")
     all_files = sorted(glob.glob(os.path.join(args.data_dir, "*.pt")))
-    if args.shuffle_seed is not None:
-        random.Random(args.shuffle_seed).shuffle(all_files)
-    test_files = all_files[args.train_val_size:args.train_val_size + args.n_files]
-    print(f"   First 10 test files: {[os.path.basename(f) for f in test_files[:10]]}")
-    print(f"   Skipping first {args.train_val_size} files (train+val split)")
-    print(f"   Found {len(all_files)} total, using {len(test_files)} test files")
-    # ─────────────────────────────────────────────────────────────────────────────
-    # Загрузка сохранённых списков train/val (если есть)
-    # ─────────────────────────────────────────────────────────────────────────────
-    train_list_path = 'train_files.txt'
-    if os.path.exists(train_list_path):
-        with open(train_list_path, 'r') as f:
+    
+    # Пытаемся использовать train_list для исключения train-файлов
+    test_files = None
+    if args.train_val_size<0 and os.path.exists(args.train_list):
+        with open(args.train_list, 'r') as f:
+            train_names = set(line.strip() for line in f if line.strip())
+        print(f"   Loaded {len(train_names)} train files from {args.train_list}")
+        
+        available_test = [f for f in all_files if os.path.basename(f) not in train_names]
+        print(f"   Found {len(available_test)} non-train files")
+        
+        if args.shuffle_seed is not None:
+            random.Random(args.shuffle_seed).shuffle(available_test)
+        
+        if args.n_files and args.n_files < len(available_test):
+            test_files = available_test[:args.n_files]
+        else:
+            test_files = available_test
+        print(f"   Using {len(test_files)} test files")
+    else:
+        # fallback на старую логику
+        print(f"   {args.train_list} not found, using train_val_size={args.train_val_size}")
+        if args.shuffle_seed is not None:
+            random.Random(args.shuffle_seed).shuffle(all_files)
+        test_files = all_files[args.train_val_size:args.train_val_size + args.n_files]
+        print(f"   Skipping first {args.train_val_size} files (train+val split)")
+        print(f"   Found {len(all_files)} total, using {len(test_files)} test files")
+    
+    # Проверка пересечения (если train_list использовался, она уже не нужна, но оставим для информации)
+    if os.path.exists(args.train_list):
+        with open(args.train_list, 'r') as f:
             train_names = set(line.strip() for line in f if line.strip())
         test_names = set(os.path.basename(f) for f in test_files)
         overlap = test_names & train_names
         if overlap:
-            print(f"   ⚠️ WARNING: {len(overlap)} test files overlap with train!")
+            print(f"   ⚠️ WARNING: {len(overlap)} test files overlap with train! (should not happen)")
             print(f"   Overlapping files: {list(overlap)[:10]}...")
         else:
             print(f"   ✅ No overlap between test and train files.")
-        print(f"   Train: {len(train_names)}, Test: {len(test_names)}")
+    
+    print(f"   First 10 test files: {[os.path.basename(f) for f in test_files[:10]]}")
     
     dataset = []
     for f in tqdm(test_files, desc="Loading"):

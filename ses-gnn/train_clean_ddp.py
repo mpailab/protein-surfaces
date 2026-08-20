@@ -336,6 +336,11 @@ def train_worker(rank, world_size, args):
                 f.write(os.path.basename(p) + '\n')
         print(f"✅ Saved train files list to train_files.txt")
     val_files = all_paths[n_files:n_files + args.n_val]
+    if rank == 0:
+        with open('val_files.txt', 'w') as f:
+            for p in val_files:
+                f.write(os.path.basename(p) + '\n')
+        print(f"✅ Saved validation files list to val_files.txt")
     
     if rank == 0:
         print(f"\n{'='*80}")
